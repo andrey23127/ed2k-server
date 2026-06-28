@@ -1,0 +1,101 @@
+[package]
+name = "ed2k-server"
+version = "0.9.65"
+edition = "2021"
+description = "Modern eDonkey2000 / eMule index server (test/MVP build)"
+license = "MIT"
+rust-version = "1.75"
+
+[dependencies]
+# Async runtime
+tokio = { version = "=1.38", features = ["full"] }
+# Low-level socket options (TCP keepalive on accepted client sockets). 0.5.x is
+# the same major series tokio 1.38 already pulls in transitively, so this adds
+# no new version to the tree.
+socket2 = { version = "=0.5.7", features = ["all"] }
+tokio-util = { version = "=0.7.11", features = ["codec"] }
+bytes = "=1.6"
+futures = "=0.3.30"
+
+# Logging
+tracing = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter"] }
+
+# Errors
+thiserror = "=1.0.61"
+anyhow = "=1.0.86"
+
+# Concurrent data structures
+dashmap = "=5.5.3"
+arc-swap = "=1.7.1"
+
+# Compression
+flate2 = "=1.0.30"
+
+libc = "0.2"
+
+# Hashing
+md-5 = "=0.10.6"
+sha2 = "=0.10.8"
+hex = "=0.4.3"
+
+# DH-768 for obfuscation
+num-bigint = "=0.4.5"
+num-traits = "=0.2.18"
+
+# Config
+serde = { version = "=1.0.203", features = ["derive"] }
+serde_json = "=1.0.117"
+axum = { version = "=0.7.5", default-features = false, features = ["http1", "json", "tokio"] }
+once_cell = "=1.19.0"
+tower = { version = "=0.4.13", default-features = false }
+toml = "=0.7.8"
+
+# Time
+chrono = { version = "=0.4.38", features = ["serde"] }
+
+# CLI args
+clap = { version = "=4.4.18", features = ["derive"] }
+
+[dev-dependencies]
+tokio-test = "=0.4.4"
+tempfile = "3"
+
+# Pin transitive deps that pulled in edition2024 with newer Rust.
+# These are dependencies-of-dependencies; we list them to force the
+# resolver to a version compatible with Rust 1.75 (Debian/Ubuntu stable).
+[dependencies.indexmap]
+version = "=2.6.0"
+
+# Stage 4 (memory): inline single-source storage in FileRecord. The `union`
+# feature lets SmallVec overlap its inline-array and heap-pointer storage, so
+# SmallVec<[Source;1]> stays at 32 bytes instead of being larger; sound on
+# stable Rust (untagged unions are stable). Replaces a per-file Vec<Source>
+# heap allocation with inline storage for the common 1-source case.
+[dependencies.smallvec]
+version = "=1.13.2"
+features = ["union"]
+
+# Memory allocator (Stage 4): jemalloc replaces the system glibc malloc to cut
+# fragmentation and RSS on the many-small-allocations index workload. Target-
+# gated so it never builds on MSVC/Windows (jemalloc is unsupported there); the
+# #[global_allocator] in main.rs is cfg-gated the same way. Building it compiles
+# jemalloc from C source, so the build host needs a C toolchain (gcc/clang +
+# make) — already present on the VPS build box.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "=0.5.4"
+# Allocator introspection (stats.allocated/resident/retained) for /api/memdebug —
+# lets us split real app data from jemalloc fragmentation/retained pages.
+tikv-jemalloc-ctl = "=0.5.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "line-tables-only"

@@ -1,0 +1,16 @@
+# Layer 3 hash blocklist (csam_hashes.txt) — NOT shipped.
+#
+# One ed2k/MD4 hash per line as 32 hex characters. An optional ';' inline
+# comment may follow the hash. Lines starting with '#' are ignored.
+#
+#   0123456789abcdef0123456789abcdef ; optional note
+#
+# Obtain hashes ONLY from authoritative sources (NCMEC, IWF hash list,
+# Project Arachnid / Canadian Centre for Child Protection). These lists are
+# typically licensed and MUST NOT be redistributed publicly — keep this file
+# private and out of version control.
+#
+# Absent/empty -> Layer 3 inactive (allowed only when server.public = false;
+# a public server requires a non-empty blocklist, enforced in main.rs).
+#
+# (Intentionally empty — populate locally; template only.)

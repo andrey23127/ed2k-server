@@ -1,0 +1,38 @@
+# Project-local Cargo configuration.
+#
+# ── jemalloc tuning (applies to everyone, keep it) ──────────────────────────
+# Bakes jemalloc runtime options into the binary AT COMPILE TIME. The
+# jemalloc-sys build script reads JEMALLOC_SYS_WITH_MALLOC_CONF and embeds the
+# string as the default malloc_conf, so the tuning applies on every run with no
+# environment variable and no code change.
+#
+#   background_thread:true  — a background thread purges freed pages on the decay
+#                             schedule, so a server that frees a batch and then
+#                             goes quiet still returns memory to the OS.
+#   dirty_decay_ms:1000     — return recently-dirtied pages ~1s after idle.
+#   muzzy_decay_ms:1000     — same for muzzy pages; 1000 keeps RSS close to the
+#                             in-use bytes without the extra purge syscalls that
+#                             muzzy_decay_ms:0 costs (measured: ~+0.2% CPU).
+#
+# Verify at runtime: `ps -T -p $(pgrep -f ed2k-server) | grep jemalloc`
+# (a `jemalloc_bg_thd` thread means the config was embedded).
+[env]
+JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+
+# ── Optional CPU optimization (uncomment ONE that matches YOUR build host) ───
+# Commented out so the project builds portably everywhere. Enabling a specific
+# target-cpu produces a binary tuned to that microarchitecture — only run such a
+# binary on a CPU of that family or newer.
+#
+# Safe everywhere — optimize for the machine doing the build:
+# [build]
+# rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-Wl,--gc-sections"]
+#
+# Example: AMD Zen 3 (Ryzen 5000 / EPYC 7003), as on the reference VPS:
+# [build]
+# target = "x86_64-unknown-linux-gnu"
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=znver3", "-C", "link-arg=-Wl,--gc-sections"]
+#
+# Other values: znver2 (Zen 2), znver4 (Zen 4), skylake/icelake-server (Intel),
+# or x86-64-v3 (portable baseline for most CPUs since ~2015).

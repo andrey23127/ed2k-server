@@ -1,0 +1,12 @@
+# Layer 4 operator extra-terms list (csam_terms_extra.txt) — NOT shipped.
+#
+# One term per line; '#' comments and blank lines ignored. Case-insensitive
+# substring match. Additive only — L4 never overrides L1/L2 decisions.
+#
+# For operator-specific additions on top of the standard layers. Prefer
+# authoritative indicator lists (INHOPE/IWF/NCMEC) over ad-hoc terms to keep
+# false positives low (e.g. short ambiguous tokens inside innocent words).
+#
+# Absent/empty -> Layer 4 inactive. Hot-reloadable (~30s).
+#
+# (Intentionally empty — populate locally; template only.)

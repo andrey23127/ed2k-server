@@ -1,0 +1,91 @@
+# ed2k-server configuration
+# WSL testing: keep as-is
+# VPS public deployment: set this_ip, name, desc; uncomment seed_servers
+
+[server]
+name = "Test eD2k Server"
+desc = "ed2k-server open source"
+
+# Public server: announces itself to peers and is shared in server lists.
+# A public server REQUIRES a non-empty content_filter.hash_blocklists, or it
+# refuses to start (see [content_filter] below). Keep `false` for local/WSL
+# testing; set `true` only once this_ip, seed_servers and a hash blocklist
+# are configured for a real VPS deployment.
+public = false
+
+# Advertised server version. Do NOT set below 17.15: Lugdunum servers reject
+# older versions and will not add them to their server.met (verified against
+# the Lugdunum decompile — 17.15 is the minimum accepted version).
+version_major = 17
+version_minor = 15
+
+# Public IP of this server — shown to clients in SERVERIDENT.
+# Leave empty for WSL/local testing. Set to VPS IP for public deployment.
+# this_ip = "1.2.3.4"
+
+# Seed servers — queried on startup via UDP to fetch the current server list.
+# This is how your server discovers peers and eventually gets into their lists.
+# Standard well-known eD2k servers (public, long-running):
+# seed_servers = [
+#     "91.200.42.46:1176",
+#     "176.123.5.87:4242",
+#     "77.120.115.66:4242",
+#     "62.210.28.77:4242",
+# ]
+
+[network]
+tcp_port = 4661
+# udp_port MUST equal tcp_port + 4. The gossip protocol derives a peer's UDP
+# port as TCP+4, and seed servers compute ours the same way — any other value
+# breaks server-to-server discovery. Default eD2k pairing is 4661 / 4665.
+udp_port = 4665
+listen_ip = "0.0.0.0"
+listen_backlog = 256
+max_frame_size = 1_000_000
+login_timeout_ms = 2000
+support_crypt = true
+
+[limits]
+max_clients = 1000
+soft_limit_files = 1000
+hard_limit_files = 4000
+max_clients_per_ip = 10
+max_string_size = 250
+ping_delay_seconds = 300
+
+[content_filter]
+# Layer 3 hash blocklist(s). Obtain from authoritative sources (NCMEC/IWF/C3P);
+# do NOT commit. A public server (server.public = true) requires a non-empty list.
+hash_blocklists = []
+# Layer 4 operator extra terms (substring). Optional. Not shipped — see *.example.
+extra_terms_file = "config/csam_terms_extra.txt"
+# Layer 1 jargon list. Optional; absent = L1 inactive (L2-L4 still run). Source
+# from INHOPE/IWF/NCMEC; not shipped — copy config/csam_jargon.txt.example and fill.
+jargon_terms_file = "config/csam_jargon.txt"
+publisher_attempt_disconnect_threshold = 3
+publisher_blacklist_seconds = 86400
+
+[welcome]
+messages = [
+    "Welcome to ed2k-server",
+]
+
+[log]
+level = "info"
+connection_trace = true
+
+[storage]
+# IP filter in eMule guarding.p2p format. Empty = disabled. Hot-reloaded on
+# SIGHUP without restart. Obtain a list (e.g. bluetack/level1) and point here.
+ipfilter_path = ""
+# ip-to-country.csv for the per-client country column in the admin UI.
+# Format: start_int,end_int,ISO2,CountryName. Empty = disabled.
+# Source: https://upd.emule-security.org/ip-to-country.csv.zip (unzip first).
+country_db_path = ""
+
+[admin]
+# Localhost-only admin web UI. Access via SSH tunnel:
+#   ssh -L 8080:127.0.0.1:8080 your-vps
+# Then open http://localhost:8080 in a browser.
+enabled = true
+port = 8080

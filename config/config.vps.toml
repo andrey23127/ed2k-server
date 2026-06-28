@@ -1,0 +1,95 @@
+# ed2k-server — VPS PUBLIC DEPLOYMENT config
+# Copy to /etc/ed2k-server/config.toml and edit the fields marked CHANGE_ME
+
+[server]
+name = "CHANGE_ME"              # Your server name shown in eMule server list
+desc = "CHANGE_ME"              # Description
+public = false                  # Set to true ONLY after getting content_filter configured
+
+# Your VPS public IP — clients see this in SERVERIDENT
+this_ip = "CHANGE_ME"          # e.g. "65.109.199.83"
+
+# Well-known seed servers — your server will query them on startup
+# to get a list of active eD2k servers. Eventually other servers
+# will discover yours and add it to their lists.
+seed_servers = [
+"45.87.41.16:6262",
+"213.252.245.239:43333",
+"185.25.48.89:18357",
+"147.78.0.252:18357",
+"37.143.128.252:47111",
+"185.123.101.79:42830",
+"176.123.5.89:4725",
+"103.97.203.251:42011",
+"147.78.2.254:9197",
+"103.75.116.41:48617",
+"223.165.4.251:42011",
+"91.148.135.254:9197",
+"91.148.135.252:47111",
+"91.148.135.253:18357",
+"57.128.161.24:6666",
+"91.208.162.182:4232",
+"45.82.80.155:5687",
+"91.208.162.87:4232",
+"85.121.5.137:4232",
+"77.42.68.79:4232",
+"141.227.165.99:4232",
+"185.186.77.252:47111",
+"145.14.131.254:43333",
+"185.255.123.22:37980",
+"91.208.162.55:4235",
+"31.40.212.254:9197",
+"185.237.185.226:31031",
+"57.131.35.107:4232",
+"45.93.9.192:4232",
+"91.119.202.44:4321",
+"193.187.90.12:4661",
+"141.227.139.101:4235",
+"213.141.198.207:4232",
+]
+version_major = 18
+version_minor = 1
+
+[network]
+tcp_port = 4661
+udp_port = 4665
+listen_ip = "0.0.0.0"          # DO NOT change to your VPS IP — 0.0.0.0 is correct
+listen_backlog = 1024
+max_frame_size = 1_000_000
+login_timeout_ms = 3000         # Slightly longer for VPS latency
+support_crypt = true
+
+[limits]
+max_clients = 5000
+soft_limit_files = 5000
+hard_limit_files = 7500
+max_clients_per_ip = 10
+max_string_size = 250
+ping_delay_seconds = 300
+
+[content_filter]
+# Leave empty until you get hash list from Project Arachnid / IWF
+hash_blocklists = ["/etc/ed2k-server/csam_hashes.txt"]
+# Uncomment and add your hash list file once you receive it:
+# hash_blocklists = ["/etc/ed2k-server/csam_hashes.txt"]
+extra_terms_file = "/etc/ed2k-server/csam_terms_extra.txt"
+jargon_terms_file = "/etc/ed2k-server/csam_jargon.txt"
+publisher_attempt_disconnect_threshold = 3
+publisher_blacklist_seconds = 2592000   # 30 days
+
+[welcome]
+messages = [
+    "Welcome to CHANGE_ME",
+]
+
+[log]
+level = "warn"
+connection_trace = false        # Set to true only for debugging
+
+[storage]
+ipfilter_path = "/etc/ed2k-server/guarding.p2p"
+country_db_path = "/etc/ed2k-server/ip-to-country.csv"
+
+[admin]
+enabled = true
+port = 8080

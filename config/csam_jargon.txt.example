@@ -1,0 +1,21 @@
+# Layer 1 jargon list (csam_jargon.txt) — NOT shipped in this repo.
+#
+# One term per line. Blank lines and lines starting with '#' are ignored.
+# Terms are matched case-insensitively against filenames.
+#
+# Classification is automatic, by term length:
+#   * 6+ characters  -> substring match (matches anywhere in the filename).
+#                       Use only for terms that never occur inside innocent
+#                       words.
+#   * 1-5 characters -> word-boundary match (must be delimited by non-word
+#                       characters on both sides), to avoid false positives
+#                       such as a short token appearing inside a normal word.
+#
+# Source your terms from authoritative bodies — INHOPE, IWF, NCMEC — which
+# curate indicator lists vetted for low false-positive rates. Do NOT invent
+# terms ad hoc.
+#
+# Absent or empty -> Layer 1 is inactive; Layers 2-4 still run. Hot-reloadable:
+# edit this file and changes apply within ~30s, no restart.
+#
+# (Intentionally empty — populate locally; this .example is a template only.)
