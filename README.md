@@ -59,7 +59,7 @@ source "$HOME/.cargo/env"
 sudo apt update && sudo apt install -y build-essential
 
 # 2. Get the source
-git clone https://github.com/<your-user>/ed2k-server.git
+git clone https://github.com/andrey23127/ed2k-server.git
 cd ed2k-server
 
 # 3. Build (release)
