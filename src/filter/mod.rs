@@ -78,6 +78,22 @@ impl ContentFilter {
         }
     }
 
+    /// Heap bytes held by the content filter (for /api/memsize): the CSAM hash
+    /// blocklist/whitelist sets and the term lists.
+    pub fn size_bytes(&self) -> u64 {
+        let hsz = std::mem::size_of::<[u8; 16]>() as u64 + 1; // + hashbrown ctrl byte
+        let bl = self.hash_blocklist.load();
+        let mut n = bl.capacity() as u64 * hsz;
+        n += self.hash_whitelist.capacity() as u64 * hsz;
+        for list in [self.extra_terms.load(), self.jargon_terms.load()] {
+            n += list.capacity() as u64 * std::mem::size_of::<String>() as u64;
+            for t in list.iter() {
+                n += t.capacity() as u64;
+            }
+        }
+        n
+    }
+
     pub fn with_hash_blocklist(self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Self {
         // Builder: merge into the current (normally empty) blocklist.
         let mut set: HashSet<[u8; 16]> = (*self.hash_blocklist.load_full()).clone();

@@ -79,6 +79,22 @@ impl CountryDb {
     }
 
     pub fn is_loaded(&self) -> bool { !self.ranges.is_empty() }
+
+    /// Heap bytes held by the GeoIP database (for /api/memsize). The range table
+    /// dominates (~652k ranges x 12 B); the country-name map is ~248 entries.
+    pub fn size_bytes(&self) -> u64 {
+        let ranges = (self.ranges.capacity() * std::mem::size_of::<Range>()) as u64;
+        let mut names = (self.names.capacity()
+            * (std::mem::size_of::<[u8; 2]>() + std::mem::size_of::<Box<str>>() + 1))
+            as u64;
+        for v in self.names.values() {
+            names += v.len() as u64;
+        }
+        ranges + names
+    }
+
+    /// Number of GeoIP ranges (diagnostics).
+    pub fn range_count(&self) -> usize { self.ranges.len() }
 }
 
 impl Default for CountryDb {

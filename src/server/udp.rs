@@ -609,11 +609,17 @@ impl UdpServer {
             out.put_u32_le(pingflg);
             out.put_u32_le(lowid);
 
-            // portUDPobf = TCP_port + 14 (udpsockobf channel)
-            // portTCPobf = TCP_port + 12 (obfpingport channel)
+            // portUDPobf = TCP_port + 14 (udpsockobf channel — a real UDP listener)
+            // portTCPobf = the client-facing obfuscated TCP port. Obfuscation is
+            //   auto-detected on our MAIN TCP listener, so this is tcp_port itself
+            //   (matching OP_SERVERIDENT's ST_TCPPORTOBFUSCATION). It must NOT be
+            //   tcp_port+12: that value is our server-to-server obf-PING UDP port
+            //   (obfpingport), which has no TCP listener — advertising it made peers
+            //   propagate a phantom "45.87.41.16:6274" obf server that clients
+            //   (aMule) then tried to reach over obfuscated TCP and timed out.
             let tcp_port = self.cfg.network.tcp_port;
             out.put_u16_le(tcp_port.wrapping_add(14));
-            out.put_u16_le(tcp_port.wrapping_add(12));
+            out.put_u16_le(tcp_port);
 
             // KEY field: peers use this to encrypt obfuscated UDP traffic
             // back to us on :4675. Lugdunum semantics (from eserver.c
@@ -807,9 +813,16 @@ impl UdpServer {
         inner.put_u32_le(pingflg);
         inner.put_u32_le(lowid);
         // Trailer: portUDPobf, portTCPobf, ServerKey, our_ip (network order).
+        // portUDPobf = TCP+14 (udpsockobf — a real UDP listener).
+        // portTCPobf = tcp_port: obfuscation is auto-detected on our MAIN TCP
+        //   listener, so that is where obfuscated clients connect. It must NOT be
+        //   TCP+12 — that is our server-to-server obf-PING *UDP* port, which has no
+        //   TCP listener. Advertising it here made seeds propagate a phantom
+        //   "<ip>:6274" obfuscation-capable server, which clients (aMule) then tried
+        //   to reach over obfuscated TCP and timed out. Same fix as OP_GLOBSERVSTATRES.
         let tcp_port = self.cfg.network.tcp_port;
         inner.put_u16_le(tcp_port.wrapping_add(14));
-        inner.put_u16_le(tcp_port.wrapping_add(12));
+        inner.put_u16_le(tcp_port);
         inner.put_u32_le(our_server_key);
         inner.extend_from_slice(&our_ip.octets());
 
@@ -846,6 +859,18 @@ impl UdpServer {
         // cleanup won't evict it.
         if let std::net::IpAddr::V4(v4) = from.ip() {
             self.state.verified_servers.insert(v4, std::time::Instant::now());
+            // Also record the exact ip:TCP-port this proves. We probed tcp_port+4 and
+            // the reply comes from that UDP port, so tcp = from.port() - 4 (the UDP =
+            // TCP+4 convention). Only ip:port pairs verified this way are handed out,
+            // so a phantom port on an otherwise-real server's IP can never be
+            // advertised to clients.
+            if from.port() > 4 {
+                let tcp = from.port() - 4;
+                self.state.verified_sockets.insert(
+                    std::net::SocketAddrV4::new(v4, tcp),
+                    std::time::Instant::now(),
+                );
+            }
         }
 
         // Obfuscated GLOBSERVSTATRES carries extra fields beyond the 32-byte
@@ -1087,23 +1112,28 @@ impl UdpServer {
         //   matches, eMule overwrites name/desc from RESPONSE 1 with the
         //   tag values (same content) and ADDITIONALLY parses version.
 
-        // ─── RESPONSE 1: OLD FORMAT ──────────────────────────────────────────
-        let mut old_pkt = BytesMut::new();
-        old_pkt.put_u8(PROTO_EDONKEY);
-        old_pkt.put_u8(OP_SERVER_DESC_RES);
-        old_pkt.put_u16_le(name.len() as u16);
-        old_pkt.put_slice(name.as_bytes());
-        old_pkt.put_u16_le(desc.len() as u16);
-        old_pkt.put_slice(desc.as_bytes());
-        send_socket.send_to(&old_pkt, peer).await?;
-
-        // ─── RESPONSE 2: NEW FORMAT (taglist with version) ───────────────────
+        // Decide the response format FIRST, then send exactly ONE packet.
+        //
+        // Sending both an OLD-format and a NEW-format OP_SERVER_DESC_RES (as we did
+        // before) races on the wire: UDP has no ordering, so on aMule the two packets
+        // can arrive either way round. aMule parses the NEW format by tag NAME (safe),
+        // but its OLD-format parser reads the two strings as [description][name] —
+        // the OPPOSITE of our [name][description] — so whenever the OLD packet wins the
+        // race it swaps the server's name and description (and it shows up inconsistently
+        // because it's a race). Lugdunum only ever sends the NEW format, which is why
+        // aMule is fine with it. Fix: send NEW *or* OLD, never both.
+        //
+        // aMule and modern eMule both send the request with the low 16 bits of the
+        // challenge set to 0xF0FF (INV_SERV_DESC_LEN), so they take the NEW path and
+        // get an order-independent taglist. Only legacy clients that don't send that
+        // marker fall back to the OLD format.
         let low2 = u16::from_le_bytes([payload.get(0).copied().unwrap_or(0),
                                         payload.get(1).copied().unwrap_or(0)]);
         let is_new_format_request = payload.len() >= 4
             && (low2 == 0xF0FF || challenge == 0x7c7d7e7f);
 
         if is_new_format_request {
+            // ─── NEW FORMAT ONLY (taglist with version; parsed by tag name) ──────
             let mut new_pkt = BytesMut::new();
             new_pkt.put_u8(PROTO_EDONKEY);
             new_pkt.put_u8(OP_SERVER_DESC_RES);
@@ -1113,6 +1143,16 @@ impl UdpServer {
             write_old_str_tag(&mut new_pkt, ST_DESCRIPTION, &desc);
             write_old_str_tag(&mut new_pkt, ST_VERSION,     &version_str);
             send_socket.send_to(&new_pkt, peer).await?;
+        } else {
+            // ─── OLD FORMAT ONLY (legacy clients: <name_len><name><desc_len><desc>)
+            let mut old_pkt = BytesMut::new();
+            old_pkt.put_u8(PROTO_EDONKEY);
+            old_pkt.put_u8(OP_SERVER_DESC_RES);
+            old_pkt.put_u16_le(name.len() as u16);
+            old_pkt.put_slice(name.as_bytes());
+            old_pkt.put_u16_le(desc.len() as u16);
+            old_pkt.put_slice(desc.as_bytes());
+            send_socket.send_to(&old_pkt, peer).await?;
         }
 
         info!(

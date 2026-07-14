@@ -153,6 +153,7 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/bots", get(api_bots))
             .route("/api/block_stats", get(api_block_stats))
             .route("/api/memdebug", get(api_memdebug))
+            .route("/api/memsize", get(api_memsize))
             .with_state(state);
 
         let bind = format!("127.0.0.1:{port}");
@@ -617,6 +618,45 @@ struct BlockStatRow {
     /// Optional: distinct IPs that hit this filter (e.g. CSAM block_stats counts
     /// file publishes but a single user can publish many files).
     unique_ips: Option<u64>,
+}
+
+async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
+    // Per-container byte breakdown by CAPACITY (see ServerState::memsize_report).
+    // Keys ending in _TOTAL are subtotals of the lines above them; GRAND_TOTAL_tracked
+    // sums the subtotals. `unaccounted_bytes` is what jemalloc holds beyond that:
+    // size-class rounding, DashMap per-shard control state, Arc/Box control blocks,
+    // tokio socket buffers and per-thread allocator caches.
+    let report = s.server.memsize_report();
+    let tracked: u64 = report
+        .iter()
+        .find(|(k, _)| k == "GRAND_TOTAL_tracked")
+        .map(|(_, v)| *v)
+        .unwrap_or(0);
+    let sizes: serde_json::Map<String, serde_json::Value> = report
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::json!(v)))
+        .collect();
+    let allocated = jemalloc_allocated().unwrap_or(0);
+    Json(serde_json::json!({
+        "sizes_bytes": sizes,
+        "tracked_total_bytes": tracked,
+        "jemalloc_allocated_bytes": allocated,
+        "unaccounted_bytes": allocated.saturating_sub(tracked),
+        // Element counts for the same structures, so bytes-per-element can be
+        // derived directly (capacity vs live shows the peak-plateau slack).
+        "counts": {
+            "files": s.server.file_count(),
+            "slab_slots": s.server.file_slab.slot_count(),
+            "keyword_keys": s.server.keyword_index.posting_stats().0,
+            "keyword_postings": s.server.keyword_index.posting_stats().1,
+            "unique_names": s.server.name_interner.len(),
+            "clients": s.server.clients.len(),
+            "user_files_users": s.server.user_files.len(),
+            "smart_sources_entries": s.server.smart_sources.entry_count(),
+            "ipfilter_ranges": s.server.ip_filter.try_read().map(|f| f.len()).unwrap_or(0),
+            "geoip_ranges": s.server.country_db.try_read().map(|d| d.range_count()).unwrap_or(0),
+        },
+    }))
 }
 
 async fn api_memdebug(State(s): State<WebState>) -> Json<serde_json::Value> {

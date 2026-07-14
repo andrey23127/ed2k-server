@@ -218,6 +218,36 @@ impl KeywordIndex {
         (self.posting.len() as u64, total)
     }
 
+    /// Byte-level breakdown for /api/memsize. Returns
+    /// (posting_data_bytes, posting_vec_headers_bytes, key_slots_bytes).
+    ///
+    /// - `posting_data_bytes`: the FileId payloads, counted by CAPACITY (a Vec
+    ///   keeps its buffer after removals until `compact()` shrinks it).
+    /// - `posting_vec_headers_bytes`: the Vec<FileId> struct itself (ptr+len+cap)
+    ///   stored inside the map, one per keyword.
+    /// - `key_slots_bytes`: the hashbrown table slots — (key + value) per slot,
+    ///   sized to the map's CAPACITY. This is where the power-of-two blowup shows
+    ///   up: hashbrown rounds up and keeps ~1 ctrl byte per slot, and the table
+    ///   never shrinks on `retain`, so it stays at the peak keyword count.
+    pub fn size_report(&self) -> (u64, u64, u64) {
+        let id_sz = std::mem::size_of::<FileId>() as u64;
+        let vec_sz = std::mem::size_of::<Vec<FileId>>() as u64;
+        let key_sz = std::mem::size_of::<TokenHash>() as u64;
+
+        let mut data = 0u64;
+        for e in self.posting.iter() {
+            data += e.value().capacity() as u64 * id_sz;
+        }
+        let keys = self.posting.len() as u64;
+        let headers = keys * vec_sz;
+
+        // Slot cost across all shards, by capacity (not len).
+        let cap = self.posting.capacity() as u64;
+        let slots = cap * (key_sz + vec_sz + 1); // +1 ctrl byte per slot (hashbrown)
+
+        (data, headers, slots)
+    }
+
     /// Reclaim memory after churn. `remove_file` shrinks postings in place but
     /// leaves emptied Vecs behind to avoid hot-path contention; this leaves
     /// their (now-empty) slots and over-large capacity in place to avoid lock

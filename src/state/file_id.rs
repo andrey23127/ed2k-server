@@ -497,6 +497,35 @@ impl FileSlab {
         n
     }
 
+    /// Byte-level breakdown of what the slab holds, for /api/memsize.
+    ///
+    /// Reports CAPACITY, not length: `Vec` never shrinks on removal, so the
+    /// records/next/buckets arrays stay sized to the daily high-water mark. That
+    /// gap (capacity vs. live) is exactly what we want to see. Returns
+    /// (records_bytes, next_bytes, buckets_bytes, heap_sources_bytes).
+    ///
+    /// `heap_sources_bytes` counts only sources that SPILLED to the heap: a
+    /// SmallVec<[Source;1]> stores the first source inline (already inside the
+    /// FileRecord), so only files with 2+ sources allocate.
+    pub fn size_report(&self) -> (u64, u64, u64, u64) {
+        let rec_sz = std::mem::size_of::<FileRecord>() as u64;
+        let src_sz = std::mem::size_of::<Source>() as u64;
+        let (mut records, mut next, mut buckets, mut spilled) = (0u64, 0u64, 0u64, 0u64);
+        for s in &self.shards {
+            let sh = s.read().unwrap();
+            records += sh.records.capacity() as u64 * rec_sz;
+            next    += sh.next.capacity() as u64 * 4;      // Vec<u32>
+            buckets += sh.buckets.capacity() as u64 * 4;   // Vec<u32>
+            for r in sh.records.iter() {
+                // spilled_capacity() is 0 while the SmallVec is inline
+                if r.sources.spilled() {
+                    spilled += r.sources.capacity() as u64 * src_sz;
+                }
+            }
+        }
+        (records, next, buckets, spilled)
+    }
+
     /// Dead slots currently quarantined awaiting reuse (diagnostics). With the
     /// quarantine free-list, slot_count plateaus near (live high-water) and this
     /// holds the transient surplus; if it grows without bound, churn outpaces the

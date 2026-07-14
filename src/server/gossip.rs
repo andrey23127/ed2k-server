@@ -186,6 +186,159 @@ async fn handshake_with_seed(
     // Tiny gap so the seed processes our plain packets before we ping.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // ─── Preferred path: OBF handshake + gossip via our advertised portUDPobf ─
+    //
+    // Lugdunum sends server-to-server obf traffic from a FIXED, advertised
+    // socket (udpsockobf on portUDPobf), never an ephemeral one. Do the same:
+    // send from portUDPobf (TCP+14) — the socket the main UDP handler owns — so
+    // seeds record our stable advertised port instead of a random ephemeral one.
+    // The old bind("0.0.0.0:0") gave a new random source port per attempt, which
+    // seeds recorded as our "port" -> the 36258/32598/13700 phantom duplicates.
+    //
+    // We do NOT read the replies here (the main handler owns that socket's recv
+    // loop): after we set our_sent_random_parts and send, the main handler
+    // decodes the seed's reply and both stores its ServerKey (handle_pingreply)
+    // and merges its 0xA1 server list (handle_server_list_res). We just send,
+    // then poll seed_server_keys to know the handshake completed.
+    //
+    // Falls through to the legacy ephemeral path below only if portUDPobf is not
+    // bound (startup bind failure), so gossip still works in that case.
+    if let Some(obf_sock) = state
+        .udp_sockets
+        .get(&our_tcp_port.wrapping_add(14))
+        .map(|s| Arc::clone(&s))
+    {
+        let random_part = rand_u32();
+        let pad_len = (rand_u32() as usize) % (OBF_PING_PAYLOAD_MAX_PAD + 1);
+        let mut ping = Vec::with_capacity(4 + pad_len);
+        ping.extend_from_slice(&random_part.to_le_bytes());
+        for _ in 0..pad_len {
+            ping.push((rand_u32() & 0xFF) as u8);
+        }
+        while matches!(ping[0], 0xE3 | 0xD4 | 0xC5) {
+            ping[0] = (rand_u32() & 0xFF) as u8;
+        }
+
+        // Stash BEFORE sending so the main handler can decode the reply.
+        state.our_sent_random_parts.insert(*seed.ip(), random_part);
+        let ping_dst = SocketAddrV4::new(*seed.ip(), seed_obfping_port);
+        obf_sock.send_to(&ping, ping_dst).await?;
+        info!(
+            seed = %seed.ip(),
+            dst_port = seed_obfping_port,
+            src_port = our_tcp_port.wrapping_add(14),
+            random_part = format!("0x{:08x}", random_part),
+            "gossip phase 2 (portUDPobf): OBF ping sent"
+        );
+
+        // Wait for the main handler to decode the reply and store the ServerKey.
+        // An already-stored key (prior cycle) returns immediately — it is stable
+        // per seed, so that is correct.
+        let seed_serverkey = {
+            let dl = tokio::time::Instant::now() + REPLY_TIMEOUT;
+            loop {
+                if let Some(k) = state.seed_server_keys.get(seed.ip()).map(|r| *r) {
+                    break k;
+                }
+                if tokio::time::Instant::now() >= dl {
+                    warn!(seed = %seed.ip(),
+                          "gossip phase 2 (portUDPobf): no ServerKey stored within 5s");
+                    return Ok((0, 0));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+
+        // Ensure the verified seed is in server_list (obf-only seeds are advertised
+        // by nobody, so they'd otherwise never be handed out — see the legacy path).
+        {
+            let is_client = state.clients.iter().any(|e| {
+                matches!(e.ip, std::net::IpAddr::V4(v4) if v4 == *seed.ip())
+            });
+            if !is_client {
+                let mut list = state.server_list.write().await;
+                if !list.contains(seed) {
+                    list.push(*seed);
+                    state.server_list_added_at
+                        .insert(*seed.ip(), std::time::Instant::now());
+                    info!(seed = %seed, "added verified obf-only seed to server_list");
+                }
+                // The obf handshake proves this exact ip:port is a server (we
+                // initiated to it), so the pair is verified for hand-out too.
+                state.verified_sockets.insert(*seed, std::time::Instant::now());
+            }
+        }
+
+        // PHASE 3: obfuscated gossip from the SAME portUDPobf socket. No receive
+        // here — the main handler decodes and merges the seed's 0xA1 reply.
+        let gossip_dst = SocketAddrV4::new(*seed.ip(), seed_obfgossip_port);
+
+        let challenge2 = rand_u32();
+        let mut plain_a0 = Vec::with_capacity(12);
+        plain_a0.push(PROTO_EDONKEY);
+        plain_a0.push(OP_SERVER_LIST_REQ);
+        plain_a0.extend_from_slice(&our_ip.octets());
+        plain_a0.extend_from_slice(&our_tcp_port.to_le_bytes());
+        plain_a0.extend_from_slice(&challenge2.to_le_bytes());
+        let obf_a0 = server_obfuscation::encode_with_obfbyte(
+            &plain_a0, seed_serverkey, rand_u32(), 0x6b,
+        );
+        obf_sock.send_to(&obf_a0, gossip_dst).await?;
+
+        let mut plain_a4 = Vec::with_capacity(2);
+        plain_a4.push(PROTO_EDONKEY);
+        plain_a4.push(OP_SERVER_LIST_REQ2);
+        let obf_a4 = server_obfuscation::encode_with_obfbyte(
+            &plain_a4, seed_serverkey, rand_u32(), 0x6b,
+        );
+        obf_sock.send_to(&obf_a4, gossip_dst).await?;
+
+        // obf 0x97 only if the seed has probed us (we must echo its challenge).
+        if let Some(chal_ref) = state.incoming_seed_challenges.get(seed.ip()) {
+            let challenge_97 = *chal_ref;
+            drop(chal_ref);
+            let users = state.client_count() as u32;
+            let files = state.file_count() as u32;
+            let lowid = state.lowid_count() as u32;
+            let max_conn = 50_000u32;
+            let soft = 7_500u32;
+            let hard = 7_500u32;
+            let pingflg: u32 = 0x0000_17FB;
+            let seed_ip_le = u32::from_le_bytes(seed.ip().octets());
+            let our_server_key_for_seed =
+                crate::proto::server_obfuscation::ip_obfuscate(seckey, seed_ip_le);
+            let mut plain_97 = Vec::with_capacity(46);
+            plain_97.push(PROTO_EDONKEY);
+            plain_97.push(0x97);
+            plain_97.extend_from_slice(&challenge_97.to_le_bytes());
+            plain_97.extend_from_slice(&users.to_le_bytes());
+            plain_97.extend_from_slice(&files.to_le_bytes());
+            plain_97.extend_from_slice(&max_conn.to_le_bytes());
+            plain_97.extend_from_slice(&soft.to_le_bytes());
+            plain_97.extend_from_slice(&hard.to_le_bytes());
+            plain_97.extend_from_slice(&pingflg.to_le_bytes());
+            plain_97.extend_from_slice(&lowid.to_le_bytes());
+            // portUDPobf = TCP+14; portTCPobf = tcp_port (obf is auto-detected on
+            // the MAIN TCP listener). NOT TCP+12 — that's the obf-PING UDP port,
+            // which has no TCP listener and became the phantom ":6274" obf server.
+            plain_97.extend_from_slice(&our_tcp_port.wrapping_add(14).to_le_bytes());
+            plain_97.extend_from_slice(&our_tcp_port.to_le_bytes());
+            plain_97.extend_from_slice(&our_server_key_for_seed.to_le_bytes());
+            plain_97.extend_from_slice(&our_ip.octets());
+            let obf_97 = server_obfuscation::encode_with_obfbyte(
+                &plain_97, seed_serverkey, rand_u32(), 0x6b,
+            );
+            obf_sock.send_to(&obf_97, gossip_dst).await?;
+        }
+
+        info!(
+            seed = %seed.ip(),
+            "gossip (portUDPobf): handshake + obf gossip sent from advertised \
+             port; main handler will decode & merge the seed's 0xA1 reply"
+        );
+        return Ok((0, 0));
+    }
+
     // ─── PHASE 2: OBF ping from a fresh ephemeral socket ───────────────────
     let eph_sock = UdpSocket::bind("0.0.0.0:0").await?;
     let eph_port = eph_sock.local_addr()?.port();
@@ -363,8 +516,10 @@ async fn handshake_with_seed(
     plain_97.extend_from_slice(&pingflg.to_le_bytes());
     plain_97.extend_from_slice(&lowid.to_le_bytes());
     // Extended trailer: portUDPobf + portTCPobf + ServerKey + our_ip
+    // portUDPobf = TCP+14; portTCPobf = tcp_port (obf auto-detected on the MAIN
+    // TCP listener). NOT TCP+12 — that's the obf-PING UDP port (no TCP listener).
     plain_97.extend_from_slice(&our_tcp_port.wrapping_add(14).to_le_bytes());
-    plain_97.extend_from_slice(&our_tcp_port.wrapping_add(12).to_le_bytes());
+    plain_97.extend_from_slice(&our_tcp_port.to_le_bytes());
     plain_97.extend_from_slice(&our_server_key_for_seed.to_le_bytes());
     plain_97.extend_from_slice(&our_ip.octets());
 
@@ -515,6 +670,15 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
     }
     let existing: std::collections::HashSet<_> = list.iter().copied().collect();
     let before = list.len();
+    // Our own ip:port. Peers still remember us on bogus ports (recorded back when we
+    // gossiped from an ephemeral socket) and keep echoing those back in their 0xA1
+    // lists. Ingesting them re-creates the phantoms in our own list, gets them probed,
+    // and risks re-propagating them. There is exactly one server at our ip:tcp_port —
+    // never accept any other port on our own IP, and never accept ourselves from a
+    // peer at all (we know our own address; we don't need to learn it).
+    let cfg = state.live_cfg.load();
+    let self_ip: Option<Ipv4Addr> = cfg.server.this_ip.trim().parse().ok();
+    let mut self_dropped = 0usize;
     for addr in new_list {
         let ip = *addr.ip();
         // Drop private, loopback, multicast, broadcast, and client IPs.
@@ -524,10 +688,20 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
         {
             continue;
         }
+        if let Some(sip) = self_ip {
+            if ip == sip {
+                self_dropped += 1;
+                continue; // an entry about ourselves — never learn it from a peer
+            }
+        }
         if !existing.contains(&addr) {
             list.push(addr);
             state.server_list_added_at.insert(*addr.ip(), std::time::Instant::now());
         }
+    }
+    if self_dropped > 0 {
+        info!(self_dropped,
+              "merge_server_list: ignored peer entries claiming to be us (phantom ports)");
     }
     let added = list.len() - before;
     if added > 0 {
@@ -550,10 +724,34 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
 /// them (observed with 176.123.5.89, which speaks only obfuscated).
 pub async fn build_tcp_server_list(state: &ServerState) -> Vec<u8> {
     let list = state.server_list.read().await;
+    // Never hand OURSELVES to a client.
+    //
+    // A client asks for the list with OP_GETSERVERLIST right after it logs in, so
+    // it is already connected to us and already has us in its server.met — sending
+    // our own entry back adds nothing. Worse, aMule ends up accumulating a fresh
+    // copy of us on every connect (eMule silently drops the duplicate, aMule does
+    // not), so the user's list fills with clones of this server. Lugdunum does not
+    // advertise itself to clients either, which is exactly why connecting to a
+    // Lugdunum server never produces those duplicates.
+    //
+    // This only affects the CLIENT-facing list. Other servers still learn about us
+    // through gossip (build_server_list_res + our 0xA0 registration), so peering is
+    // unaffected.
+    let cfg = state.live_cfg.load();
+    let self_ip: Option<Ipv4Addr> = cfg.server.this_ip.trim().parse().ok();
     let verified: Vec<&SocketAddrV4> = list
         .iter()
         .filter(|addr| {
-            state.verified_servers.contains_key(addr.ip())
+            if let Some(sip) = self_ip {
+                if *addr.ip() == sip {
+                    return false; // ourselves — the client is already talking to us
+                }
+            }
+            // Gate on the ip:PORT pair, not the IP. verified_servers is keyed by IP,
+            // so once a real server is verified, every bogus port on its IP would
+            // pass — that is how phantom entries (e.g. a real server on a made-up
+            // port, learned from a peer's list) got advertised to our clients.
+            state.verified_sockets.contains_key(*addr)
                 || state.seed_server_keys.contains_key(addr.ip())
         })
         .take(255)
@@ -572,10 +770,24 @@ pub async fn build_tcp_server_list(state: &ServerState) -> Vec<u8> {
 /// handshake) — we never propagate an unverified (possibly mldonkey) IP.
 pub async fn build_server_list_res(state: &ServerState) -> Vec<u8> {
     let list = state.server_list.read().await;
+    // Same self-phantom guard as build_tcp_server_list: never propagate a stale entry
+    // for our own IP on a wrong port.
+    let cfg = state.live_cfg.load();
+    let self_ip: Option<Ipv4Addr> = cfg.server.this_ip.trim().parse().ok();
+    let self_port = cfg.network.tcp_port;
     let verified: Vec<&SocketAddrV4> = list
         .iter()
         .filter(|addr| {
-            state.verified_servers.contains_key(addr.ip())
+            if let Some(sip) = self_ip {
+                if *addr.ip() == sip && addr.port() != self_port {
+                    return false; // stale phantom entry for ourselves on a wrong port
+                }
+            }
+            // Gate on the ip:PORT pair, not the IP. verified_servers is keyed by IP,
+            // so once a real server is verified, every bogus port on its IP would
+            // pass — that is how phantom entries (e.g. a real server on a made-up
+            // port, learned from a peer's list) got advertised to our clients.
+            state.verified_sockets.contains_key(*addr)
                 || state.seed_server_keys.contains_key(addr.ip())
         })
         .take(255)

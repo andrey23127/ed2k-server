@@ -153,6 +153,13 @@ impl IpFilter {
     }
 
     pub fn len(&self) -> usize   { self.ranges.len() }
+
+    /// Heap bytes held by the filter (for /api/memsize): the sorted range list
+    /// plus the parallel per-range hit counters. Counted by capacity.
+    pub fn size_bytes(&self) -> u64 {
+        (self.ranges.capacity() * std::mem::size_of::<(u32, u32)>()) as u64
+            + (self.hits.capacity() * std::mem::size_of::<AtomicU32>()) as u64
+    }
     pub fn is_empty(&self) -> bool { self.ranges.is_empty() }
 }
 

@@ -110,6 +110,11 @@ impl NameInterner {
         self.table.len()
     }
 
+    /// Total slot capacity of the dedup table (for /api/memsize).
+    pub fn capacity(&self) -> usize {
+        self.table.capacity()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
     }

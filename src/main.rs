@@ -309,6 +309,10 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 tick.tick().await;
                 state_clean.recent_client_ips.retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
                 state_clean.verified_servers.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
+                // Same TTL for the ip:port-keyed set that gates hand-out, so a server
+                // that stops answering pings stops being advertised (and a phantom
+                // port, which never answers, is never verified in the first place).
+                state_clean.verified_sockets.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
                 // Bot detector keeps per-IP sliding windows. IPs that haven't
                 // queried in 5 minutes can be dropped — their window is empty
                 // and re-creating it on next query is cheap. Without this
@@ -468,11 +472,28 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     // already cleared on tombstone, so the per-record residue is
                     // just the small packed header.
                     state_orphan.user_files.shrink_to_fit();
-                    // Stage 2: free interned names no record references any
-                    // more (the evicted files dropped their Arc<str> handles).
-                    let dropped_names = state_orphan.name_interner.sweep_unused();
-                    info!(removed, remaining, dropped_kw, dropped_names,
+                    info!(removed, remaining, dropped_kw,
                           "orphan file cleanup: evicted files with no sources, compacted index + reverse index");
+                }
+
+                // Free interned names that no live record references any more.
+                //
+                // This MUST run every cycle, not only when files were evicted.
+                // Names are interned on paths that may not end in a stored record
+                // (a re-published hash whose name changed drops the old Arc; a file
+                // rejected by the content filter after interning; a tombstoned
+                // record clearing its name), so unreferenced names accumulate even
+                // in cycles with zero evictions. Keeping the sweep under
+                // `if removed > 0` let that garbage pile up between evictions —
+                // observed live as 449k interned names against 327k live files
+                // (~37% dead), growing with uptime and inflating bytes-per-file.
+                //
+                // Cost is a scan of the interner every 10 min, off the hot path.
+                let dropped_names = state_orphan.name_interner.sweep_unused();
+                if dropped_names > 0 {
+                    info!(dropped_names,
+                          interned = state_orphan.name_interner.len(),
+                          "name interner: freed unreferenced names");
                 }
             }
         });

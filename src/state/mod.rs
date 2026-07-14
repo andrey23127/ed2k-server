@@ -269,6 +269,22 @@ pub struct ServerState {
     /// are almost certainly mldonkey/eMule CLIENTS that seeds wrongly propagated
     /// into their server lists.
     pub verified_servers: DashMap<std::net::Ipv4Addr, std::time::Instant>,
+    /// Servers verified at a SPECIFIC ip:port (not just IP).
+    ///
+    /// `verified_servers` is keyed by IP alone, which is fine for "is this a real
+    /// server, don't evict it" but WRONG as a gate for handing entries out: once an
+    /// IP is verified, *every* port on that IP passes — so a bogus entry like
+    /// 45.82.80.155:24996 (a phantom port for a real server, learned from a peer's
+    /// list) was advertised to our clients as a genuine server, and aMule happily
+    /// added it. There is exactly one server per ip:port, so the list we hand out
+    /// must be gated on the pair.
+    ///
+    /// Filled from the 0x97 ping reply: we probe `tcp_port + 4` and the reply comes
+    /// back from that UDP port, so the TCP port is `from.port() - 4` (the UDP =
+    /// TCP+4 convention every eD2k client already assumes when it pings a server),
+    /// and from a successful obfuscated handshake, where we know the seed's TCP port
+    /// because we initiated to it.
+    pub verified_sockets: DashMap<SocketAddrV4, std::time::Instant>,
     /// When each entry was first added to server_list (for the "give it 10
     /// minutes to verify" grace period).
     pub server_list_added_at: DashMap<std::net::Ipv4Addr, std::time::Instant>,
@@ -514,6 +530,7 @@ impl ServerState {
             client_type_stats: DashMap::new(),
             recent_client_ips: DashMap::new(),
             verified_servers: DashMap::new(),
+            verified_sockets: DashMap::new(),
             server_list_added_at: DashMap::new(),
             csam_unique_ips: DashMap::new(),
             csam_blocked_hashes: DashMap::new(),
@@ -713,6 +730,167 @@ impl ServerState {
             ("recent_client_ips".into(), self.recent_client_ips.len() as u64),
             ("bot_query_log".into(), self.bot_query_log.len() as u64),
             ("bot_detections".into(), self.bot_detections.len() as u64),
+        ]
+    }
+
+    /// Byte-level memory breakdown by CAPACITY (not length), for /api/memsize.
+    ///
+    /// Reports `capacity * element_size` for every container the server holds, so
+    /// `capacity - live` is the peak-plateau slack (Vec/HashMap/HashSet/DashMap
+    /// never shrink their backing store on removal; a struct sized to the daily
+    /// high-water mark keeps that memory even when the live count drops).
+    ///
+    /// DashMap overhead note: a DashMap is N_SHARDS separate hashbrown tables, each
+    /// behind an RwLock. `capacity()` sums the shards' capacities, so slot counts
+    /// below already account for the sharding; the per-slot cost is
+    /// (key + value + 1 control byte), hashbrown's layout.
+    ///
+    /// Will not sum exactly to jemalloc `allocated` (size-class rounding, Arc/Box
+    /// control blocks, tokio buffers and thread caches live outside), but the
+    /// remainder is reported as `unaccounted_bytes` by the endpoint.
+    pub fn memsize_report(&self) -> Vec<(String, u64)> {
+        use std::mem::size_of;
+
+        // Cost of one DashMap slot: key + value + hashbrown's 1 control byte.
+        fn dm_slots(cap: usize, key: usize, val: usize) -> u64 {
+            (cap * (key + val + 1)) as u64
+        }
+        const IPV4: usize = 4;
+        const UHASH: usize = 16;
+        const INSTANT: usize = 16;
+
+        // ── file index ────────────────────────────────────────────────────────
+        let (slab_records, slab_next, slab_buckets, slab_spilled_src) =
+            self.file_slab.size_report();
+        let (kw_data, kw_headers, kw_slots) = self.keyword_index.size_report();
+
+        // user_files: DashMap<UserHash, HashSet<FileId>> — outer map slots PLUS
+        // each per-user HashSet's own hashbrown table.
+        let id_sz = size_of::<file_id::FileId>();
+        let mut uf_sets_bytes = 0u64;
+        for e in self.user_files.iter() {
+            uf_sets_bytes += e.value().capacity() as u64 * (id_sz as u64 + 1);
+        }
+        let uf_map_slots = dm_slots(
+            self.user_files.capacity(),
+            UHASH,
+            size_of::<std::collections::HashSet<file_id::FileId>>(),
+        );
+
+        // names: interned bytes + one Arc control block per unique name + map slots
+        let mut name_bytes = 0u64;
+        for (_src_len, name_len) in self.file_slab.iter_records_for_report() {
+            name_bytes += name_len as u64;
+        }
+        let name_arc_ctrl = self.name_interner.len() as u64 * 16;
+        let name_map_slots =
+            self.name_interner.capacity() as u64 * (size_of::<Arc<str>>() as u64 + 1);
+
+        // ── clients ───────────────────────────────────────────────────────────
+        // ClientHandle carries three Strings (nick/country/software) whose heap
+        // buffers live outside the struct, plus an Arc<AtomicU64> and an mpsc Sender.
+        let mut client_strings = 0u64;
+        for e in self.clients.iter() {
+            let c = e.value();
+            client_strings +=
+                (c.nick.capacity() + c.country.capacity() + c.software.capacity()) as u64;
+        }
+        let clients_slots = dm_slots(
+            self.clients.capacity(),
+            UHASH,
+            size_of::<ClientHandle>(),
+        );
+
+        // ── filters (loaded once, large) ──────────────────────────────────────
+        let ipfilter_bytes = self
+            .ip_filter
+            .try_read()
+            .map(|f| f.size_bytes())
+            .unwrap_or(0);
+        let geoip_bytes = self
+            .country_db
+            .try_read()
+            .map(|d| d.size_bytes())
+            .unwrap_or(0);
+        let content_filter_bytes = self.filter.size_bytes();
+
+        // ── caches & bookkeeping maps ─────────────────────────────────────────
+        let smart_sources_bytes = self.smart_sources.size_bytes();
+
+        let server_list_bytes = {
+            let l = self.server_list.try_read();
+            match l {
+                Ok(v) => (v.capacity() * size_of::<SocketAddrV4>()) as u64,
+                Err(_) => 0,
+            }
+        };
+
+        let mut misc = 0u64;
+        misc += dm_slots(self.our_sent_random_parts.capacity(), IPV4, 4);
+        misc += dm_slots(self.seed_server_keys.capacity(), IPV4, 4);
+        misc += dm_slots(self.incoming_seed_challenges.capacity(), IPV4, 4);
+        misc += dm_slots(self.observed_udp_ports.capacity(), IPV4, 2 + INSTANT);
+        misc += dm_slots(self.recent_client_ips.capacity(), IPV4, INSTANT);
+        misc += dm_slots(self.verified_servers.capacity(), IPV4, INSTANT);
+        misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
+        misc += dm_slots(self.csam_unique_ips.capacity(), IPV4, 8);
+        misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 0);
+        misc += dm_slots(self.obf_decode_cache.capacity(), IPV4, 5);
+        misc += dm_slots(self.banned_bots.capacity(), IPV4, INSTANT);
+        misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
+        misc += dm_slots(self.bot_query_log.capacity(), IPV4, size_of::<BotTracker>());
+        misc += dm_slots(self.bot_detections.capacity(), IPV4, size_of::<BotDetection>());
+        misc += dm_slots(self.udp_sockets.capacity(), 2, size_of::<Arc<tokio::net::UdpSocket>>());
+
+        // ── totals ────────────────────────────────────────────────────────────
+        let slab_total = slab_records + slab_next + slab_buckets + slab_spilled_src;
+        let kw_total = kw_data + kw_headers + kw_slots;
+        let names_total = name_bytes + name_arc_ctrl + name_map_slots;
+        let uf_total = uf_sets_bytes + uf_map_slots;
+        let clients_total = clients_slots + client_strings;
+        let filters_total = ipfilter_bytes + geoip_bytes + content_filter_bytes;
+        let other_total = smart_sources_bytes + server_list_bytes + misc;
+
+        vec![
+            // file slab
+            ("slab_records_cap".into(), slab_records),
+            ("slab_next+buckets_cap".into(), slab_next + slab_buckets),
+            ("slab_sources_spilled".into(), slab_spilled_src),
+            ("slab_TOTAL".into(), slab_total),
+            // keyword index
+            ("keyword_posting_data_cap".into(), kw_data),
+            ("keyword_vec_headers".into(), kw_headers),
+            ("keyword_table_slots_cap".into(), kw_slots),
+            ("keyword_TOTAL".into(), kw_total),
+            // names
+            ("names_bytes".into(), name_bytes),
+            ("names_arc_ctrl".into(), name_arc_ctrl),
+            ("names_map_slots_cap".into(), name_map_slots),
+            ("names_TOTAL".into(), names_total),
+            // reverse index
+            ("user_files_sets_cap".into(), uf_sets_bytes),
+            ("user_files_map_slots_cap".into(), uf_map_slots),
+            ("user_files_TOTAL".into(), uf_total),
+            // clients
+            ("clients_map_slots_cap".into(), clients_slots),
+            ("clients_strings".into(), client_strings),
+            ("clients_TOTAL".into(), clients_total),
+            // filters (static, loaded at startup)
+            ("filter_ipfilter".into(), ipfilter_bytes),
+            ("filter_geoip".into(), geoip_bytes),
+            ("filter_content".into(), content_filter_bytes),
+            ("filters_TOTAL".into(), filters_total),
+            // caches / bookkeeping
+            ("smart_sources_cache".into(), smart_sources_bytes),
+            ("server_list".into(), server_list_bytes),
+            ("misc_maps".into(), misc),
+            ("other_TOTAL".into(), other_total),
+            // grand total
+            (
+                "GRAND_TOTAL_tracked".into(),
+                slab_total + kw_total + names_total + uf_total
+                    + clients_total + filters_total + other_total,
+            ),
         ]
     }
 

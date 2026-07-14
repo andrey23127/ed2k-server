@@ -84,6 +84,22 @@ impl SmartSourcesCache {
 
     /// Cache statistics: (hits, misses). Used by the admin Status page to show
     /// the real GETSOURCES cache hit rate.
+    /// Heap bytes held by the cache (for /api/memsize): map slots plus each
+    /// entry's encoded payload buffer (by capacity).
+    pub fn size_bytes(&self) -> u64 {
+        let m = self.map.lock().unwrap();
+        let slots = (m.capacity()
+            * (std::mem::size_of::<[u8; 16]>() + std::mem::size_of::<CacheEntry>() + 1))
+            as u64;
+        let payloads: u64 = m.values().map(|e| e.payload.capacity() as u64).sum();
+        slots + payloads
+    }
+
+    /// Number of cached entries (diagnostics).
+    pub fn entry_count(&self) -> usize {
+        self.map.lock().unwrap().len()
+    }
+
     pub fn stats(&self) -> (u64, u64) {
         (
             self.hits.load(Ordering::Relaxed),
