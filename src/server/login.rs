@@ -115,7 +115,20 @@ pub fn build_welcome_batch(
         let mut payload = BytesMut::with_capacity(20);
         payload.put_u32_le(client.assigned_id);            // [0-3]   client_id
         payload.put_u32_le(tcp_flags);                      // [4-7]   tcp_flags
-        payload.put_u32_le(client.assigned_id);            // [8-11]  filler
+        // [8-11] AUX PORT — the server's "standard" TCP port.
+        //
+        // This is NOT a filler. eMule skips these bytes (it reads the reported IP
+        // straight from packet+12), but aMule reads them as the aux-port field and
+        // does `cur_server->SetPort(ConnPort)` — and CServer::realport is a uint16,
+        // so whatever we put here gets truncated to 16 bits and BECOMES the server's
+        // port in the client's list. We used to put client_id here, so every aMule
+        // session rewrote our port to `assigned_id & 0xFFFF`: client id 1968999842
+        // showed up as port 36258, the next session as 34750, and so on — the
+        // "phantom clones of our server on random ports" that only ever appeared in
+        // aMule. The field means "if the client logged in on an auxiliary port, here
+        // is the standard port to advertise", so send our real TCP port. aMule then
+        // sets the port to what it already is (no-op) and eMule is unaffected.
+        payload.put_u32_le(cfg.network.tcp_port as u32);   // [8-11]  aux/standard port
         payload.put_u32_le(server_ip);                      // [12-15] server_reported_ip
         payload.put_u32_le(cfg.network.tcp_port as u32);   // [16-19] obfuscation_tcp_port
         frames.push(Frame::new(OP_IDCHANGE, payload.to_vec()));
