@@ -8,6 +8,7 @@
 #[allow(dead_code)]
 pub mod file_id;
 pub mod keyword_index;
+pub mod posting_codec;
 pub mod name_interner;
 pub mod smart_sources;
 
@@ -285,6 +286,14 @@ pub struct ServerState {
     /// and from a successful obfuscated handshake, where we know the seed's TCP port
     /// because we initiated to it.
     pub verified_sockets: DashMap<SocketAddrV4, std::time::Instant>,
+    /// Live sum of every connection's Framed read+write buffer CAPACITY.
+    ///
+    /// These buffers are per-connection heap that /api/memsize could not see (they
+    /// live inside each task's Framed, not in any registry), which is why the
+    /// unaccounted remainder tracked the client count. Each connection adds its
+    /// current capacity here and subtracts it on close, so the endpoint can report
+    /// the real figure instead of us inferring it from a regression.
+    pub framed_buffer_bytes: std::sync::atomic::AtomicI64,
     /// When each entry was first added to server_list (for the "give it 10
     /// minutes to verify" grace period).
     pub server_list_added_at: DashMap<std::net::Ipv4Addr, std::time::Instant>,
@@ -531,6 +540,7 @@ impl ServerState {
             recent_client_ips: DashMap::new(),
             verified_servers: DashMap::new(),
             verified_sockets: DashMap::new(),
+            framed_buffer_bytes: std::sync::atomic::AtomicI64::new(0),
             server_list_added_at: DashMap::new(),
             csam_unique_ips: DashMap::new(),
             csam_blocked_hashes: DashMap::new(),
@@ -847,7 +857,12 @@ impl ServerState {
         let kw_total = kw_data + kw_headers + kw_slots;
         let names_total = name_bytes + name_arc_ctrl + name_map_slots;
         let uf_total = uf_sets_bytes + uf_map_slots;
-        let clients_total = clients_slots + client_strings;
+        // Real per-connection codec buffers, reported by the connections themselves.
+        let framed_bufs = self
+            .framed_buffer_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(0) as u64;
+        let clients_total = clients_slots + client_strings + framed_bufs;
         let filters_total = ipfilter_bytes + geoip_bytes + content_filter_bytes;
         let other_total = smart_sources_bytes + server_list_bytes + misc;
 
@@ -874,6 +889,7 @@ impl ServerState {
             // clients
             ("clients_map_slots_cap".into(), clients_slots),
             ("clients_strings".into(), client_strings),
+            ("clients_framed_buffers".into(), framed_bufs),
             ("clients_TOTAL".into(), clients_total),
             // filters (static, loaded at startup)
             ("filter_ipfilter".into(), ipfilter_bytes),

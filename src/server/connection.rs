@@ -29,7 +29,21 @@ pub async fn handle_connection(
     peer: SocketAddr,
 ) -> Result<()> {
     let codec = Ed2kCodec::new(cfg.network.max_frame_size);
-    let mut framed = Framed::new(stream, codec);
+    // Framed::new would allocate 8 KiB for the read buffer AND 8 KiB for the write
+    // buffer — 16 KiB of heap per connection before a single byte arrives. eD2k
+    // control frames are small (a login, a search, a keepalive: tens to hundreds of
+    // bytes), so that baseline is mostly waste at 50k+ users. Start both buffers
+    // small; BytesMut grows geometrically on demand, and the rare big frame (an
+    // OFFERFILES publish) is handed back by reclaim_framed_buffers() afterwards.
+    let mut framed = Framed::with_capacity(stream, codec, FRESH_BUF);
+    // with_capacity only sizes the READ buffer; the write buffer still defaults to
+    // 8 KiB. It is empty at this point, so swapping it is safe.
+    *framed.write_buffer_mut() = BytesMut::with_capacity(FRESH_BUF);
+
+    // Report this connection's buffer footprint so /api/memsize can show it instead
+    // of it landing in "unaccounted". Kept in sync on every reclaim, removed on exit.
+    let mut accounted_bufs: i64 = 0;
+    account_framed_buffers(&state, &framed, &mut accounted_bufs);
 
     let mut client: Option<ClientHandle> = None;
     // Channel for OTHER tasks to push frames at this client — used by CALLBACK
@@ -161,6 +175,8 @@ pub async fn handle_connection(
                             warn!(ip = %peer.ip(), error = %e, "handler error");
                             break;
                         }
+                        reclaim_framed_buffers(&mut framed);
+                        account_framed_buffers(&state, &framed, &mut accounted_bufs);
                     }
                     Some(Err(e)) => {
                         warn!(ip = %peer.ip(), error = %e, "frame error - dropping");
@@ -177,6 +193,8 @@ pub async fn handle_connection(
                     debug!(ip = %peer.ip(), error = %e, "send error on pushed frame");
                     break;
                 }
+                reclaim_framed_buffers(&mut framed);
+                account_framed_buffers(&state, &framed, &mut accounted_bufs);
                 // Pushed frames (server-originated keepalive pings, search
                 // results, etc.) are also legitimate connection activity —
                 // a quiet client that we just pinged is not idle, it is
@@ -193,6 +211,14 @@ pub async fn handle_connection(
                 break;
             }
         }
+    }
+
+    // This connection's buffers are about to be dropped — take them off the gauge.
+    // Runs on every exit path: the loop above only leaves via `break`.
+    if accounted_bufs != 0 {
+        state
+            .framed_buffer_bytes
+            .fetch_sub(accounted_bufs, std::sync::atomic::Ordering::Relaxed);
     }
 
     if let Some(c) = client {
@@ -218,6 +244,48 @@ pub async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// Starting (and target) size of each codec buffer.
+const FRESH_BUF: usize = 2 * 1024;
+/// Hand a buffer back once it has grown past this and is drained.
+const BUF_HIGH_WATER: usize = 8 * 1024;
+
+/// Give back an oversized-but-empty codec buffer.
+///
+/// `Framed` grows its read/write buffers to fit the largest frame it ever sees (a
+/// big OFFERFILES publish, a large search page) and then NEVER shrinks them, so the
+/// capacity sticks for the whole session. Measured live, per-connection heap that
+/// /api/memsize could not see tracked the client count at ~33 KiB each — at 54k
+/// users that projects to ~1.7 GB, comparable to the entire file index.
+///
+/// The `is_empty()` guard is what makes this safe: `Framed` keeps partially-received
+/// bytes in the read buffer and not-yet-flushed bytes in the write buffer, so
+/// replacing a NON-empty buffer would corrupt the stream. When it is drained there
+/// is nothing to preserve.
+fn reclaim_framed_buffers(framed: &mut Framed<CryptStream, Ed2kCodec>) {
+    if framed.read_buffer().is_empty() && framed.read_buffer().capacity() > BUF_HIGH_WATER {
+        *framed.read_buffer_mut() = BytesMut::with_capacity(FRESH_BUF);
+    }
+    if framed.write_buffer().is_empty() && framed.write_buffer().capacity() > BUF_HIGH_WATER {
+        *framed.write_buffer_mut() = BytesMut::with_capacity(FRESH_BUF);
+    }
+}
+
+/// Keep the global Framed-buffer gauge in step with this connection's real capacity.
+fn account_framed_buffers(
+    state: &Arc<ServerState>,
+    framed: &Framed<CryptStream, Ed2kCodec>,
+    accounted: &mut i64,
+) {
+    let now = (framed.read_buffer().capacity() + framed.write_buffer().capacity()) as i64;
+    let delta = now - *accounted;
+    if delta != 0 {
+        state
+            .framed_buffer_bytes
+            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+        *accounted = now;
+    }
 }
 
 async fn dispatch(
