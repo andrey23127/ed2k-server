@@ -1,6 +1,6 @@
 [package]
 name = "ed2k-server"
-version = "0.9.66"
+version = "0.9.67"
 edition = "2021"
 description = "Modern eDonkey2000 / eMule index server (test/MVP build)"
 license = "MIT"

@@ -468,23 +468,35 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 }
                 if removed > 0 {
                     let remaining = state_orphan.file_slab.live_count();
-                    // Reclaim keyword-index memory left behind by the removals
-                    // (empty posting sets + over-large set capacity). Off the
-                    // hot path, so the shrink cost is fine here.
-                    let dropped_kw = state_orphan.keyword_index.compact();
-                    // CRITICAL: also purge the evicted hashes from the
-                    // `user_files` reverse index. Orphan-cleanup bypasses
-                    // remove_sources_of (the only other place that touches
-                    // user_files), so without this the reverse index retains
-                    // dead FileHash entries forever — the real RSS leak.
+                    // CRITICAL: purge the evicted hashes from the `user_files`
+                    // reverse index. Orphan-cleanup bypasses remove_sources_of
+                    // (the only other place that touches user_files), so without
+                    // this the reverse index retains dead FileHash entries forever
+                    // — the real RSS leak.
                     state_orphan.purge_ids_from_user_files(&evicted_ids);
                     // Note: slab slots are tombstoned (not freed) by design —
                     // ids must never be reused. Heavy fields (name/sources) are
                     // already cleared on tombstone, so the per-record residue is
                     // just the small packed header.
                     state_orphan.user_files.shrink_to_fit();
-                    info!(removed, remaining, dropped_kw,
-                          "orphan file cleanup: evicted files with no sources, compacted index + reverse index");
+                    info!(removed, remaining,
+                          "orphan file cleanup: evicted files with no sources, purged reverse index");
+                }
+
+                // Drain the keyword-index hot tier into the compressed cold store.
+                //
+                // This MUST run every cycle, not only when files were evicted.
+                // add_file only ever writes to the hot Vec tier; compact() is the
+                // ONLY thing that merges hot into the delta-varint cold blobs. On a
+                // healthy server files are mostly ADDED, not evicted, so orphan
+                // removals are rare — gating compact on `removed > 0` meant hot
+                // never drained and cold stayed empty (observed live: cold_keys=0,
+                // hot_keys=513k after an hour), losing the entire varint memory win
+                // and bloating the uncompressed hot tier. Runs every ~10 min, off
+                // the hot path.
+                let dropped_kw = state_orphan.keyword_index.compact();
+                if dropped_kw > 0 {
+                    info!(dropped_kw, "keyword index: compacted (hot->cold, dropped empty)");
                 }
 
                 // Free interned names that no live record references any more.
