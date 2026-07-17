@@ -648,6 +648,8 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
             "files": s.server.file_count(),
             "slab_slots": s.server.file_slab.slot_count(),
             "keyword_keys": s.server.keyword_index.posting_stats().0,
+            "keyword_cold_keys": s.server.keyword_index.tier_sizes().0,
+            "keyword_hot_keys": s.server.keyword_index.tier_sizes().1,
             "keyword_postings": s.server.keyword_index.posting_stats().1,
             "unique_names": s.server.name_interner.len(),
             "clients": s.server.clients.len(),

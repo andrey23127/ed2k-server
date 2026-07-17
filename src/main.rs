@@ -313,6 +313,17 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // that stops answering pings stops being advertised (and a phantom
                 // port, which never answers, is never verified in the first place).
                 state_clean.verified_sockets.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
+                // observed_udp_ports remembers each client's externally-seen UDP port
+                // for NAT-T coordination. It is re-inserted with a fresh timestamp on
+                // every UDP packet from that IP, so an entry older than 30 min means
+                // the client has been UDP-silent that long — drop it; if it comes back
+                // the very next packet re-observes the port. Without this the map grew
+                // by every distinct IP ever seen and never shrank.
+                const OBSERVED_PORT_TTL: std::time::Duration =
+                    std::time::Duration::from_secs(30 * 60);
+                state_clean
+                    .observed_udp_ports
+                    .retain(|_, (_, ts)| ts.elapsed() < OBSERVED_PORT_TTL);
                 // Bot detector keeps per-IP sliding windows. IPs that haven't
                 // queried in 5 minutes can be dropped — their window is empty
                 // and re-creating it on next query is cheap. Without this

@@ -136,7 +136,12 @@ fn tokenize_into<F: FnMut(&str)>(filename: &str, mut visit: F) {
 #[derive(Default)]
 pub struct KeywordIndex {
     /// Compressed, ascending, deduped posting blobs (the bulk of the index).
-    cold: DashMap<TokenHash, Vec<u8>>,
+    ///
+    /// Stored as `Box<[u8]>` (ptr+len, 16 B) rather than `Vec<u8>` (ptr+len+cap,
+    /// 24 B): a cold blob is rebuilt whole by `compact()` and never grown in place,
+    /// so the spare-capacity field a `Vec` carries is pure waste — 8 B per keyword
+    /// (~7.6 MB now, ~180 MB projected at 33M keys).
+    cold: DashMap<TokenHash, Box<[u8]>>,
     /// Recent additions not yet merged into `cold`, as plain sorted+deduped Vecs.
     hot: DashMap<TokenHash, Vec<FileId>>,
 }
@@ -179,7 +184,7 @@ impl KeywordIndex {
                 if let Some(mut ids) = posting_codec::decode(entry.value()) {
                     if let Ok(pos) = ids.binary_search(&id) {
                         ids.remove(pos);
-                        *entry.value_mut() = posting_codec::encode(&ids);
+                        *entry.value_mut() = posting_codec::encode(&ids).into_boxed_slice();
                     }
                 }
             }
@@ -259,14 +264,43 @@ impl KeywordIndex {
             _ => return Vec::new(),
         };
 
+        // Intersect against each other token WITHOUT materialising its full posting.
+        //
+        // `result` is ascending (the seed was sorted). For each other token we hold
+        // its cold blob and hot Vec and test membership per result element: the cold
+        // side via a monotonic `PostingCursor` (no allocation, no full decode into a
+        // Vec), the hot side via binary_search. Because `retain` visits `result` in
+        // ascending order, the cursor only moves forward — so a common word like
+        // "the" (a huge posting) is never decoded into a multi-MB Vec on every
+        // search; we stream past it once. (Stage 3 regressed this to a full
+        // materialize per token; this restores the streaming intersection.)
         for (i, h) in hashes.iter().enumerate() {
             if i == seed_idx {
                 continue;
             }
-            match self.materialize(*h) {
-                Some(posting) => result.retain(|fh| posting.binary_search(fh).is_ok()),
-                None => return Vec::new(),
+            let cold_ref = self.cold.get(h);
+            let hot_ref = self.hot.get(h);
+            if cold_ref.is_none() && hot_ref.is_none() {
+                return Vec::new(); // token absent entirely → empty intersection
             }
+            // Cursor over the cold blob (if any and well-formed).
+            let mut cursor = match &cold_ref {
+                Some(c) => posting_codec::PostingCursor::new(c.value()),
+                None => None,
+            };
+            result.retain(|fh| {
+                let in_cold = match cursor.as_mut() {
+                    Some(cur) => cur.contains(*fh),
+                    None => false,
+                };
+                if in_cold {
+                    return true;
+                }
+                match &hot_ref {
+                    Some(h) => h.value().binary_search(fh).is_ok(),
+                    None => false,
+                }
+            });
             if result.is_empty() {
                 break;
             }
@@ -294,6 +328,13 @@ impl KeywordIndex {
         (self.cold.len().max(self.hot.len()) as u64, total)
     }
 
+    /// (cold_keys, hot_keys) — the two-tier split, for /api/memsize observability.
+    /// Lets us confirm the cold tier is the compressed Box<[u8]> store and see how
+    /// much sits un-merged in hot between compactions.
+    pub fn tier_sizes(&self) -> (usize, usize) {
+        (self.cold.len(), self.hot.len())
+    }
+
     /// Byte-level breakdown for /api/memsize. Returns
     /// (blob_data_bytes, blob_vec_headers_bytes, key_slots_bytes).
     ///
@@ -302,15 +343,15 @@ impl KeywordIndex {
     /// - `key_slots_bytes`: hashbrown table slots (key + value + 1 ctrl), by the
     ///   map's capacity — the power-of-two/never-shrink-on-retain cost.
     pub fn size_report(&self) -> (u64, u64, u64) {
-        let blob_hdr = std::mem::size_of::<Vec<u8>>() as u64;
+        let blob_hdr = std::mem::size_of::<Box<[u8]>>() as u64;
         let idvec_hdr = std::mem::size_of::<Vec<FileId>>() as u64;
         let id_sz = std::mem::size_of::<FileId>() as u64;
         let key_sz = std::mem::size_of::<TokenHash>() as u64;
 
-        // data = compressed cold blobs + raw hot Vecs (the transient un-merged tier)
+        // data = compressed cold blobs (exact-sized) + raw hot Vecs (un-merged tier)
         let mut data = 0u64;
         for e in self.cold.iter() {
-            data += e.value().capacity() as u64;
+            data += e.value().len() as u64;
         }
         for e in self.hot.iter() {
             data += e.value().capacity() as u64 * id_sz;
@@ -359,13 +400,11 @@ impl KeywordIndex {
             }
             merged.extend_from_slice(&cold_ids[i..]);
             merged.extend_from_slice(&hv[j..]);
-            *cold_entry.value_mut() = posting_codec::encode(&merged);
+            *cold_entry.value_mut() = posting_codec::encode(&merged).into_boxed_slice();
         }
 
-        // Shrink cold blob buffers and drop keywords that became empty.
-        for mut entry in self.cold.iter_mut() {
-            entry.value_mut().shrink_to_fit();
-        }
+        // Box<[u8]> blobs are already exact-sized (rebuilt whole above), so there
+        // is no spare capacity to reclaim. Just drop keywords that became empty.
         let before = self.cold.len();
         self.cold
             .retain(|_, blob| posting_codec::decoded_len(blob).unwrap_or(0) != 0);
