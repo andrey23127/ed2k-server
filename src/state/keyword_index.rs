@@ -144,6 +144,20 @@ pub struct KeywordIndex {
     cold: DashMap<TokenHash, Box<[u8]>>,
     /// Recent additions not yet merged into `cold`, as plain sorted+deduped Vecs.
     hot: DashMap<TokenHash, Vec<FileId>>,
+    /// Deletions not yet applied to `cold`, as plain sorted+deduped Vecs.
+    ///
+    /// Symmetric to `hot`. Applying a removal directly to the cold tier means
+    /// decode + re-encode of the whole blob per deleted file per token; profiling
+    /// showed that `posting_codec::encode` was ~24% of process CPU, essentially all
+    /// of it from `remove_file` (client disconnects and orphan eviction delete far
+    /// more than "rare"). Marking here is O(log n) on a small Vec, and `compact()`
+    /// applies the whole batch in the same single decode+encode per key it already
+    /// does for `hot`.
+    ///
+    /// INVARIANT: `pending_removals[k]` and `hot[k]` are disjoint — `add_file`
+    /// clears an id from pending when it re-adds it, so a delete-then-re-add
+    /// sequence cannot resurrect the deletion at compact time.
+    pending_removals: DashMap<TokenHash, Vec<FileId>>,
 }
 
 impl KeywordIndex {
@@ -164,6 +178,13 @@ impl KeywordIndex {
             if let Err(pos) = v.binary_search(&id) {
                 v.insert(pos, id);
             }
+            drop(v);
+            // Re-add cancels a not-yet-applied delete, keeping hot/pending disjoint.
+            if let Some(mut pend) = self.pending_removals.get_mut(&th) {
+                if let Ok(pos) = pend.binary_search(&id) {
+                    pend.remove(pos);
+                }
+            }
         });
     }
 
@@ -177,15 +198,14 @@ impl KeywordIndex {
                     v.remove(pos);
                 }
             }
-            // And from the cold blob if present. Removes are far rarer than adds and
-            // are batched by the orphan-cleanup path, so the O(posting) re-encode
-            // here is acceptable; it is NOT on the publish hot path.
-            if let Some(mut entry) = self.cold.get_mut(&th) {
-                if let Some(mut ids) = posting_codec::decode(entry.value()) {
-                    if let Ok(pos) = ids.binary_search(&id) {
-                        ids.remove(pos);
-                        *entry.value_mut() = posting_codec::encode(&ids).into_boxed_slice();
-                    }
+            // For the cold tier, only MARK the deletion — do not touch the blob.
+            // compact() applies the batch. Reads subtract pending, so the file stops
+            // being returned immediately even though the blob still contains it.
+            // Only worth marking if the key actually has a cold blob.
+            if self.cold.contains_key(&th) {
+                let mut pend = self.pending_removals.entry(th).or_default();
+                if let Err(pos) = pend.binary_search(&id) {
+                    pend.insert(pos, id);
                 }
             }
         });
@@ -198,6 +218,20 @@ impl KeywordIndex {
     /// `cold`). Returns an owned ascending, deduped Vec. `None` iff the keyword is
     /// absent from BOTH tiers.
     fn materialize(&self, th: TokenHash) -> Option<Vec<FileId>> {
+        let out = self.materialize_raw(th)?;
+        // Subtract not-yet-applied deletions. hot and pending are disjoint, so this
+        // only drops ids still physically present in the cold blob.
+        match self.pending_removals.get(&th) {
+            Some(pend) if !pend.is_empty() => {
+                let p = pend.value();
+                Some(out.into_iter().filter(|id| p.binary_search(id).is_err()).collect())
+            }
+            _ => Some(out),
+        }
+    }
+
+    /// merge(cold, hot) WITHOUT applying pending removals.
+    fn materialize_raw(&self, th: TokenHash) -> Option<Vec<FileId>> {
         let cold = self.cold.get(&th);
         let hot = self.hot.get(&th);
         match (cold, hot) {
@@ -233,7 +267,12 @@ impl KeywordIndex {
             .and_then(|c| posting_codec::decoded_len(c.value()))
             .unwrap_or(0);
         let hot = self.hot.get(&th).map(|h| h.value().len()).unwrap_or(0);
-        cold + hot
+        let pending = self
+            .pending_removals
+            .get(&th)
+            .map(|p| p.value().len())
+            .unwrap_or(0);
+        (cold + hot).saturating_sub(pending)
     }
 
     /// Look up file ids that have ALL of the given tokens.
@@ -283,6 +322,9 @@ impl KeywordIndex {
             if cold_ref.is_none() && hot_ref.is_none() {
                 return Vec::new(); // token absent entirely → empty intersection
             }
+            // Deletions not yet applied to the cold blob: an id found by the cursor
+            // that is listed here must be treated as absent.
+            let pend_ref = self.pending_removals.get(h);
             // Cursor over the cold blob (if any and well-formed).
             let mut cursor = match &cold_ref {
                 Some(c) => posting_codec::PostingCursor::new(c.value()),
@@ -294,7 +336,14 @@ impl KeywordIndex {
                     None => false,
                 };
                 if in_cold {
-                    return true;
+                    // Still in the blob, but scheduled for deletion → not a match.
+                    let deleted = match &pend_ref {
+                        Some(p) => p.value().binary_search(fh).is_ok(),
+                        None => false,
+                    };
+                    if !deleted {
+                        return true;
+                    }
                 }
                 match &hot_ref {
                     Some(h) => h.value().binary_search(fh).is_ok(),
@@ -328,11 +377,11 @@ impl KeywordIndex {
         (self.cold.len().max(self.hot.len()) as u64, total)
     }
 
-    /// (cold_keys, hot_keys) — the two-tier split, for /api/memsize observability.
+    /// (cold_keys, hot_keys, pending_removal_keys) — the deferred-tier split, for /api/memsize observability.
     /// Lets us confirm the cold tier is the compressed Box<[u8]> store and see how
     /// much sits un-merged in hot between compactions.
-    pub fn tier_sizes(&self) -> (usize, usize) {
-        (self.cold.len(), self.hot.len())
+    pub fn tier_sizes(&self) -> (usize, usize, usize) {
+        (self.cold.len(), self.hot.len(), self.pending_removals.len())
     }
 
     /// Byte-level breakdown for /api/memsize. Returns
@@ -356,11 +405,16 @@ impl KeywordIndex {
         for e in self.hot.iter() {
             data += e.value().capacity() as u64 * id_sz;
         }
+        for e in self.pending_removals.iter() {
+            data += e.value().capacity() as u64 * id_sz;
+        }
         // headers = one Vec header per cold key + one per hot key
-        let headers = self.cold.len() as u64 * blob_hdr + self.hot.len() as u64 * idvec_hdr;
+        let headers = self.cold.len() as u64 * blob_hdr
+            + (self.hot.len() + self.pending_removals.len()) as u64 * idvec_hdr;
         // slots = both maps' table capacity
         let slots = self.cold.capacity() as u64 * (key_sz + blob_hdr + 1)
-            + self.hot.capacity() as u64 * (key_sz + idvec_hdr + 1);
+            + (self.hot.capacity() + self.pending_removals.capacity()) as u64
+                * (key_sz + idvec_hdr + 1);
 
         (data, headers, slots)
     }
@@ -372,44 +426,66 @@ impl KeywordIndex {
     /// An empty posting encodes to a single `count=0` byte, so "empty" means the
     /// blob decodes to length 0.
     pub fn compact(&self) -> usize {
-        // STAGE 3 core: drain the hot tier into the cold blobs in bulk. Each hot key
-        // is merged into its cold blob exactly once here (one decode + one encode per
-        // keyword per 10-min cycle), instead of once per single insert on the hot
-        // path — that is what removes the quadratic publish cost.
-        let hot_keys: Vec<TokenHash> = self.hot.iter().map(|e| *e.key()).collect();
-        for th in hot_keys {
-            // Take the hot Vec out.
-            let hv = match self.hot.remove(&th) {
-                Some((_, v)) => v,
-                None => continue,
-            };
-            if hv.is_empty() {
+        // Drain BOTH deferred tiers into the compressed cold blobs in bulk: the hot
+        // additions and the pending removals. Each affected keyword costs exactly
+        // one decode + one merge/filter + one encode per cycle, instead of one per
+        // individual add/remove on the hot path — that is what keeps publish and
+        // disconnect traffic off the codec.
+        let mut keys: Vec<TokenHash> = self.hot.iter().map(|e| *e.key()).collect();
+        keys.extend(self.pending_removals.iter().map(|e| *e.key()));
+        keys.sort_unstable();
+        keys.dedup();
+
+        for th in keys {
+            // Take both deferred sets out first, so we hold at most one map lock at
+            // a time and never overlap with the cold entry lock below.
+            let hv = self.hot.remove(&th).map(|(_, v)| v).unwrap_or_default();
+            let pend = self
+                .pending_removals
+                .remove(&th)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            if hv.is_empty() && pend.is_empty() {
                 continue;
             }
+
             let mut cold_entry = self.cold.entry(th).or_default();
             let cold_ids = posting_codec::decode(cold_entry.value()).unwrap_or_default();
-            // Merge cold_ids (sorted) with hv (sorted), dropping duplicates.
+
+            // Apply deletions to the cold side first, then merge the additions.
+            // Order matters: hot and pending are disjoint (add_file clears an id
+            // from pending), so a delete-then-re-add ends up present, correctly.
             let mut merged = Vec::with_capacity(cold_ids.len() + hv.len());
             let (mut i, mut j) = (0usize, 0usize);
             while i < cold_ids.len() && j < hv.len() {
                 match cold_ids[i].0.cmp(&hv[j].0) {
-                    std::cmp::Ordering::Less => { merged.push(cold_ids[i]); i += 1; }
+                    std::cmp::Ordering::Less => {
+                        if pend.binary_search(&cold_ids[i]).is_err() {
+                            merged.push(cold_ids[i]);
+                        }
+                        i += 1;
+                    }
                     std::cmp::Ordering::Greater => { merged.push(hv[j]); j += 1; }
                     std::cmp::Ordering::Equal => { merged.push(cold_ids[i]); i += 1; j += 1; }
                 }
             }
-            merged.extend_from_slice(&cold_ids[i..]);
+            for id in &cold_ids[i..] {
+                if pend.binary_search(id).is_err() {
+                    merged.push(*id);
+                }
+            }
             merged.extend_from_slice(&hv[j..]);
+
             *cold_entry.value_mut() = posting_codec::encode(&merged).into_boxed_slice();
         }
 
-        // Box<[u8]> blobs are already exact-sized (rebuilt whole above), so there
-        // is no spare capacity to reclaim. Just drop keywords that became empty.
+        // Box<[u8]> blobs are exact-sized (rebuilt whole above). Drop keywords whose
+        // posting became empty, plus any leftover empty deferred entries.
         let before = self.cold.len();
         self.cold
             .retain(|_, blob| posting_codec::decoded_len(blob).unwrap_or(0) != 0);
-        // Also drop any now-empty hot Vecs left by removals.
         self.hot.retain(|_, v| !v.is_empty());
+        self.pending_removals.retain(|_, v| !v.is_empty());
         before - self.cold.len()
     }
 }
@@ -508,6 +584,50 @@ mod tests {
         // Removing a non-existent hash is a no-op.
         idx.remove_file(FileId(99), "beta.bin");
         assert_eq!(idx.find_intersection(&["beta".into()]).len(), 2);
+    }
+
+    #[test]
+    fn deferred_removals_are_invisible_before_compact() {
+        let idx = KeywordIndex::new();
+        let a = crate::state::file_id::FileId(64);
+        let b = crate::state::file_id::FileId(128);
+        let c = crate::state::file_id::FileId(4096);
+        idx.add_file(a, "Linux Mint.iso");
+        idx.add_file(b, "Linux Debian.iso");
+        idx.add_file(c, "Linux Arch.iso");
+        idx.compact(); // everything now lives in the cold blob
+
+        // Remove b: only MARKED, the blob still contains it. tier_sizes counts
+        // KEYS with pending removals, and this filename has three tokens
+        // (linux, debian, iso), so all three get a mark.
+        idx.remove_file(b, "Linux Debian.iso");
+        assert_eq!(idx.tier_sizes().2, 3, "removal was not deferred");
+        // ...but search must not return it.
+        assert_eq!(idx.find_intersection(&["linux".to_string()]), vec![a, c]);
+
+        // Compact applies the deletion; result unchanged, pending drained.
+        idx.compact();
+        assert_eq!(idx.tier_sizes().2, 0, "pending not drained by compact");
+        assert_eq!(idx.find_intersection(&["linux".to_string()]), vec![a, c]);
+    }
+
+    #[test]
+    fn re_add_cancels_a_pending_removal() {
+        let idx = KeywordIndex::new();
+        let a = crate::state::file_id::FileId(64);
+        let b = crate::state::file_id::FileId(128);
+        idx.add_file(a, "Linux Mint.iso");
+        idx.add_file(b, "Linux Debian.iso");
+        idx.compact();
+
+        idx.remove_file(b, "Linux Debian.iso");
+        idx.add_file(b, "Linux Debian.iso"); // re-published before compact ran
+        assert_eq!(idx.find_intersection(&["linux".to_string()]), vec![a, b]);
+
+        // The delete must NOT resurface when compact applies the batch.
+        idx.compact();
+        assert_eq!(idx.find_intersection(&["linux".to_string()]), vec![a, b],
+            "re-added file was wrongly deleted at compact");
     }
 
     #[test]
