@@ -163,6 +163,11 @@ impl ContentFilter {
     }
 
     /// Number of hashes in blocklist (for startup logging).
+    /// Whitelisted hashes (verified false positives, Layer 3 override).
+    pub fn whitelist_size(&self) -> usize {
+        self.hash_whitelist.len()
+    }
+
     pub fn blocklist_size(&self) -> usize {
         self.hash_blocklist.load().len()
     }
@@ -206,7 +211,21 @@ impl ContentFilter {
     /// Load a hash list file. Format: one hex MD4 per line, optional
     /// `;`-comment after the hash. Lines starting with # are skipped.
     pub fn load_hash_file(path: &Path) -> std::io::Result<Vec<[u8; 16]>> {
-        let content = std::fs::read_to_string(path)?;
+        // Read bytes and decode leniently instead of `read_to_string`.
+        //
+        // This file legitimately carries eD2k FILENAMES in its `;` comments (that
+        // is how a reviewer knows what a hash refers to), and eD2k filenames are
+        // arbitrary bytes — any encoding, or none. A strict UTF-8 read fails on the
+        // first bad byte and returns Err for the WHOLE file, which silently
+        // disables Layer 3 entirely: observed live as
+        // "blocklist load failed ... stream did not contain valid UTF-8" with
+        // entries = 0 while thousands of hashes sat in the file.
+        //
+        // Lossy decoding replaces bad sequences with U+FFFD. The payload we parse
+        // is ASCII hex, so it is unaffected; only comment text can be mangled, and
+        // a mangled comment is infinitely better than a disabled blocklist.
+        let bytes = std::fs::read(path)?;
+        let content = String::from_utf8_lossy(&bytes);
         let mut hashes = Vec::new();
         for (lineno, line) in content.lines().enumerate() {
             let trimmed = line.trim();
@@ -239,7 +258,10 @@ impl ContentFilter {
 
     /// Load operator-supplied extra term file (one substring per line).
     pub fn load_terms_file(path: &Path) -> std::io::Result<Vec<String>> {
-        let content = std::fs::read_to_string(path)?;
+        // Same reasoning as load_hash_file: term lists carry non-ASCII terms and
+        // operator comments, so one bad byte must not discard the whole file.
+        let bytes = std::fs::read(path)?;
+        let content = String::from_utf8_lossy(&bytes);
         Ok(content
             .lines()
             .map(|s| s.trim())

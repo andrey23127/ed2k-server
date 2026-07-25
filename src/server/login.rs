@@ -80,6 +80,17 @@ pub fn build_welcome_batch(
     state: &ServerState,
     client: &ClientHandle,
 ) -> Vec<Frame> {
+    // Hot-reloadable view of the configuration. /api/config swaps `live_cfg`
+    // atomically, so everything read through `live` below takes effect for the
+    // NEXT client that logs in — no restart needed for the server name,
+    // description, version, advertised limits or welcome messages.
+    //
+    // PORTS ARE DELIBERATELY NOT READ FROM HERE. `cfg.network.tcp_port` is the
+    // port we are actually bound to; the live config may already carry a new
+    // value that only becomes real after a restart (web.rs flags port changes as
+    // restart-needed). Advertising a port nothing listens on would send every
+    // client to a dead socket, so the bound port stays authoritative.
+    let live = state.live_cfg.load();
     let mut frames = Vec::new();
 
     // 1. IDCHANGE — 20-byte payload, format required by eMule 0.49c ServerSocket.cpp:
@@ -103,10 +114,10 @@ pub fn build_welcome_batch(
     //   0x0400 TCPOBFUSCATION — required (with non-zero obf port) for "Obfuscation: Yes"
     //   = 0x05DD
     {
-        let server_ip: u32 = if cfg.server.this_ip.is_empty() {
+        let server_ip: u32 = if live.server.this_ip.is_empty() {
             0
         } else {
-            cfg.server.this_ip.parse::<std::net::Ipv4Addr>()
+            live.server.this_ip.parse::<std::net::Ipv4Addr>()
                 .map(|ip| u32::from_le_bytes(ip.octets()))
                 .unwrap_or(0)
         };
@@ -143,12 +154,12 @@ pub fn build_welcome_batch(
 
     // 3. SERVERMESSAGE — first welcome line (or default)
     {
-        let msg = cfg
+        let msg = live
             .welcome
             .messages
             .first()
             .cloned()
-            .unwrap_or_else(|| format!("Welcome to {}", cfg.server.name));
+            .unwrap_or_else(|| format!("Welcome to {}", live.server.name));
         let mut payload = BytesMut::with_capacity(2 + msg.len());
         payload.put_u16_le(msg.len() as u16);
         payload.put_slice(msg.as_bytes());
@@ -164,10 +175,10 @@ pub fn build_welcome_batch(
         payload.put_slice(&server_hash);
 
         // Server IP: use configured this_ip if set, otherwise 0 (client uses TCP source)
-        let server_ip: u32 = if cfg.server.this_ip.is_empty() {
+        let server_ip: u32 = if live.server.this_ip.is_empty() {
             0
         } else {
-            cfg.server.this_ip.parse::<std::net::Ipv4Addr>()
+            live.server.this_ip.parse::<std::net::Ipv4Addr>()
                 .map(|ip| u32::from_le_bytes(ip.octets()))
                 .unwrap_or(0)
         };
@@ -175,17 +186,17 @@ pub fn build_welcome_batch(
         payload.put_u16_le(cfg.network.tcp_port);
 
         let tags = vec![
-            Tag::byte(ST_SERVERNAME,  TagValue::String(cfg.server.name.clone())),
-            Tag::byte(ST_DESCRIPTION, TagValue::String(cfg.server.desc.clone())),
+            Tag::byte(ST_SERVERNAME,  TagValue::String(live.server.name.clone())),
+            Tag::byte(ST_DESCRIPTION, TagValue::String(live.server.desc.clone())),
             // ST_VERSION as STRING "major.minor" — same format as our 0xA3 reply.
             // Some eMule builds don't display UINT32-encoded version in the server
             // list, so we use the explicit "17.15" string that eMule parses reliably.
             Tag::byte(ST_VERSION, TagValue::String(
-                format!("{}.{}", cfg.server.version_major, cfg.server.version_minor)
+                format!("{}.{}", live.server.version_major, live.server.version_minor)
             )),
-            Tag::byte(ST_MAXUSERS,    TagValue::U32(cfg.limits.max_clients)),
-            Tag::byte(ST_SOFTFILES,   TagValue::U32(cfg.limits.soft_limit_files)),
-            Tag::byte(ST_HARDFILES,   TagValue::U32(cfg.limits.hard_limit_files)),
+            Tag::byte(ST_MAXUSERS,    TagValue::U32(live.limits.max_clients)),
+            Tag::byte(ST_SOFTFILES,   TagValue::U32(live.limits.soft_limit_files)),
+            Tag::byte(ST_HARDFILES,   TagValue::U32(live.limits.hard_limit_files)),
             // ST_UDPFLAGS — eMule's SupportsObfuscationTCP() requires either this OR
             // ST_TCPFLAGS to have bit 0x400 (SRV_UDPFLG_TCPOBFUSCATION) set.
             // From eMule's server.h: SupportsObfuscationTCP() =
@@ -204,7 +215,7 @@ pub fn build_welcome_batch(
     }
 
     // 5. Additional welcome lines (welcome[1..N])
-    for line in cfg.welcome.messages.iter().skip(1) {
+    for line in live.welcome.messages.iter().skip(1) {
         let mut payload = BytesMut::with_capacity(2 + line.len());
         payload.put_u16_le(line.len() as u16);
         payload.put_slice(line.as_bytes());
@@ -220,13 +231,18 @@ pub fn build_welcome_batch(
 /// TCP connection; private/loopback always get LowID without probing.
 pub async fn assign_client_id(
     state: &ServerState,
-    cfg: &Config,
+    // Kept for API stability; the probe timeout now comes from live_cfg so it is
+    // hot-reloadable. Callers are unchanged.
+    _cfg: &Config,
     peer_ip: IpAddr,
     client_port: u16,
 ) -> (u32, bool) {
     use crate::server::highid_probe::{high_id_from_ip, probe};
 
-    let is_high = probe(peer_ip, client_port, cfg.network.login_timeout_ms).await;
+    // Hot-reloadable: the probe timeout is read per login, so tuning it via
+    // /api/config takes effect immediately.
+    let probe_timeout = state.live_cfg.load().network.login_timeout_ms;
+    let is_high = probe(peer_ip, client_port, probe_timeout).await;
 
     if is_high {
         let id = high_id_from_ip(peer_ip).unwrap_or_else(|| state.allocate_low_id());

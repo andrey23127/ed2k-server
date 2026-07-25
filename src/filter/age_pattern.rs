@@ -8,6 +8,12 @@
 ///
 /// Matches: optional digit + age suffix in {yo, yr, year, años, let, jahr},
 /// where age is 0-17.
+/// Age 0 is never written as an age in a filename — it is volume/episode
+/// numbering ("Ep 0Y"). Age 1 IS used in real material, so the lower bound stops
+/// at 1 and the "1 Year 83 Cumshots" class of false positive is handled by the
+/// counter guard below instead of by a blunt bound.
+const MIN_AGE: u32 = 1;
+
 fn contains_minor_age_token(s: &str) -> bool {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -31,9 +37,24 @@ fn contains_minor_age_token(s: &str) -> bool {
             i += 1;
             digits += 1;
         }
-        if age > 17 {
+        // Upper bound: 18+ is not a minor. Lower bound excludes 0, which in
+        // practice is only ever episode/volume numbering — live false positive:
+        // "XConfessions Vol. 26 Ep 0Y".
+        if !(MIN_AGE..=17).contains(&age) {
             continue;
         }
+        // Bare "y" suffix, ONLY when directly attached to the digits ("12y",
+        // "15y"). Evidenced live: "BroSis G12 B15 12y Sis Blows 15y Bro" carried
+        // four minor ages and none was recognised, because "y" alone was not a
+        // suffix. Requiring NO space is what makes this safe: Spanish "y" means
+        // "and", so "Ana 15 y Maria" would otherwise read as an age token.
+        if i < bytes.len() && (bytes[i] | 0x20) == b'y' {
+            let after_y = i + 1;
+            if after_y == bytes.len() || !is_word_char(bytes[after_y]) {
+                return true;
+            }
+        }
+
         // Optional whitespace/separator (just spaces for now)
         let after_digits = i;
         while i < bytes.len() && bytes[i] == b' ' {
@@ -44,7 +65,14 @@ fn contains_minor_age_token(s: &str) -> bool {
         let suffixes = [
             "yo", "y.o", "y.o.", "yr", "yrs", "year", "years",
             "años", "ano", "anos",
-            "let", "letnia",
+            // NOTE: bare "let" was REMOVED. Czech/Slovak "15 let" (= years) is a
+            // real age form, but "let" is also an extremely common English verb,
+            // and the scanner only requires a word boundary after it. Live FP:
+            // "Classic XXX - Vegas 3 Let It Ride (1990)" — a 1990 adult film with
+            // adult performers — parsed "3 Let" as "3 years" and, combined with
+            // the "xxx" sex term, was wrongly blocked. The inflected Slavic forms
+            // below are unambiguous and keep most of the coverage.
+            "letnia", "letni", "letech", "letý", "leta",
             "jahr", "jährig", "jahrige",
             "лет", "года", "год",
             // CJK / Korean age suffixes (e.g. "13歳", "13才", "13세").
@@ -56,11 +84,37 @@ fn contains_minor_age_token(s: &str) -> bool {
             "年生", "学年", "학년",
         ];
         let mut matched = false;
+        let rest_lower = rest.to_lowercase();
         for suffix in &suffixes {
-            if rest.to_lowercase().starts_with(*suffix) {
+            if rest_lower.starts_with(*suffix) {
                 // Check word boundary AFTER suffix
                 let suffix_end = i + suffix.len();
                 if suffix_end == bytes.len() || !is_word_char(bytes[suffix_end]) {
+                    // "3 years ago" is a time span, not somebody's age. Live false
+                    // positive: an FC2-PPV title reading "From About 3 Years Ago,
+                    // My ...". Same for the other languages we already accept an
+                    // age suffix in.
+                    let tail = rest_lower[suffix.len()..].trim_start();
+                    if tail.starts_with("ago")
+                        || tail.starts_with("назад")
+                        || tail.starts_with("temu")
+                        || tail.starts_with("前")
+                    {
+                        continue;
+                    }
+                    // A SPELLED-OUT unit followed by another number is a count, not
+                    // an age: "1 Year 83 Cumshots" is a compilation spanning a year.
+                    // Restricted to the word forms on purpose — the abbreviated ones
+                    // are routinely followed by a year of capture ("12yo 2013 cam"),
+                    // which must still register as an age.
+                    let spelled = matches!(
+                        *suffix,
+                        "year" | "years" | "año" | "años" | "ano" | "anos"
+                            | "jahr" | "лет" | "года" | "год"
+                    );
+                    if spelled && tail.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
                     matched = true;
                     break;
                 }
@@ -143,10 +197,82 @@ fn contains_sex_term(lowered: &str) -> bool {
     false
 }
 
+
+/// Gender-tagged age pairs: "G12 B15", "g13 b15", "B08 G16".
+///
+/// A single "B12" is far too weak to act on — it is a vitamin, a bomber, a bus
+/// route, a chess opening. What is not ambiguous is a PAIR of them in one
+/// filename, which is a naming convention used to label the two children in a
+/// video. Requiring two independent tokens is what keeps this false-positive
+/// free; combined with L2's mandatory sex term it is a very specific signal.
+///
+/// Evidenced live (all passed every layer before this):
+///   "mov family BroSis G12 B15 - 12y Sis Blows 15y Bro"
+///   "mov family BroSis B08 G16 - 16y girl fuck with her 8y bro"
+fn count_gender_age_tokens(s: &str) -> usize {
+    let b = s.as_bytes();
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] | 0x20; // ASCII-lowercase
+        if (c == b'g' || c == b'b') && (i == 0 || !is_word_char(b[i - 1])) {
+            let mut j = i + 1;
+            let mut age: u32 = 0;
+            let mut digits = 0;
+            while j < b.len() && b[j].is_ascii_digit() && digits < 2 {
+                age = age * 10 + (b[j] - b'0') as u32;
+                j += 1;
+                digits += 1;
+            }
+            // 1-2 digits, a minor age, and a word boundary after the number.
+            if digits > 0 && age <= 17 && (j == b.len() || !is_word_char(b[j])) {
+                count += 1;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// CJK words that state a minor age directly, rather than as digits.
+///
+/// These are ordinary words, not community jargon, so they are safe to match as
+/// substrings in a non-Latin script (no risk of hitting an English word).
+///
+/// ⚠ DO NOT ADD 女子校生 / 女子高生 ("high-school girl"). That is a mainstream
+///   GENRE TAG of legal Japanese adult video, performed by adults over 18 — it
+///   appears in catalogued studio releases (e.g. Moodyz MIGD-398, S1, Madonna).
+///   Adding it would mass-block a legal category. Junior-high (中学生, 12-15) and
+///   elementary (小学生, 6-12) carry no such adult-genre usage, which is why only
+///   those are listed. The same reasoning already governs 高 in
+///   `contains_school_grade_marker`.
+const CJK_MINOR_WORDS: &[&str] = &[
+    "中学生",   // junior high (12-15)
+    "中學生",   // ditto, traditional
+    "初中生",   // junior high (mainland usage)
+    "小学生",   // elementary (6-12)
+    "小學生",   // ditto, traditional
+    "未成年",   // "minor" (legal term), zh/ja
+    "미성년",   // ditto, Korean
+    "중학생",   // junior high, Korean
+    "초등학생", // elementary, Korean
+];
+
+fn contains_cjk_minor_word(s: &str) -> bool {
+    CJK_MINOR_WORDS.iter().any(|w| s.contains(w))
+}
+
 pub(super) fn matches_layer2(original: &str, lowered: &str) -> bool {
-    // Both conditions must hold in same filename.
-    (contains_minor_age_token(original) || contains_school_grade_marker(original))
-        && contains_sex_term(lowered)
+    // Both conditions must hold in the same filename: an age claim AND a sexual
+    // context. Neither alone is actionable — a 12-year-old's birthday video is
+    // not CSAM, and adult pornography is not our concern.
+    let age_claim = contains_minor_age_token(original)
+        || contains_school_grade_marker(original)
+        || contains_cjk_minor_word(original)
+        || count_gender_age_tokens(original) >= 2;
+    age_claim && contains_sex_term(lowered)
 }
 
 /// Detect Japanese/Korean lower-school grade markers where the grade number
@@ -179,6 +305,130 @@ fn contains_school_grade_marker(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Regression tests from live production data (2026-07) ─────────────
+    // Every string below is a REAL filename observed on the server. The blocked
+    // ones passed all filter layers before this revision; the allowed ones were
+    // wrongly blocked by it.
+
+    #[test]
+    fn regression_numbering_and_timespans_are_not_ages() {
+        // Live false positives from the 2026-07-23 review, all legal content.
+        // Episode/volume numbering read as an age of 0:
+        assert!(!contains_minor_age_token(
+            "[Lust Cinema] Erika Lust XConfessions Vol. 26 Ep 0Y - Asmr - The Sound Of Sex"
+        ));
+        // A duration read as an age of 1:
+        assert!(!contains_minor_age_token(
+            "Onlyfans - Cumpilation 2019, 1 Year 83 Cumshots! (Bareback)"
+        ));
+        // A point in the past read as an age of 3:
+        assert!(!contains_minor_age_token(
+            "FC2-PPV-3238169 An Innocent Wife ... From About 3 Years Ago, My Wife"
+        ));
+        // But real ages still count, including the low ones that DO occur in
+        // real material — the fix must not buy precision with coverage:
+        assert!(contains_minor_age_token("3 years old girl"));
+        assert!(contains_minor_age_token("PornoKid LOLITA8 rare lolita 1yo whore"));
+        assert!(contains_minor_age_token("01yo incest GraceL baby girl"));
+        // An age followed by the year of capture is still an age (this is why the
+        // counter guard is limited to spelled-out units).
+        assert!(contains_minor_age_token("cacazinha 12yo 2013 cam"));
+    }
+
+    #[test]
+    fn regression_bare_y_suffix_is_an_age() {
+        // Four minor ages in one name, none previously recognised: "y" was not a
+        // suffix and the "G12"/"B15" form was skipped entirely.
+        assert!(contains_minor_age_token("BroSis G12 B15 12y Sis Blows 15y Bro"));
+        assert!(contains_minor_age_token("16y girl fuck with her 8y bro"));
+        assert!(contains_minor_age_token("Daughter 12Yr"));
+    }
+
+    #[test]
+    fn regression_spanish_y_is_not_an_age() {
+        // "y" = "and" in Spanish. Only the attached form counts, so a spaced "y"
+        // must NOT read as an age suffix.
+        assert!(!contains_minor_age_token("Ana 15 y Maria en la playa"));
+    }
+
+    #[test]
+    fn regression_gender_age_pairs() {
+        assert_eq!(count_gender_age_tokens("mov family BroSis G12 B15 - 12y Sis"), 2);
+        assert_eq!(count_gender_age_tokens("mov family BroSis B08 G16 - 16y girl"), 2);
+        // A lone token is ambiguous (vitamin B12, chess G4) and must not qualify.
+        assert!(count_gender_age_tokens("Vitamin B12 supplement guide") < 2);
+        assert!(count_gender_age_tokens("Nikon B12 review") < 2);
+        // Adult ages are not minor ages.
+        assert_eq!(count_gender_age_tokens("G22 B24 couple"), 0);
+    }
+
+    #[test]
+    fn regression_let_is_not_a_year_suffix() {
+        // THE false positive this revision fixes: a 1990 adult film with adult
+        // performers. "Vegas 3 Let It Ride" parsed as "3 years" + "xxx" -> block.
+        let name = "Classic XXX - Vegas 3 Let It Ride(1990)(Titty Twister Rip) Victoria Paris";
+        assert!(!contains_minor_age_token(name));
+        assert!(!matches_layer2(name, &name.to_lowercase()));
+    }
+
+    #[test]
+    fn regression_series_number_is_not_an_age() {
+        // Numbers that index a series or volume, not a person's age.
+        for name in [
+            "Bring Um Young 13 - Amai Liu, Kitty Jung (Adult, About 18)",
+            "Zooskool - Animal Sex 16",
+            "Anal Expedition 3 - Sarah Blue, Vanessa Blew",
+            "Backdoor Babes 1983",
+        ] {
+            assert!(
+                !contains_minor_age_token(name),
+                "series number read as age in {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_cjk_minor_words() {
+        assert!(contains_cjk_minor_word("14歳 中学生"));
+        assert!(contains_cjk_minor_word("小学生 幼女"));
+        assert!(contains_cjk_minor_word("未成年"));
+        // The AV genre tag must NOT be treated as a minor claim.
+        assert!(!contains_cjk_minor_word("女子校生アナル大乱交 辻本りょう"));
+        assert!(!contains_cjk_minor_word("女子高生"));
+    }
+
+    #[test]
+    fn regression_legal_jav_genre_not_blocked() {
+        // Catalogued studio releases with adult performers. Blocking these would
+        // wrongly wipe out a large legal category.
+        for name in [
+            "MIGD-398-[Moodyz)女子校生アナル大乱交 辻本りょう 浅乃ハルミ",
+            "ssni-216 快感！初 体 験8 河北彩花",
+            "JUC-705 息子の嫁が巨乳過ぎて… 青木りん",
+        ] {
+            assert!(
+                !matches_layer2(name, &name.to_lowercase()),
+                "legal JAV wrongly blocked: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn regression_full_layer2_still_blocks_real_cases() {
+        // Age signal AND sex term both present -> must block.
+        for name in [
+            "Mov Family Brosis g13 b15 -15 Boy fuck And Cum On His 13 Sister",
+            "mov family BroSis B08 G16 - 16y girl fuck with her 8y bro",
+            "9 Yo Girl Sex With 10 Yo Brother",
+            "中学生 レイプ",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()),
+                "should be blocked: {name:?}"
+            );
+        }
+    }
 
     #[test]
     fn detects_yo() {

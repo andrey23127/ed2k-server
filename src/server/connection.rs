@@ -28,7 +28,15 @@ pub async fn handle_connection(
     stream: CryptStream,
     peer: SocketAddr,
 ) -> Result<()> {
-    let codec = Ed2kCodec::new(cfg.network.max_frame_size);
+    // Per-connection snapshot of the hot-reloadable config. Taken once here, so a
+    // config change applies to every NEW connection without a restart while an
+    // in-flight session keeps a consistent view for its whole lifetime.
+    // `load_full()`, not `load()`: the returned value is held across await points
+    // for the whole connection, and a fast Guard is tied to thread-local state that
+    // tokio may move between worker threads. load_full() hands back a plain Arc,
+    // which is safe to keep and costs one refcount bump per connection.
+    let live = state.live_cfg.load_full();
+    let codec = Ed2kCodec::new(live.network.max_frame_size);
     // Framed::new would allocate 8 KiB for the read buffer AND 8 KiB for the write
     // buffer — 16 KiB of heap per connection before a single byte arrives. eD2k
     // control frames are small (a login, a search, a keepalive: tens to hundreds of
@@ -61,7 +69,7 @@ pub async fn handle_connection(
     // Lives in the connection task — it is per-connection, not per-identity.
     let mut pending_search: Vec<crate::state::file_id::FileRecord> = Vec::new();
 
-    if cfg.log.connection_trace {
+    if live.log.connection_trace {
         info!(ip = %peer.ip(), port = peer.port(), "connection accepted");
     }
 
@@ -92,7 +100,7 @@ pub async fn handle_connection(
     // the keepalive task (rx.recv() arm) so server-side traffic also
     // counts as "active".
     let login_deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_millis(cfg.network.login_timeout_ms);
+        + std::time::Duration::from_millis(live.network.login_timeout_ms);
     // Idle policy (Lugdunum-style): once a client is LOGGED IN, liveness is
     // determined by the TCP socket, NOT by application silence. A legitimate
     // client behind a carrier-grade NAT may stay completely quiet for hours —
@@ -172,14 +180,28 @@ pub async fn handle_connection(
                             &cfg, &state, &state, &mut client, &mut framed, &mut rx,
                             &mut pending_search, peer, frame
                         ).await {
-                            warn!(ip = %peer.ip(), error = %e, "handler error");
+                            // Throttled: a banned publisher's client retries every
+                            // ~30 s forever, and each retry lands here.
+                            if let Some(sup) = crate::health::throttle().allow(
+                                peer.ip(), "handler_error", crate::health::SUPPRESS_WINDOW)
+                            {
+                                warn!(ip = %peer.ip(), error = %e, suppressed = sup,
+                                      "handler error");
+                            }
                             break;
                         }
                         reclaim_framed_buffers(&mut framed);
                         account_framed_buffers(&state, &framed, &mut accounted_bufs);
                     }
                     Some(Err(e)) => {
-                        warn!(ip = %peer.ip(), error = %e, "frame error - dropping");
+                        // Throttled: a peer with a broken path produces a timeout
+                        // every ~20 s indefinitely.
+                        if let Some(sup) = crate::health::throttle().allow(
+                            peer.ip(), "frame_error", crate::health::SUPPRESS_WINDOW)
+                        {
+                            warn!(ip = %peer.ip(), error = %e, suppressed = sup,
+                                  "frame error - dropping");
+                        }
                         break;
                     }
                     None => {
@@ -206,7 +228,12 @@ pub async fn handle_connection(
         }
 
         if let Some(c) = &client {
-            if c.csam_attempts >= cfg.content_filter.publisher_attempt_disconnect_threshold {
+            // Strictly greater, matching the ban condition in
+            // `record_csam_file_for_user`. The two MUST use the same comparison:
+            // when disconnect fired at `>=` while the ban needed `>`, a publisher
+            // with exactly `threshold` blocked files was dropped without being
+            // banned and reconnected in seconds, looping indefinitely.
+            if c.csam_attempts > live.content_filter.publisher_attempt_disconnect_threshold {
                 warn!(ip = %peer.ip(), csam_attempts = c.csam_attempts, "csam threshold — disconnecting");
                 break;
             }
@@ -321,11 +348,22 @@ async fn dispatch(
             // since user_hash arrives in the login payload. Ban lasts
             // publisher_blacklist_seconds — banned publisher can't re-enter.
             {
+                // Read straight from live_cfg: this is a different function from
+                // handle_connection, and the temporary guard is dropped at the end
+                // of the statement (never held across an .await), so a hot reload
+                // takes effect on the next login attempt.
                 let ttl = std::time::Duration::from_secs(
-                    cfg.content_filter.publisher_blacklist_seconds);
+                    state.live_cfg.load().content_filter.publisher_blacklist_seconds);
                 if state.is_publisher_banned(&req.user_hash, ttl) {
-                    warn!(ip = %peer.ip(), user_hash = hex::encode(req.user_hash),
-                          "login refused — CSAM publisher is banned");
+                    // Throttled: the ban lasts 30 days by default while the client
+                    // keeps auto-reconnecting on a ~30 s timer, so this single peer
+                    // would otherwise write ~5700 warnings a day.
+                    if let Some(sup) = crate::health::throttle().allow(
+                        peer.ip(), "login_banned", crate::health::SUPPRESS_WINDOW)
+                    {
+                        warn!(ip = %peer.ip(), user_hash = hex::encode(req.user_hash),
+                              suppressed = sup, "login refused — CSAM publisher is banned");
+                    }
                     return Err(anyhow::anyhow!("banned CSAM publisher"));
                 }
             }

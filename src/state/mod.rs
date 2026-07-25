@@ -341,8 +341,19 @@ pub struct ServerState {
     /// 1, so a user with a single rare FP can reconnect forever without ever
     /// being banned. Only N genuinely DIFFERENT blocked files reach the
     /// threshold. Value = (set of file hashes, last_seen for TTL sweep).
-    pub csam_files_by_user:
-        DashMap<UserHash, (std::collections::HashSet<FileHash>, std::time::Instant)>,
+    /// Per-publisher record of DISTINCT blocked files. Maps each blocked file's
+    /// hash to the NAME it carried when the filter caught it — captured at catch
+    /// time because the file is often evicted (sources gone after the ban) before
+    /// any review runs, at which point the slab can no longer resolve the name.
+    pub csam_files_by_user: DashMap<
+        UserHash,
+        (
+            // hash -> (name at catch time, when it was caught)
+            std::collections::HashMap<FileHash, (String, std::time::Instant)>,
+            // when this publisher was last caught (drives the TTL sweep)
+            std::time::Instant,
+        ),
+    >,
     /// Per-reason counter of blocked connection attempts.
     /// Keys: "ipfilter", "csam", "max_connections_per_ip", "rate_limit", "bot".
     pub block_stats: DashMap<String, u64>,
@@ -461,6 +472,7 @@ impl ServerState {
         &self,
         user_hash: UserHash,
         file_hash: FileHash,
+        file_name: &str,
         threshold: u32,
         ttl: std::time::Duration,
     ) -> bool {
@@ -468,16 +480,33 @@ impl ServerState {
         let mut entry = self
             .csam_files_by_user
             .entry(user_hash)
-            .or_insert_with(|| (std::collections::HashSet::new(), now));
+            .or_insert_with(|| (std::collections::HashMap::new(), now));
         // Restart if the user's record has gone stale (older than ttl).
         if now.duration_since(entry.1) > ttl {
             entry.0.clear();
         }
-        entry.0.insert(file_hash);
+        // Keyed by hash (dedup unchanged); value is the name AND the moment it was
+        // caught. The per-file timestamp is what lets /api/publishers answer "what
+        // was caught in the last 24 h" — with only a per-publisher timestamp, an
+        // account that trips the filter daily would keep dragging its entire
+        // history into every export, which is exactly the growth being avoided.
+        // Re-publishing the same hash keeps the FIRST catch (name and time).
+        entry
+            .0
+            .entry(file_hash)
+            .or_insert_with(|| (file_name.to_string(), now));
         entry.1 = now;
-        // Ban only once the count EXCEEDS the tolerated threshold (e.g. 4th
-        // distinct file when threshold=3). Files at or below threshold are still
-        // filtered — they just don't trigger a ban.
+        // Ban once the count EXCEEDS the threshold (4th distinct file when
+        // threshold = 3). The first `threshold` files are filtered but tolerated —
+        // deliberate headroom so a single rare false positive can never ban an
+        // innocent publisher.
+        //
+        // The disconnect path in connection.rs uses the SAME comparison. They must
+        // agree: while disconnect fired at `>= threshold` and the ban needed
+        // `> threshold`, a publisher holding exactly `threshold` blocked files was
+        // dropped but never banned, so it reconnected immediately and repeated
+        // forever — observed live as three IPs looping every 3-4 seconds,
+        // re-publishing the same three hashes and flooding the log.
         entry.0.len() as u32 > threshold
     }
 
@@ -1043,12 +1072,12 @@ mod user_files_index_tests {
         let ttl = Duration::from_secs(3600);
         // threshold = 3 = MAX tolerated distinct files. Files 1-3 are filtered
         // but must NOT ban (headroom for false positives).
-        assert!(!s.record_csam_file_for_user(u, fhash(10), 3, ttl), "1st file");
-        assert!(!s.record_csam_file_for_user(u, fhash(11), 3, ttl), "2nd file");
-        assert!(!s.record_csam_file_for_user(u, fhash(12), 3, ttl), "3rd file (at threshold)");
+        assert!(!s.record_csam_file_for_user(u, fhash(10), "test.mp4", 3, ttl), "1st file");
+        assert!(!s.record_csam_file_for_user(u, fhash(11), "test.mp4", 3, ttl), "2nd file");
+        assert!(!s.record_csam_file_for_user(u, fhash(12), "test.mp4", 3, ttl), "3rd file (at threshold)");
         assert!(!s.is_publisher_banned(&u, ttl), "not banned at threshold");
         // The 4th DISTINCT file EXCEEDS the threshold → ban.
-        assert!(s.record_csam_file_for_user(u, fhash(13), 3, ttl), "4th distinct file");
+        assert!(s.record_csam_file_for_user(u, fhash(13), "test.mp4", 3, ttl), "4th distinct file");
         s.ban_publisher(u);
         assert!(s.is_publisher_banned(&u, ttl), "banned above threshold");
     }
@@ -1067,7 +1096,7 @@ mod user_files_index_tests {
         let fp_file = fhash(99);
         for _ in 0..50 {
             assert!(
-                !s.record_csam_file_for_user(u, fp_file, 3, ttl),
+                !s.record_csam_file_for_user(u, fp_file, "test.mp4", 3, ttl),
                 "republishing the same file must never reach the threshold"
             );
         }

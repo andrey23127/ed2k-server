@@ -93,6 +93,24 @@ pub struct ServerConfig {
     pub seed_servers: Vec<String>,
 }
 
+impl NetworkConfig {
+    /// Main UDP port — ALWAYS `tcp_port + 4`, never configured separately.
+    ///
+    /// The eD2k protocol fixes the whole UDP block relative to the TCP port, and
+    /// every other channel already derived itself that way (`+8` aux, `+12`
+    /// server-to-server obf-ping, `+14` portUDPobf). The main port was the lone
+    /// exception, settable independently — which only created ways to be wrong:
+    /// a mismatched value makes the server advertise ports it does not listen on,
+    /// and clients (aMule especially) then talk to a dead socket. Deriving it
+    /// removes that entire class of misconfiguration.
+    ///
+    /// A stale `udp_port = ...` left in an existing config.toml is harmless: the
+    /// struct has no `deny_unknown_fields`, so the key is simply ignored.
+    pub fn udp_port(&self) -> u16 {
+        self.tcp_port.wrapping_add(4)
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkConfig {
     pub tcp_port: u16,
@@ -102,8 +120,6 @@ pub struct NetworkConfig {
     pub listen_backlog: u32,
     #[serde(default = "default_max_frame")]
     pub max_frame_size: u32,
-    #[serde(default = "default_udp_port")]
-    pub udp_port: u16,
     /// Server key embedded in GLOBSERVSTATRES
     #[serde(default = "default_udp_server_key")]
     pub udp_server_key: u32,
@@ -209,7 +225,6 @@ fn default_backlog() -> u32 {
 fn default_max_frame() -> u32 {
     1_000_000
 }
-fn default_udp_port() -> u16 { 4665 }
 fn default_udp_server_key() -> u32 { 0x1234_5678 }
 fn default_login_timeout_ms() -> u64 { 2000 }
 fn default_true() -> bool { true }
@@ -263,7 +278,6 @@ public = false
 
 [network]
 tcp_port = 4661
-udp_port = 4665
 
 [limits]
 max_clients = 1000
@@ -287,5 +301,49 @@ hash_blocklists = []
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_port_is_derived_from_tcp_port() {
+        let cfg = Config::minimal_test_config();
+        assert_eq!(cfg.network.tcp_port, 4661);
+        // Protocol-fixed offset: main UDP is always TCP+4.
+        assert_eq!(cfg.network.udp_port(), 4665);
+    }
+
+    #[test]
+    fn stale_udp_port_key_is_ignored_not_an_error() {
+        // Existing deployments still carry `udp_port = ...` in config.toml.
+        // Parsing must succeed and ignore it, deriving the port from tcp_port
+        // instead — otherwise every server would fail to start after upgrading.
+        let toml_str = r#"
+[server]
+name = "t"
+desc = "t"
+this_ip = ""
+version_major = 17
+version_minor = 15
+public = false
+
+[network]
+tcp_port = 6262
+udp_port = 9999
+
+[limits]
+max_clients = 1
+soft_limit_files = 1
+hard_limit_files = 1
+ping_delay_seconds = 1
+
+[content_filter]
+hash_blocklists = []
+"#;
+        let cfg: Config = toml::from_str(toml_str).expect("stale key must not break parsing");
+        assert_eq!(cfg.network.udp_port(), 6266, "must derive, not use the stale 9999");
     }
 }

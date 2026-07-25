@@ -36,7 +36,9 @@ impl IpFilter {
     /// Load from a guarding.p2p-format file. If the file doesn't exist or is
     /// unreadable, returns an empty (pass-all) filter and logs a warning.
     pub fn load(path: &Path) -> Self {
-        let content = match std::fs::read_to_string(path) {
+        // Lossy decode: guarding.p2p range descriptions come from third-party
+        // lists and are not reliably UTF-8. One bad byte must not void the file.
+        let content = match std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()) {
             Ok(c) => c,
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -124,7 +126,7 @@ impl IpFilter {
             return Vec::new();
         }
         let mut rows: Vec<HitRow> = Vec::with_capacity(needed.len());
-        if let Ok(content) = std::fs::read_to_string(path) {
+        if let Ok(content) = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()) {
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {

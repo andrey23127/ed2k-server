@@ -105,10 +105,28 @@ pub fn spawn_gossip(
     info!(seeds = seeds.len(), "starting gossip — full handshake per seed");
 
     for seed in seeds {
-        let state = Arc::clone(&state);
-        let main_sock = Arc::clone(&main_udp_sock);
-        tokio::spawn(seed_loop(seed, state, our_ip, our_tcp_port, main_sock, seckey));
+        spawn_seed(seed, Arc::clone(&state), our_ip, our_tcp_port,
+                   Arc::clone(&main_udp_sock), seckey);
     }
+}
+
+/// Start the loop for ONE seed and hand back its join handle.
+///
+/// Exposed so the caller can supervise the set of running seeds and follow a
+/// hot-reloaded `server.seed_servers` list: dropped seeds get their task
+/// aborted, added seeds get a new one. Aborting is safe here — `seed_loop` owns
+/// no shared state beyond `Arc`s and holds no lock across its awaits, so the
+/// worst case is a handshake abandoned mid-flight, which the peer treats like
+/// any other lost UDP exchange.
+pub fn spawn_seed(
+    seed: SocketAddrV4,
+    state: Arc<ServerState>,
+    our_ip: Ipv4Addr,
+    our_tcp_port: u16,
+    main_udp_sock: Arc<UdpSocket>,
+    seckey: [u8; 16],
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(seed_loop(seed, state, our_ip, our_tcp_port, main_udp_sock, seckey))
 }
 
 /// Per-seed loop: do the full 3-phase handshake, then sleep, then repeat.
@@ -124,18 +142,40 @@ async fn seed_loop(
     let stagger = Duration::from_millis(500 + (seed.port() as u64 % 5) * 200);
     tokio::time::sleep(stagger).await;
 
+    // Give up on a seed that never completes a handshake.
+    //
+    // A misconfigured peer — one that does not speak obfuscation, or is simply
+    // gone — fails every cycle forever, warning each time. Two such seeds were
+    // doing exactly that in production. After this many CONSECUTIVE failures the
+    // loop exits; the supervisor then leaves this seed alone until the configured
+    // seed list actually changes, rather than restarting it every minute.
+    //
+    // The counter resets on any success, so a peer that is merely down for a while
+    // is not written off permanently — it keeps its retries until it exhausts them,
+    // and a config touch brings it back.
+    const MAX_CONSECUTIVE_FAILURES: u32 = 5;
+    let mut failures: u32 = 0;
+
     loop {
         match handshake_with_seed(&seed, &state, our_ip, our_tcp_port, &main_sock, &seckey).await {
             Ok((server_count, packets_received)) => {
+                failures = 0;
                 info!(
-                    seed = %seed,
-                    server_count,
-                    packets_received,
+                    seed = %seed, server_count, packets_received,
                     "gossip cycle complete — full handshake succeeded"
                 );
             }
             Err(e) => {
-                warn!(seed = %seed, error = %e, "gossip cycle failed");
+                failures += 1;
+                warn!(seed = %seed, error = %e, failures, "gossip cycle failed");
+                if failures >= MAX_CONSECUTIVE_FAILURES {
+                    warn!(
+                        seed = %seed, failures,
+                        "gossip: giving up on this seed — no successful handshake; \
+                         it will be retried only after server.seed_servers changes"
+                    );
+                    return;
+                }
             }
         }
 
@@ -241,9 +281,20 @@ async fn handshake_with_seed(
                     break k;
                 }
                 if tokio::time::Instant::now() >= dl {
-                    warn!(seed = %seed.ip(),
-                          "gossip phase 2 (portUDPobf): no ServerKey stored within 5s");
-                    return Ok((0, 0));
+                    // Return Err, not Ok((0,0)): this is a genuine failure — the seed
+                    // never sent its ServerKey, so obfuscation could not complete.
+                    // seed_loop counts Err toward MAX_CONSECUTIVE_FAILURES; a seed
+                    // that does not speak obfuscation trips it and gets dropped. The
+                    // SUCCESSFUL obf path also returns Ok((0,0)) (its reply arrives
+                    // asynchronously in the main handler), so the two must be
+                    // distinguishable by Ok vs Err — hence this cannot stay Ok.
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "seed {} sent no ServerKey within 5s (no obfuscation support?)",
+                            seed.ip()
+                        ),
+                    ));
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }

@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 use ed2k_server::config::Config;
 use ed2k_server::filter::ContentFilter;
 use ed2k_server::server::connection::handle_connection;
-use ed2k_server::server::gossip::{parse_seed, spawn_gossip};
+use ed2k_server::server::gossip::parse_seed;
 use ed2k_server::server::keepalive::spawn_keepalive;
 use ed2k_server::server::obfuscated_conn::make_stream;
 use ed2k_server::server::udp::UdpServer;
@@ -66,10 +66,25 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // Set up tracing per config.log.level (env RUST_LOG overrides if set).
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(&cfg.log.level));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
+    // Per-layer filters, deliberately: the console layer honours log.level (or
+    // RUST_LOG), while the in-memory ring keeps WARN+ regardless. Operators run
+    // with logging turned down or off to save disk, and the health panel must
+    // still be able to show what went wrong — a global filter would silence the
+    // ring too, exactly when it matters.
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .compact()
+                .with_filter(filter),
+        )
+        .with(
+            ed2k_server::health::RingLayer
+                .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+        )
         .init();
 
     info!(version = env!("CARGO_PKG_VERSION"), "ed2k-server starting");
@@ -313,6 +328,11 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // that stops answering pings stops being advertised (and a phantom
                 // port, which never answers, is never verified in the first place).
                 state_clean.verified_sockets.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
+                // Drop log-throttle entries for peers that have gone quiet, so the
+                // map tracks only currently-noisy addresses rather than every IP
+                // ever seen.
+                ed2k_server::health::throttle()
+                    .sweep(std::time::Duration::from_secs(3600));
                 // observed_udp_ports remembers each client's externally-seen UDP port
                 // for NAT-T coordination. It is re-inserted with a fresh timestamp on
                 // every UDP packet from that IP, so an entry older than 30 min means
@@ -853,30 +873,115 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         });
     }
 
-    // Server-to-server gossip using the main UDP socket (port 4665).
+    // Server-to-server gossip using the main UDP socket (TCP+4).
     // Seed servers see requests from our real server port and can add us
     // to their peer lists — this is how Lugdunum gets discovered quickly.
+    //
+    // The seed list and this_ip are read from live_cfg inside the supervisor
+    // below, not captured here, so both follow a config reload.
     {
-        let seeds: Vec<_> = cfg.server.seed_servers.iter()
-            .filter_map(|s| parse_seed(s))
-            .collect();
-
-        let our_ip: std::net::Ipv4Addr = cfg.server.this_ip.parse()
-            .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
-
-        if !seeds.is_empty() {
-            info!(seeds = seeds.len(), "starting gossip with seed servers");
+        let configured_seeds = cfg.server.seed_servers.len();
+        if configured_seeds > 0 {
+            info!(seeds = configured_seeds, "starting gossip with seed servers");
         }
 
-        // Plain bootstrap + keepalive on TCP+4 channel.
-        spawn_gossip(
-            Arc::clone(&state),
-            seeds.clone(),
-            our_ip,
-            cfg.network.tcp_port,
-            udp_socket,
-            seckey,
-        );
+        // Plain bootstrap + keepalive on TCP+4 channel, under a supervisor that
+        // follows a hot-reloaded `server.seed_servers` list.
+        //
+        // The supervisor owns every seed loop, so it can stop one when the seed is
+        // removed from the config. (Spawning the initial set separately and only
+        // supervising later additions would not work: without the JoinHandle there
+        // is no way to abort a startup loop, and a removed seed would keep running
+        // until restart.) The first reconcile happens immediately — `interval`
+        // fires its first tick right away — so startup behaviour is unchanged.
+        //
+        // Only the DIFFERENCE is acted on: untouched seeds keep their existing loop
+        // and handshake state, so a config reload does not disturb working peers.
+        {
+            let state_seed = Arc::clone(&state);
+            let sock_seed = Arc::clone(&udp_socket);
+            let tcp_port = cfg.network.tcp_port;
+            tokio::spawn(async move {
+                use std::collections::{HashMap, HashSet};
+                use std::net::{Ipv4Addr, SocketAddrV4};
+                let mut running: HashMap<SocketAddrV4, tokio::task::JoinHandle<()>> =
+                    HashMap::new();
+                // Seeds whose loop gave up (never completed a handshake). They are
+                // NOT restarted on the next tick — otherwise a permanently broken
+                // peer would be retried every minute forever, which is the noise
+                // this is meant to stop. They are reconsidered only when the
+                // configured list actually changes (see `prev_desired`).
+                let mut given_up: HashSet<SocketAddrV4> = HashSet::new();
+                let mut prev_desired: HashSet<SocketAddrV4> = HashSet::new();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    tick.tick().await;
+
+                    let live = state_seed.live_cfg.load();
+                    let desired: HashSet<SocketAddrV4> = live
+                        .server
+                        .seed_servers
+                        .iter()
+                        .filter_map(|s| parse_seed(s))
+                        .collect();
+                    let our_ip_live: Ipv4Addr = live
+                        .server
+                        .this_ip
+                        .parse()
+                        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+                    drop(live);
+
+                    // A REAL change to the configured list clears the give-up set:
+                    // the operator has touched seed_servers, so every listed seed
+                    // deserves a fresh attempt. Comparing sets (not just lengths)
+                    // means the 60 s poll on its own never resets anything.
+                    if desired != prev_desired {
+                        if !given_up.is_empty() {
+                            info!(
+                                cleared = given_up.len(),
+                                "gossip: seed list changed — retrying previously failed seeds"
+                            );
+                        }
+                        given_up.clear();
+                        prev_desired = desired.clone();
+                    }
+
+                    // Stop loops for seeds no longer listed, and note the ones that
+                    // ended on their own (they exhausted their retries).
+                    running.retain(|addr, handle| {
+                        if !desired.contains(addr) {
+                            handle.abort();
+                            info!(seed = %addr, "gossip: seed removed from config — stopped");
+                            false
+                        } else if handle.is_finished() {
+                            given_up.insert(*addr);
+                            false
+                        } else {
+                            true
+                        }
+                    });
+
+                    // Start loops for newly listed seeds.
+                    for addr in desired {
+                        if given_up.contains(&addr) {
+                            continue;
+                        }
+                        if !running.contains_key(&addr) {
+                            let h = ed2k_server::server::gossip::spawn_seed(
+                                addr,
+                                Arc::clone(&state_seed),
+                                our_ip_live,
+                                tcp_port,
+                                Arc::clone(&sock_seed),
+                                seckey,
+                            );
+                            running.insert(addr, h);
+                            info!(seed = %addr, "gossip: seed loop started");
+                        }
+                    }
+                }
+            });
+        }
 
         // Note: OBF ping is now performed inline by gossip's per-seed
         // handshake (gossip::seed_loop). The standalone obf_ping_loop was

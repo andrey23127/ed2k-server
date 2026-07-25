@@ -30,7 +30,8 @@ pub struct CountryDb {
 
 impl CountryDb {
     pub fn load(path: &Path) -> Self {
-        let Ok(content) = std::fs::read_to_string(path) else {
+        // Lossy decode — country names in third-party CSVs are often Latin-1.
+        let Ok(content) = std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()) else {
             tracing::warn!(path = %path.display(), "ip-to-country.csv not found — country stats disabled");
             return CountryDb { ranges: Vec::new(), names: HashMap::new() };
         };

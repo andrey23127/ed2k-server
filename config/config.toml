@@ -35,10 +35,6 @@ version_minor = 15
 
 [network]
 tcp_port = 4661
-# udp_port MUST equal tcp_port + 4. The gossip protocol derives a peer's UDP
-# port as TCP+4, and seed servers compute ours the same way — any other value
-# breaks server-to-server discovery. Default eD2k pairing is 4661 / 4665.
-udp_port = 4665
 listen_ip = "0.0.0.0"
 listen_backlog = 256
 max_frame_size = 1_000_000

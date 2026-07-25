@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod filter;
+pub mod health;
 pub mod proto;
 pub mod server;
 pub mod state;

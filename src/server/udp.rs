@@ -105,11 +105,11 @@ pub fn resolve_seckey(cfg: &Config) -> [u8; 16] {
 
 impl UdpServer {
     pub async fn bind(cfg: Arc<Config>, state: Arc<ServerState>, seckey: [u8; 16]) -> Result<Self> {
-        let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.udp_port);
+        let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.udp_port());
         let socket = UdpSocket::bind(&bind_addr).await?;
         tracing::info!(addr = %bind_addr, "UDP listener ready");
         let socket = Arc::new(socket);
-        state.udp_sockets.insert(cfg.network.udp_port, Arc::clone(&socket));
+        state.udp_sockets.insert(cfg.network.udp_port(), Arc::clone(&socket));
         Ok(Self {
             cfg,
             state,
@@ -1084,7 +1084,7 @@ impl UdpServer {
         };
 
         // Find the send socket — our main UDP (:4665) for Lugdunum's port check.
-        let main_udp_port = self.cfg.network.udp_port;
+        let main_udp_port = self.cfg.network.udp_port();
         let send_socket = match self.state.udp_sockets.get(&main_udp_port) {
             Some(s) => Arc::clone(&s),
             None => {

@@ -154,6 +154,8 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/block_stats", get(api_block_stats))
             .route("/api/memdebug", get(api_memdebug))
             .route("/api/memsize", get(api_memsize))
+            .route("/api/publishers", get(api_publishers))
+            .route("/api/health", get(api_health))
             .with_state(state);
 
         let bind = format!("127.0.0.1:{port}");
@@ -209,7 +211,7 @@ async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
         ),
         public_ip: s.cached_public_ip.clone(),
         tcp_port: s.config.network.tcp_port,
-        udp_port: s.config.network.udp_port,
+        udp_port: s.config.network.udp_port(),
         uptime_seconds: s.metrics.uptime_secs(),
         client_count: s.server.clients.len() as u64,
         low_id_count: s.server.lowid_count_cached.load(std::sync::atomic::Ordering::Relaxed) as u64,
@@ -521,9 +523,6 @@ async fn api_config_set(
     if old.network.tcp_port != new_cfg.network.tcp_port {
         restart_needed.push("network.tcp_port".into());
     }
-    if old.network.udp_port != new_cfg.network.udp_port {
-        restart_needed.push("network.udp_port".into());
-    }
     if old.admin.port != new_cfg.admin.port || old.admin.enabled != new_cfg.admin.enabled {
         restart_needed.push("admin.port / admin.enabled".into());
     }
@@ -618,6 +617,262 @@ struct BlockStatRow {
     /// Optional: distinct IPs that hit this filter (e.g. CSAM block_stats counts
     /// file publishes but a single user can publish many files).
     unique_ips: Option<u64>,
+}
+
+/// Publisher graph: every user the content filter has ever flagged, together with
+/// EVERYTHING else they currently publish.
+///
+/// The point is to reach the files a name-based filter can never catch. A CSAM
+/// filename filter only catches publishers who advertise their content; the same
+/// account almost always also shares files named `VID_20230116_224252.mp4` or
+/// `00050.m2ts`, which no term list can judge. But the *publisher* is a strong
+/// signal: if an account tripped the filter on N distinct files, the rest of its
+/// library deserves human review.
+///
+/// Output is intended for MANUAL REVIEW and for building an MD4 hash blocklist
+/// (Layer 3, the authoritative layer) — it is not an automatic ban list. Sorted by
+/// flagged-file count, worst first.
+///
+/// GET /api/publishers?min_flagged=1&max_files=200
+/// Health surface: listening ports, filter data files, recent warnings.
+///
+/// Exists because the server is normally run with logging turned down or off
+/// (the volume is large and disk is not), which otherwise leaves no way to see
+/// that a UDP socket never bound or that a blocklist failed to parse. Everything
+/// here is computed on demand — nothing is tracked in the hot path.
+async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
+    let tcp = s.config.network.tcp_port;
+
+    // ── ports ────────────────────────────────────────────────────────────
+    // UDP: a socket that bound successfully is registered in `udp_sockets`, so
+    // presence there IS the health signal. The expected set is protocol-fixed
+    // relative to the TCP port.
+    let expected_udp = [
+        (tcp.wrapping_add(4), "main UDP (TCP+4)"),
+        (tcp.wrapping_add(8), "aux UDP (TCP+8)"),
+        (tcp.wrapping_add(12), "server-to-server obf ping (TCP+12)"),
+        (tcp.wrapping_add(14), "portUDPobf (TCP+14)"),
+    ];
+    let mut ports: Vec<serde_json::Value> = Vec::new();
+
+    // TCP: probe it for real. A bound-but-wedged listener would still accept,
+    // which is exactly what we want to verify from the outside.
+    let tcp_ok = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::net::TcpStream::connect(("127.0.0.1", tcp)),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false);
+    ports.push(serde_json::json!({
+        "proto": "tcp", "port": tcp, "role": "client TCP", "ok": tcp_ok,
+        "detail": if tcp_ok { "accepting connections" } else { "connect failed" },
+    }));
+
+    for (port, role) in expected_udp {
+        let bound = s.server.udp_sockets.contains_key(&port);
+        ports.push(serde_json::json!({
+            "proto": "udp", "port": port, "role": role, "ok": bound,
+            "detail": if bound { "bound" } else { "NOT bound — check for a port conflict at startup" },
+        }));
+    }
+
+    // ── filter data files ────────────────────────────────────────────────
+    // `entries` is the count actually held in memory after parsing, so a file
+    // that exists but parsed to nothing is visible as entries = 0. Per-line
+    // parse errors are reported through the log ring below (the loaders already
+    // warn! with file and line number).
+    fn file_stat(path: &str) -> (bool, u64, u64) {
+        match std::fs::metadata(path) {
+            Ok(m) => {
+                let age = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                (true, m.len(), age)
+            }
+            Err(_) => (false, 0, 0),
+        }
+    }
+
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut push_file = |label: &str, path: &str, entries: Option<u64>, files: &mut Vec<serde_json::Value>| {
+        if path.is_empty() {
+            return;
+        }
+        let (exists, size, age) = file_stat(path);
+        files.push(serde_json::json!({
+            "label": label,
+            "path": path,
+            "exists": exists,
+            "entries": entries,
+            "size_bytes": size,
+            "modified_secs_ago": age,
+            "ok": exists && entries.map(|e| e > 0).unwrap_or(true),
+        }));
+    };
+
+    let cf = &s.config.content_filter;
+    let blocklist_total = s.server.filter.blocklist_size() as u64;
+    for (i, p) in cf.hash_blocklists.iter().enumerate() {
+        // The loader merges every blocklist into one set, so the count is
+        // reported once (on the first file) rather than duplicated per file.
+        let n = if i == 0 { Some(blocklist_total) } else { None };
+        push_file("hash blocklist (L3)", p, n, &mut files);
+    }
+    if let Some(p) = &cf.extra_terms_file {
+        push_file("extra terms (L4)", p, Some(s.server.filter.extra_terms_count() as u64), &mut files);
+    }
+    if let Some(p) = &cf.jargon_terms_file {
+        push_file("jargon terms (L1)", p, Some(s.server.filter.jargon_terms_count() as u64), &mut files);
+    }
+    if let Some(p) = &cf.whitelist_hashes_file {
+        push_file("hash whitelist", p, Some(s.server.filter.whitelist_size() as u64), &mut files);
+    }
+    let ipf = s.server.ip_filter.read().await.len() as u64;
+    push_file("IP filter", &s.config.storage.ipfilter_path, Some(ipf), &mut files);
+    let geo = s.server.country_db.read().await.range_count() as u64;
+    push_file("GeoIP database", &s.config.storage.country_db_path, Some(geo), &mut files);
+
+    // ── recent warnings/errors ───────────────────────────────────────────
+    let entries = crate::health::ring().snapshot(100);
+    let total_seen = crate::health::ring().total_seen();
+
+    Json(serde_json::json!({
+        "ports": ports,
+        "files": files,
+        "log": { "total_seen": total_seen, "shown": entries.len(), "entries": entries },
+    }))
+}
+
+async fn api_publishers(
+    State(s): State<WebState>,
+    uri: axum::http::Uri,
+) -> Json<serde_json::Value> {
+    // Query string parsed by hand: axum's `Query` extractor sits behind the
+    // optional "query" feature, which this build does not enable, and pulling it
+    // in just for two optional numbers is not worth the dependency change.
+    let qs = uri.query().unwrap_or("");
+    let param = |key: &str| -> Option<&str> {
+        qs.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == key { Some(v) } else { None }
+        })
+    };
+    let min_flagged: usize = param("min_flagged").and_then(|v| v.parse().ok()).unwrap_or(1);
+    // Cap per-publisher file listings so one prolific account cannot produce a
+    // multi-megabyte response.
+    let max_files: usize = param("max_files").and_then(|v| v.parse().ok()).unwrap_or(200);
+    // flagged_only=1 → return, per publisher, ONLY the files that actually tripped
+    // the filter (resolved to their names), and skip the rest of their library.
+    // This is the QA view: exactly the handful of files that caused each ban, so a
+    // human can confirm the filter did not misfire. Small and bounded (≤ threshold
+    // files per publisher), unlike the full library dump.
+    let flagged_only: bool =
+        matches!(param("flagged_only"), Some("1") | Some("true"));
+    // Only report files caught within this window. Defaults to 24 h because the
+    // records live for `publisher_blacklist_seconds` (30 days by default), so an
+    // unfiltered export grows every day the server stays up. Pass 0 for "all".
+    let max_age_hours: u64 = param("max_age_hours")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let max_age = std::time::Duration::from_secs(max_age_hours.saturating_mul(3600));
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+
+    for e in s.server.csam_files_by_user.iter() {
+        let user_hash = *e.key();
+        let (flagged_map, last_seen) = e.value();
+        if flagged_map.len() < min_flagged {
+            continue;
+        }
+
+        // Resolve each FLAGGED hash to its filename via the slab. A file may have
+        // been evicted after the ban (no sources left), in which case the name is
+        // gone — reported as null so the reviewer knows it existed but is no longer
+        // resolvable.
+        // Name comes from the catch-time record, so it survives eviction. We also
+        // report whether the file is still live in the index (has sources) — a
+        // reviewer wants to know if it is still being served right now.
+        // Files caught inside the window (all of them when max_age_hours = 0).
+        let recent: Vec<_> = flagged_map
+            .iter()
+            .filter(|(_, (_, caught))| max_age_hours == 0 || caught.elapsed() <= max_age)
+            .collect();
+        if recent.is_empty() {
+            continue; // nothing recent from this publisher — skip it entirely
+        }
+        let recent_count = recent.len();
+
+        let flagged_detail: Vec<serde_json::Value> = recent
+            .into_iter()
+            .map(|(h, (name, caught))| {
+                let still_live = s
+                    .server
+                    .file_slab
+                    .id_of(h)
+                    .and_then(|id| s.server.file_slab.get(id))
+                    .map(|rec| rec.sources.len());
+                serde_json::json!({
+                    "hash": hex::encode(h),
+                    "name": name,
+                    "caught_secs_ago": caught.elapsed().as_secs(),
+                    "still_live": still_live.is_some(),
+                    "sources": still_live.unwrap_or(0),
+                })
+            })
+            .collect();
+
+        // In flagged_only mode skip the (potentially huge) full-library resolve.
+        let mut published: Vec<serde_json::Value> = Vec::new();
+        let mut published_total = 0usize;
+        if !flagged_only {
+        if let Some(files) = s.server.user_files.get(&user_hash) {
+            published_total = files.len();
+            for fid in files.iter().take(max_files) {
+                if let Some(rec) = s.server.file_slab.get(*fid) {
+                    published.push(serde_json::json!({
+                        "hash": hex::encode(rec.hash),
+                        "name": &*rec.name,
+                        "size": rec.size,
+                        "sources": rec.sources.len(),
+                        // true = this exact file already tripped the filter
+                        "flagged": flagged_map.contains_key(&rec.hash),
+                    }));
+                }
+            }
+        }
+        }
+
+        let mut entry = serde_json::json!({
+            "user_hash": hex::encode(user_hash),
+            "flagged_files": recent_count,
+            "flagged_files_total": flagged_map.len(),
+            "flagged": flagged_detail,
+            "banned": s.server.banned_publishers.contains_key(&user_hash),
+            "last_flagged_secs_ago": last_seen.elapsed().as_secs(),
+        });
+        if !flagged_only {
+            entry["published_now"] = serde_json::json!(published_total);
+            entry["published_truncated"] = serde_json::json!(published_total > published.len());
+            entry["published"] = serde_json::json!(published);
+        }
+        out.push(entry);
+    }
+
+    // Worst offenders first.
+    out.sort_by(|a, b| {
+        b["flagged_files"].as_u64().unwrap_or(0)
+            .cmp(&a["flagged_files"].as_u64().unwrap_or(0))
+    });
+
+    Json(serde_json::json!({
+        "publishers": out.len(),
+        "min_flagged": min_flagged,
+        "results": out,
+    }))
 }
 
 async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
@@ -814,6 +1069,7 @@ tr:hover td{background:#1e2035}
   <button onclick="showTab('filter',this)">Filter</button>
   <button onclick="showTab('bots',this)">Bots</button>
   <button onclick="showTab('blocks',this)">Blocks</button>
+  <button onclick="showTab('health',this)">Health</button>
   <button onclick="showTab('settings',this)">Settings</button>
 </nav>
 
@@ -903,6 +1159,33 @@ tr:hover td{background:#1e2035}
       Counts since server start. Cleared on restart.
     </p>
     <div id="blocks-table"></div>
+  </div>
+</div>
+
+<div id="tab-health" class="tab">
+  <div class="section">
+    <h3>Listening ports</h3>
+    <div style="opacity:.7;font-size:12px;margin-bottom:8px">
+      UDP ports are fixed by the protocol at TCP+4 / +8 / +12 / +14 and are derived automatically.
+    </div>
+    <div id="health-ports"></div>
+  </div>
+  <div class="section">
+    <h3>Filter data files</h3>
+    <div style="opacity:.7;font-size:12px;margin-bottom:8px">
+      "entries" is what is actually loaded in memory. Per-line parse errors appear in the log below.
+    </div>
+    <div id="health-files"></div>
+  </div>
+  <div class="section">
+    <h3>Recent warnings &amp; errors</h3>
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <span style="opacity:.7;font-size:12px" id="health-log-meta"></span>
+      <label style="font-size:12px;opacity:.8;cursor:pointer;margin-left:auto">
+        <input type="checkbox" id="health-show-warn" onchange="refreshHealth()"> show warnings
+      </label>
+    </div>
+    <div id="health-log" style="max-height:420px;overflow:auto;font-family:ui-monospace,monospace;font-size:12px"></div>
   </div>
 </div>
 
@@ -1189,9 +1472,64 @@ async function refreshBlocks() {
     + '</tbody></table>';
 }
 
+function healthDot(ok) {
+  return '<span style="color:' + (ok ? '#4ade80' : '#f87171') + '">' + (ok ? '●' : '●') + '</span>';
+}
+async function refreshHealth() {
+  let h;
+  try { h = await fetch('/api/health').then(r=>r.json()); } catch { return; }
+
+  document.getElementById('health-ports').innerHTML =
+    '<table><thead><tr><th></th><th>Proto</th><th>Port</th><th>Role</th><th>State</th></tr></thead><tbody>'
+    + h.ports.map(p =>
+        '<tr><td>' + healthDot(p.ok) + '</td><td>' + p.proto.toUpperCase() + '</td><td>' + p.port
+        + '</td><td>' + p.role + '</td><td>' + p.detail + '</td></tr>').join('')
+    + '</tbody></table>';
+
+  document.getElementById('health-files').innerHTML =
+    '<table><thead><tr><th></th><th>File</th><th>Entries</th><th>Size</th><th>Modified</th><th>Path</th></tr></thead><tbody>'
+    + h.files.map(f =>
+        '<tr><td>' + healthDot(f.ok) + '</td><td>' + f.label + '</td><td>'
+        + (f.entries === null ? '<span style="opacity:.5">merged</span>' : fmt(f.entries))
+        + '</td><td>' + (f.exists ? fmt(f.size_bytes)+'B' : '<span style="color:#f87171">missing</span>')
+        + '</td><td>' + (f.exists ? fmtDur(f.modified_secs_ago)+' ago' : '-')
+        + '</td><td style="opacity:.6;font-size:11px">' + f.path + '</td></tr>').join('')
+    + '</tbody></table>';
+
+  // Errors only by default. Warnings are still COLLECTED (that is how a bad line
+  // in a filter file surfaces — the loaders warn! with file and line number), but
+  // they are noisy day to day, so they are behind a toggle.
+  const showWarn = document.getElementById('health-show-warn').checked;
+  const shown = h.log.entries.filter(e => showWarn || e.level === 'ERROR');
+  const errCount = h.log.entries.filter(e => e.level === 'ERROR').length;
+  const warnCount = h.log.entries.length - errCount;
+  document.getElementById('health-log-meta').textContent =
+    errCount + ' errors' + (warnCount ? ', ' + warnCount + ' warnings' : '')
+    + ' in the last ' + h.log.shown + ' events (' + h.log.total_seen + ' since start)'
+    + (h.log.total_seen === 0 ? ' — nothing has gone wrong' : '');
+  document.getElementById('health-log').innerHTML =
+    shown.length === 0
+      ? '<div style="opacity:.5;padding:8px">'
+        + (showWarn ? 'No warnings or errors recorded.' : 'No errors. Tick "show warnings" for the rest.')
+        + '</div>'
+      : shown.map(e => {
+          const t = new Date(e.ts * 1000).toLocaleTimeString();
+          const col = e.level === 'ERROR' ? '#f87171' : '#fbbf24';
+          return '<div style="padding:3px 0;border-bottom:1px solid rgba(255,255,255,.06)">'
+            + '<span style="opacity:.5">' + t + '</span> '
+            + '<span style="color:' + col + '">' + e.level + '</span> '
+            + escapeHtml(e.message)
+            + (e.fields ? ' <span style="opacity:.55">' + escapeHtml(e.fields) + '</span>' : '')
+            + '</div>';
+        }).join('');
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
 async function refresh() {
   await Promise.all([refreshStatus(), refreshClients(), refreshPeers(), refreshFilter(),
-                      refreshBots(), refreshBlocks()]);
+                      refreshBots(), refreshBlocks(), refreshHealth()]);
   document.getElementById('refreshed').textContent = 'last updated: ' + new Date().toLocaleTimeString();
 }
 refresh();

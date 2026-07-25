@@ -174,8 +174,8 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=null
 StandardError=null
-LimitNOFILE=65536
-Environment=RUST_LOG=ed2k_server=info
+LimitNOFILE=1048576
+OOMScoreAdjust=-500
 
 [Install]
 WantedBy=multi-user.target
@@ -241,18 +241,27 @@ a watched file) or needs a **restart**.
 ### `[network]`
 | Key | Meaning | Apply |
 |---|---|---|
-| `tcp_port` | eD2k TCP port (default 4661) | **restart** |
-| `udp_port` | eD2k UDP port — **must be `tcp_port + 4`** (default 4665) | **restart** |
+| `tcp_port` | eD2k TCP port (default 4661). All UDP ports are derived from it (see below) | **restart** |
 | `listen_ip` | Bind address for the listeners | restart |
 | `listen_backlog`, `max_frame_size` | Socket / frame tuning | restart |
 | `login_timeout_ms` | Login handshake timeout | restart |
 | `support_crypt` | Advertise protocol obfuscation support | restart |
 
-> **`udp_port` must equal `tcp_port + 4`.** The server-to-server gossip protocol
-> derives a peer's UDP port as TCP+4, and seed servers compute ours the same way.
-> Any other pairing silently breaks discovery — seeds will not add you to their
-> `server.met`. The default 4661/4665 already satisfies this; keep the +4 offset
-> if you change the ports.
+> **UDP ports are derived from `tcp_port`, not configured.** The eD2k protocol
+> fixes the whole UDP block relative to the TCP port, and seed servers compute a
+> peer's ports the same way, so there is nothing to set:
+>
+> | Port | Purpose |
+> |---|---|
+> | `tcp_port + 4` | main eD2k UDP (searches, sources) |
+> | `tcp_port + 8` | auxiliary UDP |
+> | `tcp_port + 12` | server-to-server obfuscated ping |
+> | `tcp_port + 14` | `portUDPobf` (obfuscated UDP) |
+>
+> Earlier versions had a separate `udp_port` key that had to be kept at
+> `tcp_port + 4` by hand; a wrong value silently broke discovery. It has been
+> removed. A stale `udp_port = ...` left in an old `config.toml` is ignored, so
+> existing configs keep working without edits.
 
 ### `[limits]`
 | Key | Meaning | Apply |
