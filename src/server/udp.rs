@@ -173,6 +173,9 @@ impl UdpServer {
             // try to decrypt it with the key derived from our seckey and the
             // sender's IP. If that fails, drop it (it's noise or not for us).
             let (opcode, payload, decoded_buf);
+            // How to encode a reply: None = plaintext, Some((key, formula)) =
+            // obfuscated the same way the request arrived.
+            let mut obf_ctx: Option<(u32, u8)> = None;
             if data[0] == PROTO_EDONKEY {
                 opcode = data[1];
                 payload = &data[2..];
@@ -280,6 +283,12 @@ impl UdpServer {
                 match decoded_opt {
                     Some(inner) => {
                         debug!(ip = %peer.ip(), "decoded obfuscated server-to-server UDP");
+                        // Remember HOW this datagram was obfuscated, so the reply can
+                        // be encoded the same way. A client that queries us over the
+                        // obfuscated channel cannot read a plaintext answer, and the
+                        // decode cache we just populated holds exactly the (key,
+                        // formula) pair needed to encode it back.
+                        obf_ctx = self.state.obf_decode_cache.get(&sender_v4).map(|e| *e);
                         decoded_buf = inner;
                         opcode = decoded_buf[1];
                         payload = &decoded_buf[2..];
@@ -347,7 +356,7 @@ impl UdpServer {
                 }
             }
 
-            if let Err(e) = self.dispatch(opcode, payload, peer).await {
+            if let Err(e) = self.dispatch(opcode, payload, peer, obf_ctx).await {
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(ip = %peer.ip(), opcode = format!("0x{opcode:02x}"), error = %e, "UDP handler error");
                 }
@@ -355,7 +364,75 @@ impl UdpServer {
         }
     }
 
-    async fn dispatch(&self, opcode: u8, payload: &[u8], peer: SocketAddr) -> Result<()> {
+    /// Send a reply on the SAME socket the request arrived on, obfuscated the same
+    /// way it came in.
+    ///
+    /// Both halves matter and both were wrong for OP_SERVER_DESC_RES:
+    ///
+    /// * **Port.** Clients match a server UDP reply by (IP, source port). Answering
+    ///   from a different port than the one queried makes the client drop the
+    ///   packet — it cannot tell which server it belongs to. Observed live: a
+    ///   description request to portUDPobf (TCP+14) was answered from the main UDP
+    ///   port, so eMule silently discarded it and the server's name, description
+    ///   and version stayed blank in the server list.
+    /// * **Obfuscation.** A client that asks over the obfuscated channel cannot
+    ///   read a plaintext answer at all.
+    async fn reply(
+        &self,
+        bytes: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> std::io::Result<usize> {
+        match obf {
+            None => self.socket.send_to(bytes, peer).await,
+            Some((key, formula)) => {
+                use crate::proto::server_obfuscation::{encode, encode_with_obfbyte};
+                let rng_seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.subsec_nanos())
+                    .unwrap_or(0x1234_ABCD)
+                    .wrapping_mul(0x9E37_79B9);
+                // The obf byte encodes the DIRECTION, so a reply must flip it —
+                // re-using the byte that decoded the request produces a packet the
+                // peer cannot decrypt at all.
+                //
+                // From eMule's EncryptedDatagramSocket.cpp:
+                //   MAGICVALUE_UDP_CLIENTSERVER = 0x6B  (client -> server)
+                //   MAGICVALUE_UDP_SERVERCLIENT = 0xA5  (server -> client)
+                // EncryptSendServer() keys with 0x6B; DecryptReceivedServer() keys
+                // with 0xA5. The base key is the same in both directions (the
+                // server's UDP key), only this byte differs.
+                //
+                // So: a request that decoded with 0x6B came from a client, and our
+                // answer to it must use 0xA5. A packet that decoded with 0xA5 came
+                // from a peer acting as the server, so our answer goes out as
+                // 0x6B. Formula 0 is the server-to-server gossip scheme, which has
+                // no direction byte and is symmetric.
+                //
+                // Getting this wrong is worse than not encrypting: eMule passes an
+                // unencrypted reply straight through (it only logs "Expected
+                // encrypted packet, but received unencrypted"), but a reply
+                // encrypted with the wrong direction byte fails the magic check,
+                // stays ciphertext, and is dropped for not starting with 0xE3.
+                let wire = match formula {
+                    0 => encode(bytes, key, rng_seed),
+                    1 => encode_with_obfbyte(bytes, key, rng_seed, 0x6b),
+                    _ => encode_with_obfbyte(bytes, key, rng_seed, 0xa5),
+                };
+                self.socket.send_to(&wire, peer).await
+            }
+        }
+    }
+
+    /// `obf`: how the request was obfuscated, or None if it arrived in the clear.
+    /// Replies must mirror it — see `reply()`.
+    async fn dispatch(
+        &self,
+        opcode: u8,
+        payload: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(
                 ip = %peer.ip(),
@@ -390,8 +467,8 @@ impl UdpServer {
         }
 
         match opcode {
-            OP_GLOB_GETSOURCES   => self.handle_getsources_single(payload, peer).await,
-            OP_GLOB_GETSOURCES2  => self.handle_getsources_multi(payload, peer).await,
+            OP_GLOB_GETSOURCES   => self.handle_getsources_single(payload, peer, obf).await,
+            OP_GLOB_GETSOURCES2  => self.handle_getsources_multi(payload, peer, obf).await,
             OP_SERVER_NATT_KEEPALIVE => {
                 // NAT-traversal keepalive: payload is the sender's 16-byte
                 // userhash. Record the EXTERNAL UDP port we saw it arrive from
@@ -433,12 +510,12 @@ impl UdpServer {
                 }
                 Ok(())
             }
-            OP_GLOB_SERVSTATREQ  => self.handle_servstat(payload, peer).await,
+            OP_GLOB_SERVSTATREQ  => self.handle_servstat(payload, peer, obf).await,
             // 0x97 = GLOBSERVSTATRES — seed server responding to our keepalive ping
             0x97 => self.handle_pingreply(payload, peer).await,
-            OP_SERVER_DESC_REQ   => self.handle_server_desc(payload, peer).await,
-            OP_GLOB_SEARCHREQ    => self.handle_search(payload, peer).await,
-            OP_GLOB_SEARCHREQ3   => self.handle_search(payload, peer).await,
+            OP_SERVER_DESC_REQ   => self.handle_server_desc(payload, peer, obf).await,
+            OP_GLOB_SEARCHREQ    => self.handle_search(payload, peer, obf).await,
+            OP_GLOB_SEARCHREQ3   => self.handle_search(payload, peer, obf).await,
             // 0xA1 SERVER_LIST_RES — response to our gossip SERVER_LIST_REQ.
             // Seed servers send this back after we query them on startup.
             0xA1 => self.handle_server_list_res(payload, peer).await,
@@ -451,7 +528,7 @@ impl UdpServer {
                 // (Full ServerAdd logic would add them to our peer table — MVP: skip)
                 let data = crate::server::gossip::build_server_list_res(&self.state).await;
                 if data.len() > 3 { // only send if we have servers
-                    self.socket.send_to(&data, peer).await?;
+                    self.reply(&data, peer, obf).await?;
                     debug!(ip = %peer.ip(), "server_list_req(0xA0): registered + sent list");
                 }
                 Ok(())
@@ -468,11 +545,16 @@ impl UdpServer {
     // ─── GLOBGETSOURCES (0x9A) ──────────────────────────────────────────────
 
     /// Single-hash source lookup. Payload: hash(16) [+ size_lo(4) [+ size_hi(4)]]
-    async fn handle_getsources_single(&self, payload: &[u8], peer: SocketAddr) -> Result<()> {
+    async fn handle_getsources_single(
+        &self,
+        payload: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         if payload.len() < 16 { return Ok(()); }
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&payload[..16]);
-        self.send_found_sources(&hash, peer).await
+        self.send_found_sources(&hash, peer, obf).await
     }
 
     // ─── GLOBGETSOURCES2 (0x94) ─────────────────────────────────────────────
@@ -483,7 +565,12 @@ impl UdpServer {
     /// Variant B (newer clients):          hash(16) + size_lo(4) [+ size_hi(4)].
     ///
     /// Distinguish: if (payload.len() % 16 == 0) → variant A, else → variant B.
-    async fn handle_getsources_multi(&self, payload: &[u8], peer: SocketAddr) -> Result<()> {
+    async fn handle_getsources_multi(
+        &self,
+        payload: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         if payload.len() < 16 { return Ok(()); }
 
         if payload.len() % 16 == 0 {
@@ -492,20 +579,25 @@ impl UdpServer {
             for i in 0..count {
                 let mut hash = [0u8; 16];
                 hash.copy_from_slice(&payload[i * 16..(i + 1) * 16]);
-                self.send_found_sources(&hash, peer).await?;
+                self.send_found_sources(&hash, peer, obf).await?;
             }
         } else {
             // Variant B: single hash + size
             let mut hash = [0u8; 16];
             hash.copy_from_slice(&payload[..16]);
-            self.send_found_sources(&hash, peer).await?;
+            self.send_found_sources(&hash, peer, obf).await?;
         }
 
         Ok(())
     }
 
     /// Look up sources for a file hash and send GLOBFOUNDSOURCES response.
-    async fn send_found_sources(&self, hash: &[u8; 16], peer: SocketAddr) -> Result<()> {
+    async fn send_found_sources(
+        &self,
+        hash: &[u8; 16],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         let sources: Vec<(std::net::IpAddr, u16)> = self.state
             .file_slab
             .get_by_hash(hash)
@@ -532,7 +624,7 @@ impl UdpServer {
             out.put_u16_le(*port);
         }
 
-        self.socket.send_to(&out, peer).await?;
+        self.reply(&out, peer, obf).await?;
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(ip = %peer.ip(), hash = hex::encode(hash), sources = sources.len(), "glob_getsources");
         }
@@ -551,7 +643,12 @@ impl UdpServer {
     ///
     /// The 0x55AA magic identifies server-to-server probes (sendping() in Lugdunum
     /// always puts 0x55AA at challenge bytes [2:3]). eMule clients use random challenge.
-    async fn handle_servstat(&self, payload: &[u8], peer: SocketAddr) -> Result<()> {
+    async fn handle_servstat(
+        &self,
+        payload: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         let challenge = if payload.len() >= 4 {
             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
         } else {
@@ -666,7 +763,7 @@ impl UdpServer {
         }
         // Short form: 12 bytes payload (just challenge+users+files)
 
-        self.socket.send_to(&out, peer).await?;
+        self.reply(&out, peer, obf).await?;
 
         // After replying plain to a server probe (0x55AA marker), ALSO send
         // an OBFUSCATED copy of the same 0x97 to seed's portUDPobf if we
@@ -1060,7 +1157,12 @@ impl UdpServer {
     /// eMule uses stored DescReqChallenge to validate: if PeekUInt16 == 0xF0FF
     /// AND PeekUInt32 == stored challenge → parse tags for name/desc/version.
     /// Otherwise → old format ReadString(name) + ReadString(desc).
-    async fn handle_server_desc(&self, payload: &[u8], peer: SocketAddr) -> Result<()> {
+    async fn handle_server_desc(
+        &self,
+        payload: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         // Read server name/desc/version from live_cfg (hot-reloadable).
         let live = self.state.live_cfg.load();
         let version_str = format!("{}.{}", live.server.version_major,
@@ -1081,17 +1183,6 @@ impl UdpServer {
             u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]])
         } else {
             0
-        };
-
-        // Find the send socket — our main UDP (:4665) for Lugdunum's port check.
-        let main_udp_port = self.cfg.network.udp_port();
-        let send_socket = match self.state.udp_sockets.get(&main_udp_port) {
-            Some(s) => Arc::clone(&s),
-            None => {
-                debug!(port = main_udp_port,
-                       "no main UDP socket — falling back to self.socket");
-                Arc::clone(&self.socket)
-            }
         };
 
         // Strategy: send TWO responses to maximize compatibility.
@@ -1142,7 +1233,7 @@ impl UdpServer {
             write_old_str_tag(&mut new_pkt, ST_SERVERNAME,  &name);
             write_old_str_tag(&mut new_pkt, ST_DESCRIPTION, &desc);
             write_old_str_tag(&mut new_pkt, ST_VERSION,     &version_str);
-            send_socket.send_to(&new_pkt, peer).await?;
+            self.reply(&new_pkt, peer, obf).await?;
         } else {
             // ─── OLD FORMAT ONLY (legacy clients: <name_len><name><desc_len><desc>)
             let mut old_pkt = BytesMut::new();
@@ -1152,15 +1243,16 @@ impl UdpServer {
             old_pkt.put_slice(name.as_bytes());
             old_pkt.put_u16_le(desc.len() as u16);
             old_pkt.put_slice(desc.as_bytes());
-            send_socket.send_to(&old_pkt, peer).await?;
+            self.reply(&old_pkt, peer, obf).await?;
         }
 
         info!(
             ip = %peer.ip(),
             challenge = format!("0x{challenge:08x}"),
             new_format_sent = is_new_format_request,
-            src_port = main_udp_port,
-            "server_desc_req answered (old format always + new format if matched)"
+            obfuscated = obf.is_some(),
+            src_port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0),
+            "server_desc_req answered"
         );
         Ok(())
     }
@@ -1168,7 +1260,12 @@ impl UdpServer {
     // ─── GLOBSEARCHREQ (0x98) ───────────────────────────────────────────────
 
     /// UDP global search — one result per datagram (SPEC.md §2.3.4).
-    async fn handle_search(&self, payload: &[u8], peer: SocketAddr) -> Result<()> {
+    async fn handle_search(
+        &self,
+        payload: &[u8],
+        peer: SocketAddr,
+        obf: Option<(u32, u8)>,
+    ) -> Result<()> {
         let tree = match parse_search(payload) {
             Ok(t) => t,
             Err(e) => {
@@ -1242,7 +1339,7 @@ impl UdpServer {
             ));
             write_tag_list(&mut out, &tags);
 
-            self.socket.send_to(&out, peer).await?;
+            self.reply(&out, peer, obf).await?;
             sent += 1;
         }
 

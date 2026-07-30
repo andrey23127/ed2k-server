@@ -32,12 +32,20 @@ pub enum FilterResult {
     /// File passed all checks; safe to index.
     Allow,
     /// File matched a content filter at the given layer; do not index.
-    Block(Layer),
+    ///
+    /// The second field says WHAT matched: the offending term for L1/L4, a
+    /// rendered age token ("age 12 (yo)") for L2, or "hash" for L3. Carrying the
+    /// reason is what makes a block reviewable — with only the layer, a reviewer
+    /// has to re-derive the cause from the filename and can get it wrong (an L3
+    /// masquerade under an innocent name looks exactly like a term false
+    /// positive). It also lets a review group thousands of blocks by their few
+    /// dozen causes.
+    Block(Layer, String),
 }
 
 impl FilterResult {
     pub fn is_blocked(&self) -> bool {
-        matches!(self, FilterResult::Block(_))
+        matches!(self, FilterResult::Block(..))
     }
 }
 
@@ -183,26 +191,31 @@ impl ContentFilter {
         if !self.hash_whitelist.contains(file_hash)
             && self.hash_blocklist.load().contains(file_hash)
         {
-            return FilterResult::Block(Layer::L3HashBlock);
+            return FilterResult::Block(Layer::L3HashBlock, "hash".to_string());
         }
 
         // Normalize for term matching.
         let lowered = filename.to_lowercase();
 
         // Layer 1: jargon (list loaded at runtime; empty = inactive)
-        if jargon::matches_layer1(&lowered, &self.jargon_terms.load()) {
-            return FilterResult::Block(Layer::L1Jargon);
+        // Bind the guard first: the returned &str borrows from it, and a guard
+        // created inline inside the `if let` condition is a temporary whose
+        // lifetime rules changed between editions. An explicit binding is correct
+        // under every edition.
+        let jargon_terms = self.jargon_terms.load();
+        if let Some(term) = jargon::matches_layer1(&lowered, &jargon_terms) {
+            return FilterResult::Block(Layer::L1Jargon, term.to_string());
         }
 
         // Layer 2: age pattern + sexual context
-        if age_pattern::matches_layer2(filename, &lowered) {
-            return FilterResult::Block(Layer::L2AgePattern);
+        if let Some(reason) = age_pattern::matches_layer2(filename, &lowered) {
+            return FilterResult::Block(Layer::L2AgePattern, reason);
         }
 
         // Layer 4 (operator extras) — snapshot the hot-swappable list.
         let extra = self.extra_terms.load();
-        if extra.iter().any(|t| lowered.contains(t)) {
-            return FilterResult::Block(Layer::L4Extra);
+        if let Some(term) = extra.iter().find(|t| lowered.contains(t.as_str())) {
+            return FilterResult::Block(Layer::L4Extra, term.clone());
         }
 
         FilterResult::Allow
@@ -330,7 +343,7 @@ mod tests {
         let f = ContentFilter::new();
         // Sanitized example from real-world capture pattern
         let result = f.check(&zh(), "[movie] 8yo girl xxx.mp4");
-        assert!(matches!(result, FilterResult::Block(Layer::L2AgePattern)));
+        assert!(matches!(result, FilterResult::Block(Layer::L2AgePattern, _)));
     }
 
     #[test]
@@ -339,7 +352,7 @@ mod tests {
         let f = ContentFilter::new().with_hash_blocklist([bad]);
         assert!(matches!(
             f.check(&bad, "anything.mp4"),
-            FilterResult::Block(Layer::L3HashBlock)
+            FilterResult::Block(Layer::L3HashBlock, _)
         ));
         // Different hash same name → allowed
         assert!(matches!(
@@ -369,7 +382,7 @@ mod tests {
             .with_hash_whitelist([h])
             .with_jargon_terms(["longmarker".to_string()]);
         let result = f.check(&h, "something longmarker anything.mp4");
-        assert!(matches!(result, FilterResult::Block(Layer::L1Jargon)));
+        assert!(matches!(result, FilterResult::Block(Layer::L1Jargon, _)));
     }
 
     #[test]
@@ -377,7 +390,7 @@ mod tests {
         let f = ContentFilter::new().with_extra_terms(["specifictoken".to_string()]);
         assert!(matches!(
             f.check(&zh(), "file specifictoken anything.mp4"),
-            FilterResult::Block(Layer::L4Extra)
+            FilterResult::Block(Layer::L4Extra, _)
         ));
     }
 
@@ -390,7 +403,7 @@ mod tests {
         f.reload_extra_terms(["holiday".to_string()]);
         assert!(matches!(
             f.check(&zh(), "holiday clip.mp4"),
-            FilterResult::Block(Layer::L4Extra)
+            FilterResult::Block(Layer::L4Extra, _)
         ));
         // Reloading with an empty list clears L4 (terms removed from file).
         f.reload_extra_terms(Vec::<String>::new());

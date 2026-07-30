@@ -185,6 +185,62 @@ impl Source {
     }
 }
 
+/// One blocked publish, recorded for later review.
+///
+/// Everything here is captured AT CATCH TIME on purpose: the file is usually
+/// evicted once the publisher is banned and its sources disappear, so afterwards
+/// neither the name nor the reason can be reconstructed from the index.
+#[derive(Clone)]
+pub struct CsamCatch {
+    /// Filename as published (blocked files are never indexed, so this is the
+    /// only record of it).
+    pub name: String,
+    /// Which layer fired.
+    pub layer: crate::filter::Layer,
+    /// What matched: the term for L1/L4, a rendered age token for L2, "hash" for
+    /// L3. Reviews group by this, so a few dozen causes replace thousands of
+    /// individual filenames.
+    pub reason: String,
+    /// When it was caught (drives the review window).
+    pub at: std::time::Instant,
+}
+
+/// Names a single file has been published under, recorded only once a SECOND
+/// distinct name appears.
+///
+/// Nothing is stored for the overwhelming majority of files: one name, one entry
+/// in the slab, no alias record. The map therefore tracks only the anomaly, which
+/// is what makes it cheap enough to keep on the publish path.
+#[derive(Clone)]
+pub struct AliasRecord {
+    /// Distinct names seen, capped at `ALIAS_MAX_NAMES`. Interned, so each entry
+    /// is a pointer to a string the interner already holds.
+    pub names: Vec<std::sync::Arc<str>>,
+    /// Total divergent publishes seen, including those past the name cap.
+    pub seen: u32,
+    /// File size — a `.pdf` of 690 MB is its own red flag.
+    pub size: u64,
+}
+
+/// Cap per file. A dozen names is already conclusive; more adds no information.
+pub const ALIAS_MAX_NAMES: usize = 12;
+/// Cap on tracked files, so the map cannot grow without bound. At this size the
+/// table costs a few MB.
+pub const ALIAS_MAX_FILES: usize = 20_000;
+
+/// Files below this size are not tracked at all.
+///
+/// Without a floor the table fills with noise and nothing else: identical small
+/// files legitimately share a hash, so empty files, Qt icon assets, browser
+/// "saved_resource(1..15).html" and duplicated installers all show up carrying a
+/// dozen names each. Observed live: 37 of the top 60 entries were 0 MB, and the
+/// 20k cap was exhausted within hours — which also meant genuine candidates were
+/// being refused admission.
+///
+/// Masquerading targets large media files, so a floor costs nothing and removes
+/// essentially all of the noise.
+pub const ALIAS_MIN_SIZE: u64 = 10 * 1024 * 1024;
+
 pub struct ServerState {
     pub clients: DashMap<UserHash, ClientHandle>,
     /// FileId slab (Stage 3): the single authoritative file store. Holds every
@@ -345,11 +401,19 @@ pub struct ServerState {
     /// hash to the NAME it carried when the filter caught it — captured at catch
     /// time because the file is often evicted (sources gone after the ban) before
     /// any review runs, at which point the slab can no longer resolve the name.
+    /// Files seen under more than one name → the masquerade signal.
+    pub file_aliases: DashMap<FileHash, AliasRecord>,
+
+    /// When /api/review last exported. Each export reports only what was caught
+    /// since the previous one, so a daily review never re-reads decisions already
+    /// made. `None` until the first call, which then falls back to a 24h window.
+    pub review_watermark: std::sync::Mutex<Option<std::time::Instant>>,
+
     pub csam_files_by_user: DashMap<
         UserHash,
         (
-            // hash -> (name at catch time, when it was caught)
-            std::collections::HashMap<FileHash, (String, std::time::Instant)>,
+            // hash -> what was caught, and why
+            std::collections::HashMap<FileHash, CsamCatch>,
             // when this publisher was last caught (drives the TTL sweep)
             std::time::Instant,
         ),
@@ -468,11 +532,14 @@ impl ServerState {
     ///  - only `threshold + 1` genuinely DIFFERENT blocked files trigger a ban.
     /// Persists across reconnects (keyed by user_hash). `ttl` bounds memory: a
     /// user idle longer than ttl is swept and starts fresh.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_csam_file_for_user(
         &self,
         user_hash: UserHash,
         file_hash: FileHash,
         file_name: &str,
+        layer: crate::filter::Layer,
+        reason: &str,
         threshold: u32,
         ttl: std::time::Duration,
     ) -> bool {
@@ -491,10 +558,12 @@ impl ServerState {
         // account that trips the filter daily would keep dragging its entire
         // history into every export, which is exactly the growth being avoided.
         // Re-publishing the same hash keeps the FIRST catch (name and time).
-        entry
-            .0
-            .entry(file_hash)
-            .or_insert_with(|| (file_name.to_string(), now));
+        entry.0.entry(file_hash).or_insert_with(|| CsamCatch {
+            name: file_name.to_string(),
+            layer,
+            reason: reason.to_string(),
+            at: now,
+        });
         entry.1 = now;
         // Ban once the count EXCEEDS the threshold (4th distinct file when
         // threshold = 3). The first `threshold` files are filtered but tolerated —
@@ -579,6 +648,8 @@ impl ServerState {
             bot_detections: DashMap::new(),
             banned_bots: DashMap::new(),
             banned_publishers: DashMap::new(),
+            file_aliases: DashMap::new(),
+            review_watermark: std::sync::Mutex::new(None),
             csam_files_by_user: DashMap::new(),
             block_stats: DashMap::new(),
         }
@@ -626,13 +697,87 @@ impl ServerState {
         let (file_id, newly_added) =
             self.file_slab.get_or_insert(hash, size, name_arc.clone(), src);
         if !newly_added {
-            self.file_slab.add_or_refresh_source(&hash, src);
+            // Records the source and, in the same shard lock, tells us whether
+            // this publisher used a different name than the one already stored.
+            if let Some(stored) = self
+                .file_slab
+                .add_or_refresh_source_named(&hash, src, &name_arc)
+            {
+                self.note_alias(hash, size, &stored, &name_arc);
+            }
         } else {
             self.keyword_index.add_file(file_id, &name_arc);
         }
         // Maintain reverse index user → set of FileIds this user sources.
         // HashSet semantics dedup re-publishes of the same file by the same user.
         self.user_files.entry(publisher_hash).or_default().insert(file_id);
+    }
+
+    /// Record that `hash` has now been published under two different names.
+    ///
+    /// Called only on divergence, so this is off the common path entirely. The
+    /// first entry seeds both names; later ones append until the cap.
+    fn note_alias(
+        &self,
+        hash: FileHash,
+        size: u64,
+        stored: &std::sync::Arc<str>,
+        published_as: &std::sync::Arc<str>,
+    ) {
+        /// Do the two names share any word of 4+ characters?
+        ///
+        /// Zero-allocation: iterates the word slices in place. Only runs when two
+        /// names actually differ, which is already the uncommon case.
+        fn share_word(a: &str, b: &str) -> bool {
+            a.split(|c: char| !c.is_alphanumeric())
+                .filter(|w| w.chars().count() >= 4)
+                .any(|wa| {
+                    b.split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| w.chars().count() >= 4)
+                        .any(|wb| wa.eq_ignore_ascii_case(wb))
+                })
+        }
+        // Small files share hashes legitimately and would drown the table.
+        if size < ALIAS_MIN_SIZE {
+            return;
+        }
+        let known = self.file_aliases.contains_key(&hash);
+
+        // Admit a NEW file only when the two names share nothing.
+        //
+        // Most divergence is ordinary: the same release renamed by different
+        // users keeps its subject ("American Beauty (1999).mkv" vs
+        // "American.Beauty.1999.BDrip.mkv" share "american"/"beauty"/"1999").
+        // Masquerading does not — one file was published as "Discografia Queen",
+        // "Marc Dorcel - Paris Pigalle" AND "Amateur Homemade Webcam" at once.
+        //
+        // Filtering at admission rather than at report time keeps the table full
+        // of candidates instead of renames: it used to hit the 20k cap within a
+        // day, which meant later anomalies were refused entry.
+        //
+        // A file whose first divergence happens to be a plain rename is not lost:
+        // every later divergent publish is tested again against the same stored
+        // name, so it is admitted as soon as an unrelated name shows up.
+        if !known && share_word(stored, published_as) {
+            return;
+        }
+
+        // Bound the table: once full, keep updating what we already track rather
+        // than admitting new files.
+        if !known && self.file_aliases.len() >= ALIAS_MAX_FILES {
+            return;
+        }
+        let mut e = self.file_aliases.entry(hash).or_insert_with(|| AliasRecord {
+            names: vec![std::sync::Arc::clone(stored)],
+            seen: 0,
+            size,
+        });
+        e.seen = e.seen.saturating_add(1);
+        if e.names.len() < ALIAS_MAX_NAMES
+            && !e.names.iter().any(|n| std::sync::Arc::ptr_eq(n, published_as))
+        {
+            e.names.push(std::sync::Arc::clone(published_as));
+        }
     }
 
     /// Remove this user as a source from every file they published. If a file
@@ -1072,12 +1217,12 @@ mod user_files_index_tests {
         let ttl = Duration::from_secs(3600);
         // threshold = 3 = MAX tolerated distinct files. Files 1-3 are filtered
         // but must NOT ban (headroom for false positives).
-        assert!(!s.record_csam_file_for_user(u, fhash(10), "test.mp4", 3, ttl), "1st file");
-        assert!(!s.record_csam_file_for_user(u, fhash(11), "test.mp4", 3, ttl), "2nd file");
-        assert!(!s.record_csam_file_for_user(u, fhash(12), "test.mp4", 3, ttl), "3rd file (at threshold)");
+        assert!(!s.record_csam_file_for_user(u, fhash(10), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "1st file");
+        assert!(!s.record_csam_file_for_user(u, fhash(11), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "2nd file");
+        assert!(!s.record_csam_file_for_user(u, fhash(12), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "3rd file (at threshold)");
         assert!(!s.is_publisher_banned(&u, ttl), "not banned at threshold");
         // The 4th DISTINCT file EXCEEDS the threshold → ban.
-        assert!(s.record_csam_file_for_user(u, fhash(13), "test.mp4", 3, ttl), "4th distinct file");
+        assert!(s.record_csam_file_for_user(u, fhash(13), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "4th distinct file");
         s.ban_publisher(u);
         assert!(s.is_publisher_banned(&u, ttl), "banned above threshold");
     }
@@ -1096,7 +1241,7 @@ mod user_files_index_tests {
         let fp_file = fhash(99);
         for _ in 0..50 {
             assert!(
-                !s.record_csam_file_for_user(u, fp_file, "test.mp4", 3, ttl),
+                !s.record_csam_file_for_user(u, fp_file, "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl),
                 "republishing the same file must never reach the threshold"
             );
         }

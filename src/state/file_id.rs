@@ -554,6 +554,48 @@ impl FileSlab {
     /// `files.entry(hash).and_modify(...)`: dedups by user_hash, refreshes the
     /// completeness flag, bumps last_seen. Used by add_file_with_source for the
     /// "already known file" path.
+    /// Like `add_or_refresh_source`, but also reports the name already stored for
+    /// this file when the publisher used a DIFFERENT one.
+    ///
+    /// Returns `Some(stored_name)` only on divergence; `None` when the names match
+    /// or the file is unknown.
+    ///
+    /// Cost is one pointer comparison inside the shard lock this call already
+    /// takes: names come from the interner, so identical strings are the same
+    /// `Arc` allocation and `Arc::ptr_eq` settles it without touching the bytes.
+    /// Nothing is allocated unless the names actually differ, which is rare.
+    ///
+    /// Divergence is the signal that catches masquerading: one file circulated
+    /// under many unrelated names ("MANUALE PHOTOSHOP COMPLETO.PDF" at 690 MB,
+    /// also seen as "12Yo Nude - Sexy Dance", "Daemon.Tools.Pro", "Vikings.3x05").
+    /// A name filter cannot see that; the pattern only exists across publishers.
+    pub fn add_or_refresh_source_named(
+        &self,
+        hash: &FileHash,
+        src: Source,
+        published_as: &Arc<str>,
+    ) -> Option<Arc<str>> {
+        let id = self.id_of(hash)?;
+        let shard = self.shards.get(id_shard(id))?;
+        let mut sh = shard.write().unwrap();
+        let r = sh.records.get_mut(id_index(id))?;
+        if !r.alive {
+            return None;
+        }
+        r.last_seen = self.now_secs();
+        if let Some(existing) = r.sources.iter_mut().find(|s| s.user_hash == src.user_hash) {
+            existing.set_complete(src.complete());
+        } else {
+            r.sources.push(src);
+        }
+        // Same interned string → same allocation → nothing to report.
+        if Arc::ptr_eq(&r.name, published_as) {
+            None
+        } else {
+            Some(Arc::clone(&r.name))
+        }
+    }
+
     pub fn add_or_refresh_source(&self, hash: &FileHash, src: Source) -> bool {
         let id = match self.id_of(hash) { Some(i) => i, None => return false };
         let shard = match self.shards.get(id_shard(id)) { Some(s) => s, None => return false };

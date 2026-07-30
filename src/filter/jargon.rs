@@ -48,20 +48,25 @@ fn contains_word_bounded(lowered: &str, term: &str) -> bool {
 /// term from `terms` (terms are expected pre-lowercased by the loader).
 /// Long terms use substring match; short terms require word boundaries.
 /// Internal — not re-exported. Callers go through `ContentFilter::check`.
-pub(super) fn matches_layer1(lowered: &str, terms: &[String]) -> bool {
+/// Returns the term that matched, so the caller can report WHY a file was
+/// blocked. Reporting only the layer is not enough for review: an operator (or a
+/// reviewer) has to be able to tell "caught by term X" from "caught by the hash
+/// list", and to judge whether term X is too broad. Judging the term once beats
+/// judging each of the hundreds of filenames it catches.
+pub(super) fn matches_layer1<'a>(lowered: &str, terms: &'a [String]) -> Option<&'a str> {
     for term in terms {
         if term.is_empty() {
             continue;
         }
         if term.chars().count() >= SUBSTRING_MIN_CHARS {
             if lowered.contains(term.as_str()) {
-                return true;
+                return Some(term.as_str());
             }
         } else if contains_word_bounded(lowered, term) {
-            return true;
+            return Some(term.as_str());
         }
     }
-    false
+    None
 }
 
 #[cfg(test)]
@@ -77,32 +82,32 @@ mod tests {
     #[test]
     fn long_term_substring_matches_anywhere() {
         let t = sample();
-        assert!(matches_layer1("video longmarker something.mp4", &t));
-        assert!(matches_layer1("xlongmarkerx.zip", &t)); // unanchored OK for long terms
+        assert!(matches_layer1("video longmarker something.mp4", &t).is_some());
+        assert!(matches_layer1("xlongmarkerx.zip", &t).is_some()); // unanchored OK for long terms
     }
 
     #[test]
     fn short_term_requires_word_boundaries() {
         let t = sample();
-        assert!(matches_layer1("a shrt clip.mp4", &t));
-        assert!(matches_layer1("[shrt] file.mkv", &t));
-        assert!(matches_layer1("file.shrt.video.mkv", &t)); // dots are boundaries
-        assert!(matches_layer1("xx-shrt-xx.mp4", &t));       // hyphens are boundaries
+        assert!(matches_layer1("a shrt clip.mp4", &t).is_some());
+        assert!(matches_layer1("[shrt] file.mkv", &t).is_some());
+        assert!(matches_layer1("file.shrt.video.mkv", &t).is_some()); // dots are boundaries
+        assert!(matches_layer1("xx-shrt-xx.mp4", &t).is_some());       // hyphens are boundaries
         // No boundary → must NOT match (substring of a longer ordinary word).
-        assert!(!matches_layer1("ashrtb album.mp3", &t));
+        assert!(matches_layer1("ashrtb album.mp3", &t).is_none());
         // _ counts as a word char, so an underscore run is one identifier.
-        assert!(!matches_layer1("file_shrt_xx.mp4", &t));
+        assert!(matches_layer1("file_shrt_xx.mp4", &t).is_none());
     }
 
     #[test]
     fn empty_list_matches_nothing() {
-        assert!(!matches_layer1("anything at all.mp4", &[]));
+        assert!(matches_layer1("anything at all.mp4", &[]).is_none());
     }
 
     #[test]
     fn empty_term_is_skipped() {
         let t = vec!["".to_string(), "longmarker".to_string()];
-        assert!(!matches_layer1("nothing here.mp4", &t));
-        assert!(matches_layer1("longmarker.mp4", &t));
+        assert!(matches_layer1("nothing here.mp4", &t).is_none());
+        assert!(matches_layer1("longmarker.mp4", &t).is_some());
     }
 }

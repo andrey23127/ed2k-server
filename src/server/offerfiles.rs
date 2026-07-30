@@ -112,7 +112,7 @@ pub fn handle_offerfiles(
 
         // §7.6: mandatory content filter. Always runs, cannot be skipped.
         match state.filter.check(&file.hash, &file.filename) {
-            FilterResult::Block(layer) => {
+            FilterResult::Block(layer, reason) => {
                 blocked += 1;
                 client.csam_attempts = client.csam_attempts.saturating_add(1);
                 // Count this hash exactly ONCE in block_stats and csam_unique_ips.
@@ -149,7 +149,8 @@ pub fn handle_offerfiles(
                     let ttl = std::time::Duration::from_secs(
                         cfg.content_filter.publisher_blacklist_seconds);
                     if state.record_csam_file_for_user(
-                        client.user_hash, file.hash, &file.filename, threshold, ttl)
+                        client.user_hash, file.hash, &file.filename,
+                        layer, &reason, threshold, ttl)
                     {
                         // Threshold of distinct blocked files reached. ban_publisher
                         // is idempotent (it reports whether the ban was newly

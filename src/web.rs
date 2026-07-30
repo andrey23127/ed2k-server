@@ -156,6 +156,7 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/memsize", get(api_memsize))
             .route("/api/publishers", get(api_publishers))
             .route("/api/health", get(api_health))
+            .route("/api/review", get(api_review))
             .with_state(state);
 
         let bind = format!("127.0.0.1:{port}");
@@ -640,6 +641,246 @@ struct BlockStatRow {
 /// (the volume is large and disk is not), which otherwise leaves no way to see
 /// that a UDP socket never bound or that a blocklist failed to parse. Everything
 /// here is computed on demand — nothing is tracked in the hot path.
+/// Filter review export — the input for a human/AI false-positive audit.
+///
+/// Two design choices make this cheap to read where /api/publishers was not:
+///
+/// * **Grouped by CAUSE, not by publisher.** A false-positive verdict is a
+///   property of the term that fired, not of each file it caught: judging
+///   "brosis" once settles all 32 of its hits. A few dozen causes replace
+///   thousands of filenames.
+/// * **L3 hits are counted, not listed.** A hash-blocklist hit is a decision made
+///   earlier; re-reading the filename proves nothing and actively misleads —
+///   known material is routinely republished under innocent names (a blocked hash
+///   turned up as "Tchaikovsky 1813 Overture" and as an MS-Office archive). Those
+///   names must not be mistaken for filter mistakes.
+///
+/// Window: everything caught since the previous export (watermark), falling back
+/// to 24h on the first call. `?hours=N` overrides, `?all=1` ignores the window,
+/// `?peek=1` reports without advancing the watermark.
+///
+/// `?format=csv` dumps every entry as `hash;layer;reason;name` with no example
+/// caps — that is the machine-readable side, used to turn per-cause verdicts into
+/// blocklist/whitelist hash files.
+async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl IntoResponse {
+    let qs = uri.query().unwrap_or("");
+    let param = |key: &str| -> Option<&str> {
+        qs.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            if k == key { Some(v) } else { None }
+        })
+    };
+    let flag = |key: &str| matches!(param(key), Some("1") | Some("true"));
+    let csv = matches!(param("format"), Some("csv"));
+    let max_examples: usize = param("max_examples").and_then(|v| v.parse().ok()).unwrap_or(10);
+
+    // Resolve the window.
+    let now = std::time::Instant::now();
+    let since: Option<std::time::Instant> = if flag("all") {
+        None
+    } else if let Some(h) = param("hours").and_then(|v| v.parse::<u64>().ok()) {
+        now.checked_sub(std::time::Duration::from_secs(h * 3600))
+    } else {
+        let wm = s.server.review_watermark.lock().ok().and_then(|g| *g);
+        match wm {
+            Some(t) => Some(t),
+            // First ever call: default to 24h rather than the whole retention
+            // period, so the first export is not disproportionately large.
+            None => now.checked_sub(std::time::Duration::from_secs(24 * 3600)),
+        }
+    };
+    let window_desc = if flag("all") {
+        "all retained".to_string()
+    } else if let Some(h) = param("hours") {
+        format!("last {h}h")
+    } else if s.server.review_watermark.lock().ok().and_then(|g| *g).is_some() {
+        "since previous export".to_string()
+    } else {
+        "last 24h (first export)".to_string()
+    };
+
+    // Collect, de-duplicated by file hash: the same file caught from several
+    // publishers is ONE decision to review.
+    let mut by_hash: std::collections::HashMap<[u8; 16], crate::state::CsamCatch> =
+        std::collections::HashMap::new();
+    for e in s.server.csam_files_by_user.iter() {
+        for (h, c) in e.value().0.iter() {
+            if let Some(cutoff) = since {
+                if c.at < cutoff {
+                    continue;
+                }
+            }
+            by_hash.entry(*h).or_insert_with(|| c.clone());
+        }
+    }
+
+    if csv {
+        let mut out = String::from("hash;layer;reason;name\n");
+        for (h, c) in &by_hash {
+            // ';' cannot appear in the fields we emit except possibly the name.
+            let name = c.name.replace(';', ",");
+            out.push_str(&format!(
+                "{};{:?};{};{}\n",
+                hex::encode(h),
+                c.layer,
+                c.reason,
+                name
+            ));
+        }
+        if !flag("peek") {
+            if let Ok(mut g) = s.server.review_watermark.lock() {
+                *g = Some(now);
+            }
+        }
+        return ([("content-type", "text/plain; charset=utf-8")], out);
+    }
+
+    // Group by (layer, reason). L3 is tallied separately.
+    let mut groups: std::collections::HashMap<(String, String), Vec<([u8; 16], String)>> =
+        std::collections::HashMap::new();
+    let mut l3_count = 0usize;
+    for (h, c) in &by_hash {
+        if c.layer == crate::filter::Layer::L3HashBlock {
+            l3_count += 1;
+            continue;
+        }
+        groups
+            .entry((format!("{:?}", c.layer), c.reason.clone()))
+            .or_default()
+            .push((*h, c.name.clone()));
+    }
+
+    let mut keys: Vec<_> = groups.keys().cloned().collect();
+    // Largest groups first: those decide the most files per verdict.
+    keys.sort_by_key(|k| std::cmp::Reverse(groups[k].len()));
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "# ed2k-server filter review\n# window: {}\n# blocks in window: {} unique hashes\n",
+        window_desc,
+        by_hash.len()
+    ));
+    out.push_str(&format!(
+        "# L3 hash-blocklist hits: {l3_count} (already-decided; NOT listed — known \
+         material is republished under innocent names, so these filenames must not \
+         be read as filter mistakes)\n"
+    ));
+    out.push_str(&format!(
+        "# causes to review: {} (verdict per cause applies to all its files)\n\
+         # names truncated to 120 chars; up to {} examples per cause\n\n",
+        keys.len(),
+        max_examples
+    ));
+
+    for k in keys {
+        let items = &groups[&k];
+        out.push_str(&format!("=== {} | {} | {} files ===\n", k.0, k.1, items.len()));
+        for (h, name) in items.iter().take(max_examples) {
+            let short: String = name.chars().take(120).collect();
+            out.push_str(&format!("{} {}\n", &hex::encode(h)[..8], short));
+        }
+        if items.len() > max_examples {
+            out.push_str(&format!("... +{} more\n", items.len() - max_examples));
+        }
+        out.push('\n');
+    }
+
+    // ── Files circulating under several names ────────────────────────────
+    //
+    // Independent of the filters: this catches material that no term list can
+    // see, because the giveaway is not in any single name but in the fact that
+    // one file carries many unrelated ones. Sorted by name count — the more
+    // names, the stronger the signal.
+    // How many of the names share NO word with the first one.
+    //
+    // This is what separates the two reasons a file carries several names. A
+    // release renamed by different users keeps its subject: "American Beauty
+    // (Sam Mendes, 1999).mkv" and "American.Beauty.1999.BDrip.mkv" still share
+    // "american"/"beauty"/"1999". Masquerading does not: one 698 MB file was
+    // published as "Magma Tittenshow", "Marc Dorcel 6 Bourgeoises" AND "Joe
+    // Cocker - Discography.rar", which have nothing in common.
+    //
+    // Computed here rather than on the publish path — it only runs over the
+    // tracked set when a report is requested.
+    fn tokens(name: &str) -> std::collections::HashSet<String> {
+        name.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() >= 4)
+            .map(|w| w.to_string())
+            .collect()
+    }
+    fn unrelated_count(names: &[std::sync::Arc<str>]) -> usize {
+        let Some(first) = names.first() else { return 0 };
+        let base = tokens(first);
+        names
+            .iter()
+            .skip(1)
+            .filter(|n| tokens(n).is_disjoint(&base))
+            .count()
+    }
+
+    let mut aliases: Vec<_> = s
+        .server
+        .file_aliases
+        .iter()
+        .map(|e| {
+            let a = e.value().clone();
+            let unrelated = unrelated_count(&a.names);
+            (*e.key(), a, unrelated)
+        })
+        .collect();
+    // Unrelated names first, then size: the strongest evidence at the top.
+    aliases.sort_by_key(|(_, a, u)| (std::cmp::Reverse(*u), std::cmp::Reverse(a.size)));
+
+    if !aliases.is_empty() {
+        out.push_str(&format!(
+            "\n=== FILES PUBLISHED UNDER MULTIPLE NAMES ({} tracked) ===\n\
+             # Not a filter verdict — a lead. A file is only tracked once it appears\n\
+             # under two names sharing NO word: a renamed release keeps its subject,\n\
+             # a masqueraded file does not. Sorted by how many names are unrelated\n\
+             # to the first. [!] marks a size that contradicts the extension (a\n\
+             # 690 MB \"PDF\"). Files under 10 MB are not tracked.\n\n",
+            aliases.len()
+        ));
+        for (h, a, unrelated) in aliases.iter().take(60) {
+            // A document/image extension on a huge file is its own red flag.
+            let doclike = a.names.iter().any(|n| {
+                let l = n.to_ascii_lowercase();
+                [".pdf", ".txt", ".doc", ".epub", ".jpg", ".jpeg", ".png", ".gif"]
+                    .iter()
+                    .any(|e| l.ends_with(e))
+            });
+            let flag = if doclike && a.size > 50 * 1024 * 1024 { " [!]" } else { "" };
+            out.push_str(&format!(
+                "{} {} names ({} unrelated), {:.0} MB{}\n",
+                hex::encode(h),
+                a.names.len(),
+                unrelated,
+                a.size as f64 / 1048576.0,
+                flag
+            ));
+            for n in a.names.iter().take(6) {
+                let short: String = n.chars().take(110).collect();
+                out.push_str(&format!("    {short}\n"));
+            }
+            if a.names.len() > 6 {
+                out.push_str(&format!("    ... +{} more\n", a.names.len() - 6));
+            }
+            out.push('\n');
+        }
+    }
+
+    // Advance the watermark only after a successful build, and only if the caller
+    // did not ask to peek — otherwise a failed download would silently skip a
+    // day's worth of blocks.
+    if !flag("peek") {
+        if let Ok(mut g) = s.server.review_watermark.lock() {
+            *g = Some(now);
+        }
+    }
+    ([("content-type", "text/plain; charset=utf-8")], out)
+}
+
 async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
     let tcp = s.config.network.tcp_port;
 
@@ -698,7 +939,7 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
     }
 
     let mut files: Vec<serde_json::Value> = Vec::new();
-    let mut push_file = |label: &str, path: &str, entries: Option<u64>, files: &mut Vec<serde_json::Value>| {
+    let push_file = |label: &str, path: &str, entries: Option<u64>, files: &mut Vec<serde_json::Value>| {
         if path.is_empty() {
             return;
         }
@@ -799,7 +1040,7 @@ async fn api_publishers(
         // Files caught inside the window (all of them when max_age_hours = 0).
         let recent: Vec<_> = flagged_map
             .iter()
-            .filter(|(_, (_, caught))| max_age_hours == 0 || caught.elapsed() <= max_age)
+            .filter(|(_, c)| max_age_hours == 0 || c.at.elapsed() <= max_age)
             .collect();
         if recent.is_empty() {
             continue; // nothing recent from this publisher — skip it entirely
@@ -808,7 +1049,7 @@ async fn api_publishers(
 
         let flagged_detail: Vec<serde_json::Value> = recent
             .into_iter()
-            .map(|(h, (name, caught))| {
+            .map(|(h, c)| {
                 let still_live = s
                     .server
                     .file_slab
@@ -817,8 +1058,11 @@ async fn api_publishers(
                     .map(|rec| rec.sources.len());
                 serde_json::json!({
                     "hash": hex::encode(h),
-                    "name": name,
-                    "caught_secs_ago": caught.elapsed().as_secs(),
+                    "name": c.name,
+                    // Why it was blocked — the same reason /api/review groups by.
+                    "layer": format!("{:?}", c.layer),
+                    "reason": c.reason,
+                    "caught_secs_ago": c.at.elapsed().as_secs(),
                     "still_live": still_live.is_some(),
                     "sources": still_live.unwrap_or(0),
                 })
@@ -906,6 +1150,7 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
             "keyword_cold_keys": s.server.keyword_index.tier_sizes().0,
             "keyword_hot_keys": s.server.keyword_index.tier_sizes().1,
             "keyword_pending_removal_keys": s.server.keyword_index.tier_sizes().2,
+            "alias_tracked_files": s.server.file_aliases.len(),
             "keyword_postings": s.server.keyword_index.posting_stats().1,
             "unique_names": s.server.name_interner.len(),
             "clients": s.server.clients.len(),
