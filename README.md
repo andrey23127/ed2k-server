@@ -137,7 +137,7 @@ Put your runtime data files here too and point the config at them:
 - **`guarding.p2p`** — IP blocklist in eMule format (same format used by
   emule-security). Set `storage.ipfilter_path = "/etc/ed2k-server/guarding.p2p"`.
 
-- **CSAM filter lists** (optional but recommended — see *Content filter*).
+- **Content filter lists** (optional but recommended — see *Content filter*).
 
 ### 3. Run as a systemd service
 
@@ -275,12 +275,17 @@ a watched file) or needs a **restart**.
 ### `[content_filter]`
 | Key | Meaning | Apply |
 |---|---|---|
-| `hash_blocklists` | L3 hash-blocklist file path(s) | **live** (file edit / reload) |
+| `hash_banlist` | L3 ban-list file path(s) — blocked **and** counted against the publisher | **live** (file edit / reload) |
+| `hash_filter` | L5 filter-only file path(s) — blocked, publisher **not** accused | **live** |
 | `extra_terms_file` | L4 operator extra terms | **live** |
 | `jargon_terms_file` | L1 jargon list | **live** |
-| `whitelist_hashes_file` | Hash false-positive overrides | restart |
-| `publisher_attempt_disconnect_threshold` | Max tolerated distinct CSAM files before banning a publisher (ban fires on the next one) | restart |
+| `whitelist_hashes_file` | Hash false-positive overrides (wins over every layer) | **live** |
+| `publisher_attempt_disconnect_threshold` | Distinct blocked files tolerated before a publisher is banned (ban fires on the next one) | restart |
+| `publisher_count_window_seconds` | How far back those files are counted. Defaults to `publisher_blacklist_seconds` | restart |
 | `publisher_blacklist_seconds` | Ban duration (by user-hash) | restart |
+
+> `hash_banlist` was `hash_blocklists` and `hash_filter` was `poison_hashes`
+> before 0.9.71; the shipped filenames changed to match. See *Content filter*.
 
 ### `[storage]`
 | Key | Meaning | Apply |
@@ -302,15 +307,21 @@ a watched file) or needs a **restart**.
 | `worker_threads` | Tokio worker threads (0 = auto) | restart |
 
 **Live changes that take effect without a restart:** the CSAM filter lists —
-**L1 jargon**, **L3 hash blocklist(s)**, **L4 extra terms** — reload automatically
-within ~30 s of editing the file, or immediately on `systemctl reload` /
-`POST /api/reload`.
+**L1 jargon**, **L3 ban list(s)**, **L4 extra terms**, **L5 filter list(s)** and
+the **hash whitelist** — all reload automatically within ~30 s of editing the
+file, or immediately on `systemctl reload` / `POST /api/reload`. Copy list files
+with `cp` and **not** `cp -p`: the watcher polls mtime, so preserving timestamps
+means nothing reloads.
+
+Changes take effect on **search results and source lists**, not just on new
+publications — a hash added to either list disappears from what the server serves
+within one reload cycle, with no restart.
 
 ---
 
 ## Content filter (CSAM)
 
-The filter runs on every offered file and cannot be disabled. It has four layers:
+The filter runs on every offered file and cannot be disabled. It has five layers:
 
 - **L1 – jargon list** — known marker terms. The list is **not shipped** with the
   source (publishing a catalog of such terms is itself harmful). Supply your own
@@ -318,15 +329,56 @@ The filter runs on every offered file and cannot be disabled. It has four layers
   (INHOPE, IWF, NCMEC). Absent ⇒ L1 inactive; the other layers still run.
 - **L2 – age + sexual-context heuristics** — compiled into the binary, works out
   of the box, no data file needed. This is the main heuristic layer.
-- **L3 – hash blocklist** — exact known-file hashes. Obtain from authoritative
-  sources (NCMEC, IWF, Project Arachnid / C3P). These lists are typically licensed
-  and **must not be redistributed** — keep them private.
+- **L3 – ban list** (`hash_banlist`) — exact known-file hashes. Obtain from
+  authoritative sources (NCMEC, IWF, Project Arachnid / C3P). These lists are
+  typically licensed and **must not be redistributed** — keep them private.
+  A hit here counts against the publisher.
 - **L4 – operator extra terms** — optional additive substrings.
+- **L5 – filter list** (`hash_filter`) — blocked like anything else, but the
+  block carries **no accusation**: it does not raise `csam_attempts` and does not
+  count toward `publisher_attempt_disconnect_threshold`.
+
+### Why L3 and L5 are separate lists
+
+Two things belong in `hash_filter`: **decoys** — one hash advertised under a
+dozen unrelated names, a 700 MB file claiming at once to be a music compilation,
+a film and an office installer — and **takedown requests**, where a rightsholder
+complaint means the file should leave the index and says nothing about whoever
+happens to share it.
+
+Keeping those in the ban list did two kinds of damage: it pushed ordinary users
+toward a ban for downloading a decoy, and it diluted a list whose whole value is
+that every entry means one specific thing. `/api/review` reports blocklisted
+hashes carrying several unrelated names or a size their extension cannot hold —
+those are the candidates to move.
+
+### Whitelist
+
+`whitelist_hashes_file` overrides **every** layer, not just the hash lists. The
+false positives that actually occur are term matches — song titles that happen to
+contain a marker word, or historical texts whose title does — so an override that
+left the term layers running did nothing for the one class of mistake that
+happens in practice.
+
+### Term matching
+
+L1 and L4 share one matcher. A term is classified by length: **≥6 chars** →
+substring match, **≤5** → word-boundary match. Three refinements matter:
+
+- A long term must not begin immediately after an ASCII letter. Without this a
+  six-character term that is a suffix of an ordinary English word fires inside
+  it — one such term blocked every medical paper mentioning *fibrosis*.
+- Digits and `_` separate, letters bind: `term_001`, `2term` and `term2011` all
+  match, `aterm` and `termly` do not.
+- A trailing `$` on a term additionally forbids digits and `_` after the match.
+  Use it only when the term is the start of a longer innocent word.
+
+Terms in CJK are exempt from the boundary rules — that script has no word
+separators, so they match as plain substrings wherever they appear.
 
 Template/format files are provided as `config/*.example`. The real list files are
-git-ignored and never committed. Format: one entry per line, `#` comments allowed.
-L1 classifies a term by length (≥6 chars → substring match; ≤5 → word-boundary
-match). All three list files hot-reload without a restart.
+git-ignored and never committed. Format: one entry per line, `#` comments allowed
+(`;` inline comments too in the hash lists).
 
 ---
 
