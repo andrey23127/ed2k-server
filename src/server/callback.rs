@@ -39,8 +39,10 @@ pub async fn handle_callback_request(
         return Ok(());
     }
 
-    // Find the target client by assigned_id
-    let target = state.clients.iter().find(|e| e.assigned_id == target_id);
+    // Find the target client by assigned_id. O(1) via the id index — this used
+    // to walk every connected client, on the packet that is the whole point of
+    // LowID-to-LowID connectivity.
+    let target = state.client_by_assigned_id(target_id);
 
     let Some(target) = target else {
         warn!(

@@ -25,6 +25,47 @@ pub enum Layer {
     L3HashBlock,
     /// Operator-supplied extra terms (additive only — never overrides L1/L2)
     L4Extra,
+    /// Layer 5 — "poisoned index" hash list. Blocks like any other layer, but
+    /// carries NO accusation against the publisher.
+    ///
+    /// eD2k indexes are routinely poisoned: one hash is advertised under a dozen
+    /// unrelated names (a 700 MB file claiming to be at once a Beatles
+    /// compilation, Pulp Fiction and an Office installer). Such a file is junk
+    /// and should not be indexed — but the client offering it is an ordinary
+    /// user who downloaded a decoy, not a publisher of illegal material, and
+    /// must not be counted toward a CSAM ban.
+    ///
+    /// Keeping these hashes in the CSAM list conflated the two: every decoy
+    /// pushed real users toward `publisher_attempt_disconnect_threshold`, and it
+    /// polluted a list whose whole value is that every entry means one specific
+    /// thing — the list is shared with other operators, with its provenance
+    /// stated.
+    L5Poison,
+}
+
+impl Layer {
+    /// Whether a block at this layer counts against the publisher: toward
+    /// `csam_attempts` (session disconnect) and toward the distinct-file ban
+    /// threshold.
+    ///
+    /// This is the ONLY place the distinction lives. Every caller that
+    /// increments a publisher counter must ask here rather than testing the
+    /// layer itself, so a future layer cannot silently inherit the wrong
+    /// treatment by being added to a match arm somewhere.
+    pub fn counts_against_publisher(&self) -> bool {
+        !matches!(self, Layer::L5Poison)
+    }
+
+    /// Short stable key for `block_stats` counters and log fields.
+    pub fn stat_key(&self) -> &'static str {
+        match self {
+            Layer::L1Jargon => "csam_L1_jargon",
+            Layer::L2AgePattern => "csam_L2_age",
+            Layer::L3HashBlock => "csam_L3_hash",
+            Layer::L4Extra => "csam_L4_extra",
+            Layer::L5Poison => "poison_L5_hash",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,12 +107,27 @@ pub struct ContentFilter {
     /// (the list is NOT shipped in source — see jargon.rs). Empty = L1 inactive,
     /// which is fine; L2-L4 still run. Hot-reloadable like L4. The matching
     /// logic (substring for long terms, word-bounded for short) lives in
-    /// `jargon::matches_layer1`; this only holds the (pre-lowercased) list.
+    /// `jargon::matches_terms`; this only holds the (pre-lowercased) list.
     jargon_terms: arc_swap::ArcSwap<Vec<String>>,
 
+    /// Filter-only hash list (Layer 5, config key `hash_filter`). Blocked, but
+    /// never held against the publisher — see `Layer::L5Poison`. Separate from
+    /// `hash_blocklist` on purpose: the two lists mean different things and are
+    /// curated, exported and shared differently. Hot-reloadable like the ban
+    /// list.
+    hash_filter_set: arc_swap::ArcSwap<HashSet<[u8; 16]>>,
+
     /// Hash whitelist - verified false positives (Layer 3 override).
-    /// Any hash here bypasses Layer 3 (but NOT layers 1, 2, or 4).
-    hash_whitelist: HashSet<[u8; 16]>,
+    /// Any hash here bypasses the hash layers (3 and 5), but NOT the term and
+    /// age layers (1, 2, 4).
+    ///
+    /// Hot-reloadable like the blocklist. It used to load once at startup on the
+    /// reasoning that false-positive overrides change rarely — but the whole
+    /// point of this list is to un-block something that is being wrongly blocked
+    /// RIGHT NOW, and making that wait for a restart is backwards. It is the one
+    /// list where the delay is measured in a user's inability to publish a legal
+    /// file.
+    hash_whitelist: arc_swap::ArcSwap<HashSet<[u8; 16]>>,
 }
 
 impl ContentFilter {
@@ -82,7 +138,8 @@ impl ContentFilter {
             hash_blocklist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             extra_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
             jargon_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
-            hash_whitelist: HashSet::new(),
+            hash_filter_set: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            hash_whitelist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
         }
     }
 
@@ -92,7 +149,8 @@ impl ContentFilter {
         let hsz = std::mem::size_of::<[u8; 16]>() as u64 + 1; // + hashbrown ctrl byte
         let bl = self.hash_blocklist.load();
         let mut n = bl.capacity() as u64 * hsz;
-        n += self.hash_whitelist.capacity() as u64 * hsz;
+        n += self.hash_filter_set.load().capacity() as u64 * hsz;
+        n += self.hash_whitelist.load().capacity() as u64 * hsz;
         for list in [self.extra_terms.load(), self.jargon_terms.load()] {
             n += list.capacity() as u64 * std::mem::size_of::<String>() as u64;
             for t in list.iter() {
@@ -118,8 +176,54 @@ impl ContentFilter {
         self.hash_blocklist.store(std::sync::Arc::new(set));
     }
 
-    pub fn with_hash_whitelist(mut self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Self {
-        self.hash_whitelist.extend(hashes);
+    /// Builder: merge into the Layer 5 filter-only hash list.
+    pub fn with_hash_filter(self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Self {
+        let mut set: HashSet<[u8; 16]> = (*self.hash_filter_set.load_full()).clone();
+        set.extend(hashes);
+        self.hash_filter_set.store(std::sync::Arc::new(set));
+        self
+    }
+
+    /// Hot-swap the Layer 5 filter-only list at runtime, like the ban list.
+    pub fn reload_hash_filter(&self, hashes: impl IntoIterator<Item = [u8; 16]>) {
+        let set: HashSet<[u8; 16]> = hashes.into_iter().collect();
+        self.hash_filter_set.store(std::sync::Arc::new(set));
+    }
+
+    /// Is this hash on either hash list (and not whitelisted)?
+    ///
+    /// Cheap enough for the serving path: two `ArcSwap` loads and two hash-set
+    /// probes, no filename work at all.
+    ///
+    /// Exists because the hash lists must take effect on SEARCH RESULTS, not
+    /// only on publication. Adding a hash stops the file being re-indexed, but
+    /// copies already in the index keep being served until something evicts
+    /// them — which for a live file means never, since its sources keep
+    /// refreshing it. Before this the only way to make a takedown or a decoy
+    /// actually disappear was to restart the server and lose every connected
+    /// user.
+    ///
+    /// Applied at the point of serving rather than by sweeping the index: it is
+    /// instant, it costs nothing when the lists are empty, and it is reversible
+    /// — removing a hash from the list brings the file back without anyone
+    /// having to re-publish it.
+    pub fn hash_is_listed(&self, file_hash: &[u8; 16]) -> bool {
+        if self.hash_whitelist.load().contains(file_hash) {
+            return false;
+        }
+        self.hash_blocklist.load().contains(file_hash)
+            || self.hash_filter_set.load().contains(file_hash)
+    }
+
+    /// Number of filter-only hashes loaded (for startup logging / web panel).
+    pub fn hash_filter_size(&self) -> usize {
+        self.hash_filter_set.load().len()
+    }
+
+    pub fn with_hash_whitelist(self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Self {
+        let mut set: HashSet<[u8; 16]> = (*self.hash_whitelist.load_full()).clone();
+        set.extend(hashes);
+        self.hash_whitelist.store(std::sync::Arc::new(set));
         self
     }
 
@@ -173,7 +277,19 @@ impl ContentFilter {
     /// Number of hashes in blocklist (for startup logging).
     /// Whitelisted hashes (verified false positives, Layer 3 override).
     pub fn whitelist_size(&self) -> usize {
-        self.hash_whitelist.len()
+        self.hash_whitelist.load().len()
+    }
+
+    /// Hot-swap the false-positive whitelist at runtime.
+    ///
+    /// Unlike the block/poison lists, an EMPTY reload is meaningful here and is
+    /// applied as-is: removing every entry is how an operator retracts an
+    /// override they no longer believe in. The caller is responsible for not
+    /// calling this with an empty set because a file failed to read — see the
+    /// watcher in main.rs, which keeps the current list on any read error.
+    pub fn reload_hash_whitelist(&self, hashes: impl IntoIterator<Item = [u8; 16]>) {
+        let set: HashSet<[u8; 16]> = hashes.into_iter().collect();
+        self.hash_whitelist.store(std::sync::Arc::new(set));
     }
 
     pub fn blocklist_size(&self) -> usize {
@@ -187,11 +303,37 @@ impl ContentFilter {
 
     /// Check a candidate file. Layer order is fastest-rejection-first.
     pub fn check(&self, file_hash: &[u8; 16], filename: &str) -> FilterResult {
-        // Hash check first — O(1), fastest rejection. Whitelist takes priority.
-        if !self.hash_whitelist.contains(file_hash)
-            && self.hash_blocklist.load().contains(file_hash)
-        {
+        // Whitelist first, and it now overrides EVERY layer rather than only the
+        // hash lists.
+        //
+        // The old rule bypassed hash matches only, on the theory that a
+        // false-positive override should not switch off content matching. Three
+        // days of live review showed that gets it backwards: the entries that
+        // most need overriding are caught by TERM, not by hash — song titles
+        // that happen to be a jargon word ("Motorhead - Jailbait", an Ennio
+        // Morricone track), and Song-dynasty paediatric treatises whose title
+        // contains a CJK marker. Whitelisting those changed nothing, because
+        // L1/L4 re-blocked them on the very next publish, which made the list
+        // useless for the one class of mistake that actually occurs.
+        //
+        // An operator putting a hash here has looked at the file and ruled it
+        // legal. That ruling now stands against every layer.
+        if self.hash_whitelist.load().contains(file_hash) {
+            return FilterResult::Allow;
+        }
+
+        // Hash checks — O(1), fastest rejection.
+        if self.hash_blocklist.load().contains(file_hash) {
             return FilterResult::Block(Layer::L3HashBlock, "hash".to_string());
+        }
+
+        // Layer 5 — poisoned index. Deliberately BEFORE the term layers: the
+        // operator has already ruled on this hash, and a decoy usually carries a
+        // spam name stuffed with porn tags that L1/L4 would fire on. Letting a
+        // term layer win would re-attach the CSAM accusation the poison list
+        // exists to detach, and would count an ordinary downloader toward a ban.
+        if self.hash_filter_set.load().contains(file_hash) {
+            return FilterResult::Block(Layer::L5Poison, "poison".to_string());
         }
 
         // Normalize for term matching.
@@ -203,7 +345,7 @@ impl ContentFilter {
         // lifetime rules changed between editions. An explicit binding is correct
         // under every edition.
         let jargon_terms = self.jargon_terms.load();
-        if let Some(term) = jargon::matches_layer1(&lowered, &jargon_terms) {
+        if let Some(term) = jargon::matches_terms(&lowered, &jargon_terms) {
             return FilterResult::Block(Layer::L1Jargon, term.to_string());
         }
 
@@ -213,9 +355,15 @@ impl ContentFilter {
         }
 
         // Layer 4 (operator extras) — snapshot the hot-swappable list.
+        //
+        // Uses the SAME matcher as Layer 1. It used to call `str::contains`
+        // directly, so none of the length-based boundary rules applied to it:
+        // that is how a six-character L4 term came to fire inside "fibrosis" and
+        // block medical papers. Sharing the matcher is what keeps the two lists
+        // from drifting apart again.
         let extra = self.extra_terms.load();
-        if let Some(term) = extra.iter().find(|t| lowered.contains(t.as_str())) {
-            return FilterResult::Block(Layer::L4Extra, term.clone());
+        if let Some(term) = jargon::matches_terms(&lowered, &extra) {
+            return FilterResult::Block(Layer::L4Extra, term.to_string());
         }
 
         FilterResult::Allow
@@ -347,6 +495,110 @@ mod tests {
     }
 
     #[test]
+    fn poison_list_blocks_without_accusing_the_publisher() {
+        let junk: [u8; 16] = [0xAB; 16];
+        let f = ContentFilter::new().with_hash_filter([junk]);
+        match f.check(&junk, "Genesis - Complete Discography.rar") {
+            FilterResult::Block(layer, reason) => {
+                assert_eq!(layer, Layer::L5Poison);
+                assert_eq!(reason, "poison");
+                // The whole point of the layer.
+                assert!(!layer.counts_against_publisher());
+            }
+            FilterResult::Allow => panic!("poisoned hash must be blocked"),
+        }
+        // Every other layer DOES count.
+        assert!(Layer::L1Jargon.counts_against_publisher());
+        assert!(Layer::L2AgePattern.counts_against_publisher());
+        assert!(Layer::L3HashBlock.counts_against_publisher());
+        assert!(Layer::L4Extra.counts_against_publisher());
+    }
+
+    #[test]
+    fn poison_wins_over_the_term_layers() {
+        // A decoy normally carries a spam name full of porn tags. If a term layer
+        // got there first, the block would be reported as CSAM and would count
+        // toward the publisher ban — exactly what the poison list exists to stop.
+        let junk: [u8; 16] = [0xCD; 16];
+        let f = ContentFilter::new()
+            .with_hash_filter([junk])
+            .with_extra_terms(["preteen".to_string()]);
+        assert!(matches!(
+            f.check(&junk, "Pulp Fiction preteen xxx sex.avi"),
+            FilterResult::Block(Layer::L5Poison, _)
+        ));
+        // Same name, a hash that is NOT poisoned → the term layer still fires.
+        assert!(matches!(
+            f.check(&zh(), "Pulp Fiction preteen xxx sex.avi"),
+            FilterResult::Block(Layer::L4Extra, _)
+        ));
+    }
+
+    #[test]
+    fn csam_blocklist_outranks_poison() {
+        // If a hash is on both lists the serious classification must win, so the
+        // publisher is still counted.
+        let h: [u8; 16] = [0xEF; 16];
+        let f = ContentFilter::new()
+            .with_hash_blocklist([h])
+            .with_hash_filter([h]);
+        assert!(matches!(
+            f.check(&h, "whatever.mp4"),
+            FilterResult::Block(Layer::L3HashBlock, _)
+        ));
+    }
+
+    #[test]
+    fn whitelist_overrides_term_and_age_layers_too() {
+        // The live case: three days of review showed the overrides that matter
+        // are term matches, and bypassing only the hash lists left them blocked.
+        let h: [u8; 16] = [0x33; 16];
+        let f = ContentFilter::new()
+            .with_extra_terms(["jailbait".to_string()])
+            .with_hash_whitelist([h]);
+        assert!(matches!(
+            f.check(&h, "Motorhead - Jailbait.mp3"),
+            FilterResult::Allow
+        ));
+        // Age patterns too — an operator's ruling stands against every layer.
+        assert!(matches!(
+            f.check(&h, "some 12yo sex video.avi"),
+            FilterResult::Allow
+        ));
+        // A DIFFERENT hash with the same name is still blocked: the override is
+        // per-file, not per-name.
+        assert!(f.check(&zh(), "Motorhead - Jailbait.mp3").is_blocked());
+    }
+
+    #[test]
+    fn whitelist_overrides_the_poison_list_too() {
+        let h: [u8; 16] = [0x11; 16];
+        let f = ContentFilter::new()
+            .with_hash_filter([h])
+            .with_hash_whitelist([h]);
+        assert!(matches!(f.check(&h, "clean name.mkv"), FilterResult::Allow));
+    }
+
+    #[test]
+    fn layer4_term_does_not_fire_inside_an_english_word() {
+        // Live regression: a six-character L4 term is a suffix of "fibrosis", and
+        // L4 used to bypass the length rules entirely by calling str::contains.
+        let f = ContentFilter::new().with_extra_terms(["brosis".to_string()]);
+        assert!(matches!(
+            f.check(&zh(), "Cystic fibrosis transmembrane conductance regulator.pdf"),
+            FilterResult::Allow
+        ));
+        assert!(matches!(
+            f.check(&zh(), "pulmonary fibrosis review 2024.pdf"),
+            FilterResult::Allow
+        ));
+        // ...and still catches the real thing, including underscore-joined forms.
+        assert!(f.check(&zh(), "italian_brosis_2.avi").is_blocked());
+        assert!(f.check(&zh(), "brosis_001.mp4").is_blocked());
+        assert!(f.check(&zh(), "2022 Periscope Brosis bj.mp4").is_blocked());
+    }
+
+    #[test]
     fn hash_blocklist_blocks() {
         let bad: [u8; 16] = [0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let f = ContentFilter::new().with_hash_blocklist([bad]);
@@ -362,6 +614,26 @@ mod tests {
     }
 
     #[test]
+    fn whitelist_hot_reload_applies_and_retracts() {
+        let bad: [u8; 16] = [0x77; 16];
+        let f = ContentFilter::new().with_hash_blocklist([bad]);
+        assert!(f.check(&bad, "anything.mp4").is_blocked());
+
+        // Adding an override takes effect without a restart.
+        f.reload_hash_whitelist([bad]);
+        assert_eq!(f.whitelist_size(), 1);
+        assert!(matches!(f.check(&bad, "anything.mp4"), FilterResult::Allow));
+
+        // Retracting it must also take effect. An EMPTY reload is meaningful and
+        // is applied as written — it is how an operator withdraws an override
+        // they no longer believe in. (A failed file READ is a different case and
+        // keeps the current list; that is the watcher's job, not this method's.)
+        f.reload_hash_whitelist([]);
+        assert_eq!(f.whitelist_size(), 0);
+        assert!(f.check(&bad, "anything.mp4").is_blocked());
+    }
+
+    #[test]
     fn hash_whitelist_overrides_blocklist() {
         let bad: [u8; 16] = [0x42; 16];
         let f = ContentFilter::new()
@@ -374,15 +646,26 @@ mod tests {
     }
 
     #[test]
-    fn whitelist_does_not_override_term_layers() {
-        // Hash whitelist gives bypass for hash check ONLY; jargon still wins.
+    fn whitelist_overrides_the_jargon_layer_too() {
+        // INVERTED in 0.9.71. This used to assert that the whitelist bypassed
+        // the hash check ONLY, and that jargon still won. Live review killed
+        // that rule: the overrides that matter are term matches, so a
+        // whitelisted file was re-blocked on its next publish and the list did
+        // nothing for the one class of mistake that actually happens.
         let h: [u8; 16] = [0x42; 16];
-        // L1 list is now loaded; install a synthetic term to exercise the layer.
         let f = ContentFilter::new()
             .with_hash_whitelist([h])
             .with_jargon_terms(["longmarker".to_string()]);
-        let result = f.check(&h, "something longmarker anything.mp4");
-        assert!(matches!(result, FilterResult::Block(Layer::L1Jargon, _)));
+        assert!(matches!(
+            f.check(&h, "something longmarker anything.mp4"),
+            FilterResult::Allow
+        ));
+        // The term itself is unaffected — any OTHER file with that name is still
+        // blocked. The override is per-hash, not per-name.
+        assert!(matches!(
+            f.check(&zh(), "something longmarker anything.mp4"),
+            FilterResult::Block(Layer::L1Jargon, _)
+        ));
     }
 
     #[test]

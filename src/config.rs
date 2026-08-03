@@ -153,7 +153,7 @@ pub struct ContentFilterConfig {
     /// Optional. List of paths to hash-blocklist files. Empty list is
     /// permitted only when `server.public = false`. Enforced in `validate()`.
     #[serde(default)]
-    pub hash_blocklists: Vec<String>,
+    pub hash_banlist: Vec<String>,
 
     /// Optional path to operator-supplied additional term file.
     #[serde(default)]
@@ -169,6 +169,27 @@ pub struct ContentFilterConfig {
     #[serde(default)]
     pub whitelist_hashes_file: Option<String>,
 
+    /// Optional. Paths to FILTER-ONLY hash lists (Layer 5): files that must not
+    /// be indexed, but whose publisher is not accused of anything.
+    ///
+    /// A hit here is blocked like any other, yet it does not raise
+    /// `csam_attempts` and does not count toward
+    /// `publisher_attempt_disconnect_threshold`.
+    ///
+    /// Two things belong here:
+    ///   * decoys — one hash advertised under a dozen unrelated names. Offering
+    ///     one makes a client a victim of index poisoning, not a publisher of
+    ///     illegal material;
+    ///   * takedown requests — a rightsholder complaint means the file should go
+    ///     out of the index, and says nothing about the user who happens to
+    ///     share it.
+    ///
+    /// Keeping these out of `hash_banlist` is what lets that list keep meaning
+    /// one specific thing: every entry there is something its publisher should
+    /// be held responsible for.
+    #[serde(default)]
+    pub hash_filter: Vec<String>,
+
     /// Maximum number of DISTINCT blocked CSAM files TOLERATED from one
     /// publisher (by user_hash) before banning — headroom for rare false
     /// positives. Files at or below this count are still filtered; the ban fires
@@ -179,8 +200,35 @@ pub struct ContentFilterConfig {
     /// How long (seconds) a banned publisher's user_hash stays blocked at login.
     /// Ban is by user_hash (stable across dynamic IPs), so a long window (e.g.
     /// 30 days = 2592000) is appropriate.
+    ///
+    /// This is the PUNISHMENT length. How far back distinct files are counted
+    /// toward the threshold is a separate question — see
+    /// `publisher_count_window_seconds`.
     #[serde(default = "default_csam_blacklist")]
     pub publisher_blacklist_seconds: u64,
+
+    /// Optional. How far back (seconds) distinct blocked files are counted
+    /// toward `publisher_attempt_disconnect_threshold`. Defaults to
+    /// `publisher_blacklist_seconds` when absent, so an existing config keeps
+    /// behaving exactly as before.
+    ///
+    /// These were one value, and that conflated two settings that want opposite
+    /// answers. The ban should be long — a confirmed publisher has no business
+    /// returning tomorrow. The counting window should be SHORT, because it is
+    /// what decides who gets banned in the first place.
+    ///
+    /// At 30 days for both, the rule reads "N distinct blocked files in a month".
+    /// Collectors of tag-stuffed Asian adult video accumulate those slowly and
+    /// innocently — one poisoning source can put dozens of such names in a single
+    /// library — so a low threshold banned real users for a slow drip. At 24 h
+    /// the same threshold means "N in a day", which a collector cannot reach by
+    /// accident and a publisher clears in one OFFERFILES packet.
+    ///
+    /// Note this does NOT shorten how long the per-user records are kept: they
+    /// live for `publisher_blacklist_seconds` so that `/api/review` and
+    /// `/api/publishers` keep their history. Only the COUNT is windowed.
+    #[serde(default)]
+    pub publisher_count_window_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -254,6 +302,22 @@ fn default_log_level() -> String {
     "info".into()
 }
 
+impl ContentFilterConfig {
+    /// How far back distinct blocked files count toward the ban threshold.
+    /// Falls back to the ban length when unset, preserving the old behaviour.
+    pub fn count_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.publisher_count_window_seconds
+                .unwrap_or(self.publisher_blacklist_seconds),
+        )
+    }
+
+    /// How long a ban lasts, and how long per-user records are retained.
+    pub fn ban_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.publisher_blacklist_seconds)
+    }
+}
+
 impl Config {
     pub fn load_from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -286,7 +350,9 @@ hard_limit_files = 5000
 ping_delay_seconds = 600
 
 [content_filter]
-hash_blocklists = []
+hash_banlist = []
+hash_filter = []
+publisher_count_window_seconds = 86400
 "#;
         toml::from_str(toml_str).expect("minimal_test_config TOML must parse")
     }
@@ -294,9 +360,9 @@ hash_blocklists = []
     /// Enforce the SPEC.md §1.2 rule: refuse public deployment without
     /// a hash blocklist configured.
     pub fn validate(&self) -> Result<()> {
-        if self.server.public && self.content_filter.hash_blocklists.is_empty() {
+        if self.server.public && self.content_filter.hash_banlist.is_empty() {
             bail!(
-                "server.public = true requires content_filter.hash_blocklists \
+                "server.public = true requires content_filter.hash_banlist \
                  to be configured (see SPEC.md §1.2 / §7.6.3). Refusing to start."
             );
         }
@@ -341,7 +407,9 @@ hard_limit_files = 1
 ping_delay_seconds = 1
 
 [content_filter]
-hash_blocklists = []
+hash_banlist = []
+hash_filter = []
+publisher_count_window_seconds = 86400
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("stale key must not break parsing");
         assert_eq!(cfg.network.udp_port(), 6266, "must derive, not use the stale 9999");

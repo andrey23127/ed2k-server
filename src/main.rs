@@ -62,6 +62,102 @@ fn main() -> Result<()> {
     rt.block_on(async_main(args, cfg_preview))
 }
 
+/// The periodic index sweep: evict files that lost their last source, drain the
+/// keyword index's hot tier into the compressed cold tier, and free interned
+/// names nobody references any more.
+///
+/// Entirely synchronous and unbounded in the index size, which is why the caller
+/// runs it via `spawn_blocking` rather than on a runtime worker.
+///
+/// Each phase is timed separately. The three have very different shapes — the
+/// scan is linear in live files, compact() is linear in keywords touched since
+/// the last cycle, the name sweep is linear in interned names — so a single
+/// total would not say which one to worry about as the index grows.
+fn orphan_sweep(state: &ed2k_server::state::ServerState) {
+    use ed2k_server::state::file_id::FileId;
+
+    let t0 = std::time::Instant::now();
+    let mut removed = 0usize;
+    // Collect orphan FileIds (no sources) via the slab. We collect first, then
+    // evict, so we never hold a shard read lock while taking the write locks
+    // tombstone/remove_file need.
+    // NOTE: Arc<str> (a DST behind the pointer) must be the LAST tuple element,
+    // so the layout is (id, hash, name).
+    let mut to_evict: Vec<(FileId, [u8; 16], std::sync::Arc<str>)> = Vec::new();
+    state.file_slab.for_each_live(|id, r| {
+        if r.sources.is_empty() {
+            to_evict.push((id, r.hash, r.name.clone()));
+        }
+    });
+    let scanned_ms = t0.elapsed().as_millis();
+
+    let t1 = std::time::Instant::now();
+    let evicted_ids: Vec<FileId> = to_evict.iter().map(|(id, _, _)| *id).collect();
+    for (fid, _h, name) in to_evict {
+        // Remove the keyword postings, then tombstone the slab slot (id retired,
+        // never reused).
+        state.keyword_index.remove_file(fid, &name);
+        if state.file_slab.tombstone(fid) {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        let remaining = state.file_slab.live_count();
+        // CRITICAL: purge the evicted hashes from the `user_files` reverse index.
+        // Orphan-cleanup bypasses remove_sources_of (the only other place that
+        // touches user_files), so without this the reverse index retains dead
+        // FileHash entries forever — the real RSS leak.
+        state.purge_ids_from_user_files(&evicted_ids);
+        // Note: slab slots are tombstoned (not freed) by design — ids must never
+        // be reused. Heavy fields (name/sources) are already cleared on
+        // tombstone, so the per-record residue is just the small packed header.
+        state.user_files.shrink_to_fit();
+        info!(removed, remaining, evict_ms = t1.elapsed().as_millis(),
+              "orphan file cleanup: evicted files with no sources, purged reverse index");
+    }
+
+    // Drain the keyword-index hot tier into the compressed cold store.
+    //
+    // This MUST run every cycle, not only when files were evicted. add_file only
+    // ever writes to the hot Vec tier; compact() is the ONLY thing that merges
+    // hot into the delta-varint cold blobs. On a healthy server files are mostly
+    // ADDED, not evicted, so orphan removals are rare — gating compact on
+    // `removed > 0` meant hot never drained and cold stayed empty (observed live:
+    // cold_keys=0, hot_keys=513k after an hour), losing the entire varint memory
+    // win and bloating the uncompressed hot tier.
+    let t2 = std::time::Instant::now();
+    let dropped_kw = state.keyword_index.compact();
+    let compact_ms = t2.elapsed().as_millis();
+
+    // Free interned names that no live record references any more.
+    //
+    // This MUST run every cycle, not only when files were evicted. Names are
+    // interned on paths that may not end in a stored record (a re-published hash
+    // whose name changed drops the old Arc; a file rejected by the content filter
+    // after interning; a tombstoned record clearing its name), so unreferenced
+    // names accumulate even in cycles with zero evictions. Keeping the sweep
+    // under `if removed > 0` let that garbage pile up between evictions —
+    // observed live as 449k interned names against 327k live files (~37% dead),
+    // growing with uptime and inflating bytes-per-file.
+    let t3 = std::time::Instant::now();
+    let dropped_names = state.name_interner.sweep_unused();
+    let sweep_ms = t3.elapsed().as_millis();
+
+    // One line per cycle, always — the timings are the point. This is how an
+    // operator sees the sweep growing with the index before it becomes a stall,
+    // and which of the three phases is responsible.
+    info!(
+        scanned_ms,
+        compact_ms,
+        sweep_ms,
+        total_ms = t0.elapsed().as_millis(),
+        dropped_kw,
+        dropped_names,
+        interned = state.name_interner.len(),
+        "index sweep complete"
+    );
+}
+
 async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // Set up tracing per config.log.level (env RUST_LOG overrides if set).
     let filter = EnvFilter::try_from_default_env()
@@ -130,7 +226,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     // Load hash blocklists
     let mut total_blocked = 0;
-    for path in &cfg.content_filter.hash_blocklists {
+    for path in &cfg.content_filter.hash_banlist {
         let path = PathBuf::from(path);
         match ContentFilter::load_hash_file(&path) {
             Ok(hashes) => {
@@ -144,6 +240,22 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 filter = filter.with_hash_blocklist(hashes);
             }
             Err(e) => error!(path = %path.display(), error = %e, "blocklist load failed"),
+        }
+    }
+
+    // Load the poisoned-index lists (Layer 5). Kept apart from the blocklist on
+    // purpose — see filter::Layer::L5Poison.
+    let mut total_hash_filter = 0;
+    for path in &cfg.content_filter.hash_filter {
+        let path = PathBuf::from(path);
+        match ContentFilter::load_hash_file(&path) {
+            Ok(hashes) => {
+                let n = hashes.len();
+                total_hash_filter += n;
+                info!(count = n, path = %path.display(), "filter-only hash list loaded");
+                filter = filter.with_hash_filter(hashes);
+            }
+            Err(e) => error!(path = %path.display(), error = %e, "hash_filter load failed"),
         }
     }
 
@@ -164,6 +276,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     info!(
         public = cfg.server.public,
         blocklist_size = total_blocked,
+        hash_filter_size = total_hash_filter,
         extra_terms = filter.extra_terms_count(),
         jargon_terms = filter.jargon_terms_count(),
         "content filter configured"
@@ -318,11 +431,48 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             const CLIENT_BLOCK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
             const VERIFY_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
             const VERIFIED_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+            // Peer state keyed by arbitrary remote IPv4s. Under internet-wide UDP
+            // churn the key space is unbounded, so anything keyed this way needs
+            // an expiry or it grows for the life of the process. A day is
+            // generous — the value is re-established by the next OBF ping to that
+            // peer, so expiring one costs a single extra handshake.
+            const PEER_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+            // Alias-table entries. The table is capped at ALIAS_MAX_FILES, but a
+            // cap without an expiry means it freezes once full: every slot held
+            // forever and no newly-seen file admitted. Ageing keeps the cap
+            // meaning "the most recent N candidates" rather than "the first N
+            // ever seen". Longer than the review window so an operator still
+            // sees what /api/review reported.
+            const ALIAS_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.tick().await;
             loop {
                 tick.tick().await;
                 state_clean.recent_client_ips.retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
+
+                // Maps that had no eviction at all until 0.9.71.
+                //
+                // `csam_blocked_hashes` is the dedup set behind block_stats: one
+                // entry per distinct blocked file ever seen (20k in the first 13
+                // hours of a live deployment), and nothing removed from it. It
+                // is aged with the publisher records so the two agree on what
+                // "recent" means — re-counting a file after that is correct, not
+                // a leak, since the stats are about activity in the window.
+                let pub_ttl = std::time::Duration::from_secs(
+                    state_clean.live_cfg.load().content_filter.publisher_blacklist_seconds,
+                );
+                state_clean
+                    .csam_blocked_hashes
+                    .retain(|_, first_seen| first_seen.elapsed() < pub_ttl);
+                state_clean
+                    .file_aliases
+                    .retain(|_, a| a.last_seen.elapsed() < ALIAS_TTL);
+                // NB: observed_udp_ports already has its own, shorter TTL a few
+                // lines below (30 min — a UDP-silent client's port is re-observed
+                // on its next packet). Not duplicated here.
+                state_clean
+                    .our_sent_random_parts
+                    .retain(|_, (_, sent)| sent.elapsed() < PEER_STATE_TTL);
                 state_clean.verified_servers.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
                 // Same TTL for the ip:port-keyed set that gates hand-out, so a server
                 // that stops answering pings stops being advertised (and a phantom
@@ -360,9 +510,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     .retain(|_, since| since.elapsed() < ServerState::BOT_BAN_TTL);
 
                 // Q1: sweep expired CSAM-publisher bans and stale per-user
-                // distinct-file sets. Ban TTL = configured publisher_blacklist_
-                // seconds; the per-user sets expire after the same window (a user
-                // idle that long starts fresh). Without this both maps only grow.
+                // distinct-file sets. Both use publisher_blacklist_seconds — for
+                // the bans that is the ban length, for the per-user sets it is the
+                // RETENTION window. Retention is deliberately not shortened to
+                // publisher_count_window_seconds: the counting window decides who
+                // gets banned, but /api/review and /api/publishers read these same
+                // records and would lose their history. Without this both maps only
+                // grow.
                 {
                     let pub_ttl = std::time::Duration::from_secs(
                         state_clean.live_cfg.load().content_filter.publisher_blacklist_seconds);
@@ -464,83 +618,33 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
             loop {
                 tick.tick().await;
-                let mut removed = 0usize;
-                // Collect orphan FileIds (no sources) via the slab. We collect
-                // first, then evict, so we never hold a shard read lock while
-                // taking the write locks tombstone/remove_file need.
-                // NOTE: Arc<str> (a DST behind the pointer) must be the LAST
-                // tuple element, so the layout is (id, hash, name).
-                let mut to_evict: Vec<(ed2k_server::state::file_id::FileId, [u8; 16], std::sync::Arc<str>)> = Vec::new();
-                state_orphan.file_slab.for_each_live(|id, r| {
-                    if r.sources.is_empty() {
-                        to_evict.push((id, r.hash, r.name.clone()));
-                    }
-                });
-                let evicted_ids: Vec<ed2k_server::state::file_id::FileId> =
-                    to_evict.iter().map(|(id, _, _)| *id).collect();
-                for (fid, _h, name) in to_evict {
-                    // Remove the keyword postings, then tombstone the slab slot
-                    // (id retired, never reused).
-                    state_orphan.keyword_index.remove_file(fid, &name);
-                    if state_orphan.file_slab.tombstone(fid) {
-                        removed += 1;
-                    }
-                }
-                if removed > 0 {
-                    let remaining = state_orphan.file_slab.live_count();
-                    // CRITICAL: purge the evicted hashes from the `user_files`
-                    // reverse index. Orphan-cleanup bypasses remove_sources_of
-                    // (the only other place that touches user_files), so without
-                    // this the reverse index retains dead FileHash entries forever
-                    // — the real RSS leak.
-                    state_orphan.purge_ids_from_user_files(&evicted_ids);
-                    // Note: slab slots are tombstoned (not freed) by design —
-                    // ids must never be reused. Heavy fields (name/sources) are
-                    // already cleared on tombstone, so the per-record residue is
-                    // just the small packed header.
-                    state_orphan.user_files.shrink_to_fit();
-                    info!(removed, remaining,
-                          "orphan file cleanup: evicted files with no sources, purged reverse index");
-                }
-
-                // Drain the keyword-index hot tier into the compressed cold store.
+                // Run the sweep on the BLOCKING pool, not on the runtime.
                 //
-                // This MUST run every cycle, not only when files were evicted.
-                // add_file only ever writes to the hot Vec tier; compact() is the
-                // ONLY thing that merges hot into the delta-varint cold blobs. On a
-                // healthy server files are mostly ADDED, not evicted, so orphan
-                // removals are rare — gating compact on `removed > 0` meant hot
-                // never drained and cold stayed empty (observed live: cold_keys=0,
-                // hot_keys=513k after an hour), losing the entire varint memory win
-                // and bloating the uncompressed hot tier. Runs every ~10 min, off
-                // the hot path.
-                let dropped_kw = state_orphan.keyword_index.compact();
-                if dropped_kw > 0 {
-                    info!(dropped_kw, "keyword index: compacted (hot->cold, dropped empty)");
-                }
-
-                // Free interned names that no live record references any more.
+                // Everything `orphan_sweep` does is synchronous and unbounded in
+                // the index size: a full scan of the slab, a keyword removal per
+                // evicted file, then compact() and sweep_unused(). There is no
+                // await inside it, so a task holding a runtime worker would hold
+                // it start to finish.
                 //
-                // This MUST run every cycle, not only when files were evicted.
-                // Names are interned on paths that may not end in a stored record
-                // (a re-published hash whose name changed drops the old Arc; a file
-                // rejected by the content filter after interning; a tombstoned
-                // record clearing its name), so unreferenced names accumulate even
-                // in cycles with zero evictions. Keeping the sweep under
-                // `if removed > 0` let that garbage pile up between evictions —
-                // observed live as 449k interned names against 327k live files
-                // (~37% dead), growing with uptime and inflating bytes-per-file.
+                // That matters more here than it looks. `log.worker_threads`
+                // defaults to 1, which builds a CURRENT-THREAD runtime — one
+                // worker, no work stealing. A sweep on that worker stops the
+                // whole server: no accepts, no UDP reads, no keepalives, no
+                // timers, once every ten minutes. spawn_blocking hands the work
+                // to a separate pool that exists on the current-thread runtime
+                // too, leaving the worker free to keep serving clients.
                 //
-                // Cost is a scan of the interner every 10 min, off the hot path.
-                let dropped_names = state_orphan.name_interner.sweep_unused();
-                if dropped_names > 0 {
-                    info!(dropped_names,
-                          interned = state_orphan.name_interner.len(),
-                          "name interner: freed unreferenced names");
+                // What this does NOT fix: the sweep still takes a shard read
+                // lock while iterating, so publishes into that shard still wait.
+                // That contention is inherent; the point is that it no longer
+                // compounds with starving the runtime itself.
+                let st = Arc::clone(&state_orphan);
+                if let Err(e) = tokio::task::spawn_blocking(move || orphan_sweep(&st)).await {
+                    warn!(error = %e, "orphan cleanup sweep failed to join");
                 }
             }
         });
-        info!("orphan-file cleanup started (10min interval after 30min grace)");
+        info!("orphan-file cleanup started (10min interval after 30min grace, off-runtime)");
     }
 
     // Hot-reload of the Layer 4 CSAM extra-terms file. The operator edits the
@@ -637,7 +741,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     }
 
     // Hot-reload of the Layer 3 hash blocklist(s). The operator edits any file
-    // in `hash_blocklists` (e.g. /etc/ed2k-server/csam_hashes.txt) and the new
+    // in `hash_banlist` (e.g. /etc/ed2k-server/hash_banlist.txt) and the new
     // hashes take effect within the poll interval — NO restart (v0.9.46+).
     // We watch the max mtime across all configured files; on change we re-read
     // ALL of them, union, and atomically swap via ArcSwap. (Whitelist is still
@@ -648,7 +752,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             .live_cfg
             .load()
             .content_filter
-            .hash_blocklists
+            .hash_banlist
             .iter()
             .map(std::path::PathBuf::from)
             .collect();
@@ -693,6 +797,115 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 }
             });
             info!("L3 hash-blocklist hot-reload watcher started (30s mtime poll)");
+        }
+    }
+
+    // Same mtime watcher for the Layer 5 poisoned-index lists. A separate task
+    // rather than a second path set inside the block above: the two lists are
+    // curated on different rhythms (the poison list grows whenever a decoy swarm
+    // is spotted), and one file's mtime must not force a re-read of the other —
+    // hash_banlist.txt is the far larger file.
+    {
+        let state_pz = Arc::clone(&state);
+        let paths: Vec<std::path::PathBuf> = state_pz
+            .live_cfg
+            .load()
+            .content_filter
+            .hash_filter
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect();
+        if !paths.is_empty() {
+            tokio::spawn(async move {
+                let max_mtime = |ps: &[std::path::PathBuf]| -> Option<std::time::SystemTime> {
+                    ps.iter()
+                        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+                        .max()
+                };
+                let mut last_mtime = max_mtime(&paths);
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let mtime = match max_mtime(&paths) {
+                        Some(t) => t,
+                        None => continue, // all files unreadable right now; retry
+                    };
+                    if Some(mtime) != last_mtime {
+                        let mut all: Vec<[u8; 16]> = Vec::new();
+                        let mut ok = true;
+                        for p in &paths {
+                            match ed2k_server::filter::ContentFilter::load_hash_file(p) {
+                                Ok(h) => all.extend(h),
+                                Err(e) => {
+                                    warn!(path = %p.display(), error = %e,
+                                        "L5 hash_filter reload: file read failed; keeping current list");
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok {
+                            let n = all.len();
+                            state_pz.filter.reload_hash_filter(all);
+                            last_mtime = Some(mtime);
+                            info!(count = n, "L5 hash_filter list hot-reloaded");
+                        }
+                    }
+                }
+            });
+            info!("L5 hash_filter hot-reload watcher started (30s mtime poll)");
+        }
+    }
+
+    // Same mtime watcher for the false-positive whitelist.
+    //
+    // Its own task rather than a branch in the blocklist watcher: the whitelist
+    // is a single optional file on a different edit rhythm, and it is the list an
+    // operator touches when something legal is being blocked right now — it must
+    // not wait on the mtime of a file with hundreds of thousands of lines.
+    {
+        let state_wl = Arc::clone(&state);
+        let path = state_wl
+            .live_cfg
+            .load()
+            .content_filter
+            .whitelist_hashes_file
+            .as_ref()
+            .map(std::path::PathBuf::from);
+        if let Some(path) = path {
+            tokio::spawn(async move {
+                let mtime = |p: &std::path::Path| {
+                    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+                };
+                let mut last_mtime = mtime(&path);
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let now = match mtime(&path) {
+                        Some(t) => t,
+                        None => continue, // unreadable right now; retry next tick
+                    };
+                    if Some(now) != last_mtime {
+                        match ed2k_server::filter::ContentFilter::load_hash_file(&path) {
+                            Ok(h) => {
+                                let n = h.len();
+                                // An empty file is applied as written: clearing the
+                                // list is how an override gets retracted. A failed
+                                // READ is different and keeps the current list —
+                                // hence the match rather than unwrap_or_default.
+                                state_wl.filter.reload_hash_whitelist(h);
+                                last_mtime = Some(now);
+                                info!(count = n, "hash whitelist hot-reloaded");
+                            }
+                            Err(e) => warn!(path = %path.display(), error = %e,
+                                "whitelist reload: file read failed; keeping current list"),
+                        }
+                    }
+                }
+            });
+            info!("hash-whitelist hot-reload watcher started (30s mtime poll)");
         }
     }
 
@@ -806,7 +1019,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 {
                     let mut all: Vec<[u8; 16]> = Vec::new();
                     let mut ok = true;
-                    for path in &cfg_reload.content_filter.hash_blocklists {
+                    for path in &cfg_reload.content_filter.hash_banlist {
                         match ed2k_server::filter::ContentFilter::load_hash_file(
                             std::path::Path::new(path),
                         ) {
@@ -821,6 +1034,28 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         let n = all.len();
                         state_reload.filter.reload_hash_blocklist(all);
                         info!(count = n, "hash blocklist hot-reloaded (live)");
+                    }
+                }
+
+                // Same for the Layer 5 poisoned-index lists.
+                {
+                    let mut all: Vec<[u8; 16]> = Vec::new();
+                    let mut ok = true;
+                    for path in &cfg_reload.content_filter.hash_filter {
+                        match ed2k_server::filter::ContentFilter::load_hash_file(
+                            std::path::Path::new(path),
+                        ) {
+                            Ok(h) => all.extend(h),
+                            Err(e) => {
+                                warn!(path, error = %e, "failed to reload poison hash list");
+                                ok = false;
+                            }
+                        }
+                    }
+                    if ok {
+                        let n = all.len();
+                        state_reload.filter.reload_hash_filter(all);
+                        info!(count = n, "hash_filter list hot-reloaded (live)");
                     }
                 }
 
@@ -855,10 +1090,24 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     }
                 }
 
-                // L3 blocklist + L4 extra terms are now applied live (ArcSwap).
-                // Only the hash WHITELIST still loads at startup (rare FP-override
-                // changes), so changing the whitelist requires a restart.
-                info!("content filter reload: L3 blocklist + L4 terms applied live. Whitelist requires restart.");
+                // Hash whitelist (false-positive overrides).
+                if let Some(path) = &cfg_reload.content_filter.whitelist_hashes_file {
+                    match ed2k_server::filter::ContentFilter::load_hash_file(
+                        std::path::Path::new(path),
+                    ) {
+                        Ok(h) => {
+                            let n = h.len();
+                            state_reload.filter.reload_hash_whitelist(h);
+                            info!(count = n, "hash whitelist hot-reloaded (live)");
+                        }
+                        Err(e) => {
+                            warn!(path, error = %e,
+                                "failed to reload hash whitelist; keeping current list")
+                        }
+                    }
+                }
+
+                info!("content filter reload: blocklist, poison list, whitelist and term lists applied live");
 
                 // Hot-reload IP filter (guarding.p2p) — fully supported without restart.
                 if !cfg_reload.storage.ipfilter_path.is_empty() {

@@ -21,7 +21,6 @@ seed_servers = [
 "176.123.5.89:4725",
 "103.97.203.251:42011",
 "147.78.2.254:9197",
-"103.75.116.41:48617",
 "223.165.4.251:42011",
 "91.148.135.254:9197",
 "91.148.135.252:47111",
@@ -34,7 +33,6 @@ seed_servers = [
 "185.186.77.252:47111",
 "145.14.131.254:43333",
 "185.255.123.22:37980",
-"91.208.162.55:4235",
 "31.40.212.254:9197",
 "185.237.185.226:31031",
 "57.131.35.107:4232",
@@ -43,6 +41,7 @@ seed_servers = [
 "193.187.90.12:4661",
 "213.141.198.207:4232",
 "85.17.116.222:6082",
+"212.95.35.240:4232",
 ]
 version_major = 18
 version_minor = 1
@@ -64,14 +63,28 @@ max_string_size = 250
 ping_delay_seconds = 300
 
 [content_filter]
-# Leave empty until you get hash list from Project Arachnid / IWF
-hash_blocklists = ["/etc/ed2k-server/csam_hashes.txt"]
-# Uncomment and add your hash list file once you receive it:
-# hash_blocklists = ["/etc/ed2k-server/csam_hashes.txt"]
+# BAN LIST: blocked AND counted against the publisher. Material whose publisher
+# should answer for it — CSAM and bestiality alike, which is why the file is no
+# longer named after only one of them.
+hash_banlist = ["/etc/ed2k-server/hash_banlist.txt"]
+# FILTER LIST: blocked, publisher NOT accused. Decoys (one hash under a dozen
+# unrelated names) and takedown requests — a rightsholder complaint means the
+# file leaves the index, and says nothing about whoever happens to share it.
+hash_filter = ["/etc/ed2k-server/hash_filter.txt"]
 extra_terms_file = "/etc/ed2k-server/csam_terms_extra.txt"
 jargon_terms_file = "/etc/ed2k-server/csam_jargon.txt"
-publisher_attempt_disconnect_threshold = 3
-publisher_blacklist_seconds = 2592000   # 30 days
+# Verified false positives. Overrides EVERY layer, not just the hash lists — the
+# mistakes that actually happen are term matches (song titles, historical texts).
+whitelist_hashes_file = "/etc/ed2k-server/whitelist_hashes.txt"
+# Distinct blocked files tolerated before a ban. Read together with the counting
+# window below: at 24 h this means "N in a day", which a collector cannot reach
+# by accident and a bulk publisher clears in one OFFERFILES packet.
+publisher_attempt_disconnect_threshold = 150
+publisher_blacklist_seconds = 2592000      # 30 days — how long the BAN lasts
+# How far back distinct blocked files count toward the threshold. Short on
+# purpose: at 30 days the rule read "N files in a month", which banned collectors
+# of tag-stuffed adult video for a slow drip. Omit to fall back to the ban length.
+publisher_count_window_seconds = 86400     # 24 hours
 
 [welcome]
 messages = [

@@ -103,6 +103,90 @@ pub fn resolve_seckey(cfg: &Config) -> [u8; 16] {
     key
 }
 
+/// Strip the leading tag set from an `OP_GLOBSEARCHREQ3` (0x90) payload,
+/// returning the expression tree that follows.
+///
+/// 0x90 is NOT 0x98-with-a-different-number. It prefixes the search tree with a
+/// tag list — a `u32` count followed by that many tags — used to carry search
+/// options the tree cannot express. Feeding the whole payload to the tree parser
+/// makes it read the tag count as the first tree node, which fails or produces
+/// nonsense.
+///
+/// Live capture, 30 minutes on a production server: 357 of these arrived and the
+/// server answered NONE of them. Every 0x90 search was silently lost. A typical
+/// frame:
+///
+/// ```text
+///   e3 90 | 01 00 00 00 | 89 0e 01 01 0a 00 | "dampyur 313"
+///           tag count=1   tag: 0x89 FT_FILETYPE ...   tree
+/// ```
+///
+/// Clients pick 0x90 over 0x98 when the server advertises support for it in its
+/// UDP flags, which this server does — so the more capable the client, the more
+/// likely its searches vanished.
+///
+/// Returns `None` if the tag section is malformed or runs past the end, so a
+/// truncated or hostile frame is dropped rather than parsed as a tree.
+fn strip_searchreq3_tags(payload: &[u8]) -> Option<&[u8]> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    // Sanity bound: this is an options list, not a data structure. Anything past
+    // a handful of tags is a malformed or hostile frame, and the loop below must
+    // not be driven by an attacker-supplied u32.
+    if count > 16 {
+        return None;
+    }
+    let mut rest = &payload[4..];
+    for _ in 0..count {
+        rest = skip_one_tag(rest)?;
+    }
+    Some(rest)
+}
+
+/// Advance past one eD2k tag, returning the remainder.
+///
+/// Only the shapes that appear in a 0x90 option set are handled; anything else
+/// yields `None`, which drops the frame. That is deliberate — guessing at an
+/// unknown tag's length would resynchronise the parser at an arbitrary offset
+/// and turn a malformed frame into a plausible-looking search.
+fn skip_one_tag(buf: &[u8]) -> Option<&[u8]> {
+    let (&type_byte, rest) = buf.split_first()?;
+    // High bit set = "new tag" form: a single-byte name follows instead of a
+    // length-prefixed string.
+    let short_name = type_byte & 0x80 != 0;
+    let ttype = type_byte & 0x7F;
+    let rest = if short_name {
+        rest.get(1..)?
+    } else {
+        if rest.len() < 2 {
+            return None;
+        }
+        let name_len = u16::from_le_bytes([rest[0], rest[1]]) as usize;
+        rest.get(2 + name_len..)?
+    };
+    let value_len = match ttype {
+        0x02 => {
+            // string: u16 length prefix
+            if rest.len() < 2 {
+                return None;
+            }
+            2 + u16::from_le_bytes([rest[0], rest[1]]) as usize
+        }
+        0x03 => 4, // u32
+        0x04 => 4, // float
+        0x08 => 4, // u32 (alt)
+        0x09 => 1, // u8
+        0x0A => 2, // u16
+        0x0B => 8, // u64
+        // 0x11..=0x20: inline short string, length encoded in the type byte.
+        t if (0x11..=0x20).contains(&t) => (t - 0x10) as usize,
+        _ => return None,
+    };
+    rest.get(value_len..)
+}
+
 impl UdpServer {
     pub async fn bind(cfg: Arc<Config>, state: Arc<ServerState>, seckey: [u8; 16]) -> Result<Self> {
         let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.udp_port());
@@ -180,12 +264,31 @@ impl UdpServer {
                 opcode = data[1];
                 payload = &data[2..];
             } else {
-                // Pre-flight: obfuscated packets are AT LEAST 10 bytes (1B random
-                // pad + 2B salt + 4B magic + 1B padlen + 2B inner). Anything
-                // shorter is definitely garbage; skip all crypto. Same for
-                // suspiciously-large junk (>2KB is never an obf s2s packet in
-                // practice — the typical obfuscated 0xA1 reply is ~50-300B).
-                if data.len() < 10 || data.len() > 1500 {
+                // Pre-flight. An obfuscated eD2k datagram is at least 10 bytes
+                // (1B random pad + 2B salt + 4B magic + 1B padlen + 2B inner),
+                // and >1500 is never an obf s2s packet in practice — the typical
+                // obfuscated 0xA1 reply is 50-300B. Skipping the crypto for those
+                // is free.
+                //
+                // BUT the minimum must not apply on the obfping port. What
+                // arrives there is not an obfuscated packet at all: it is a
+                // peer's random_part in cleartext, 4 bytes plus up to 14 of
+                // padding, and the decode-failure branch below is written to
+                // accept exactly 4..=18. A blanket `< 10` cut those frames off
+                // before that branch could ever see them, so the two rules
+                // contradicted each other and the shorter half of every peer's
+                // obf-ping was dropped in silence.
+                //
+                // Live capture, 30 minutes: 9825 datagrams reached the obfping
+                // port and 3780 of them — 38% — were under 10 bytes. Lengths ran
+                // evenly from 4 to 15, which is what random padding looks like,
+                // so this was not a handful of odd peers but a constant loss
+                // across all of them. Of 119 short frames checked, exactly one
+                // got a reply.
+                let local_port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
+                let on_obfping_port = local_port == self.cfg.network.tcp_port.wrapping_add(12);
+                let min_len = if on_obfping_port { 4 } else { 10 };
+                if data.len() < min_len || data.len() > 1500 {
                     continue;
                 }
 
@@ -248,7 +351,7 @@ impl UdpServer {
                 if decoded_opt.is_none() {
                     let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
                     let keys_to_try: [Option<u32>; 3] = [
-                        self.state.our_sent_random_parts.get(&sender_v4).map(|r| *r),
+                        self.state.our_sent_random_parts.get(&sender_v4).map(|r| r.0),
                         self.state.seed_server_keys.get(&sender_v4).map(|r| *r),
                         Some(ip_obf_key),
                     ];
@@ -312,12 +415,9 @@ impl UdpServer {
                         // Heuristic: short packet (4..=18 bytes), not a
                         // plain eD2k frame (we're already in the obfuscated
                         // branch), arriving on our obfpingport (TCP+12).
-                        let local_port = self.socket.local_addr()
-                            .map(|a| a.port())
-                            .unwrap_or(0);
-                        let our_tcp_port = self.cfg.network.tcp_port;
-                        let is_obfping_port = local_port == our_tcp_port.wrapping_add(12);
-                        if is_obfping_port && (4..=18).contains(&data.len()) {
+                        // `on_obfping_port` was computed by the pre-flight above,
+                        // which is also what lets a 4..=9 byte frame reach here.
+                        if on_obfping_port && (4..=18).contains(&data.len()) {
                             // Extract peer's random_part (first 4 bytes, LE).
                             let random_part = u32::from_le_bytes([
                                 data[0], data[1], data[2], data[3],
@@ -515,7 +615,17 @@ impl UdpServer {
             0x97 => self.handle_pingreply(payload, peer).await,
             OP_SERVER_DESC_REQ   => self.handle_server_desc(payload, peer, obf).await,
             OP_GLOB_SEARCHREQ    => self.handle_search(payload, peer, obf).await,
-            OP_GLOB_SEARCHREQ3   => self.handle_search(payload, peer, obf).await,
+            // 0x90 carries a leading tag set before the expression tree; 0x98
+            // does not. See strip_searchreq3_tags.
+            OP_GLOB_SEARCHREQ3   => {
+                match strip_searchreq3_tags(payload) {
+                    Some(tree) => self.handle_search(tree, peer, obf).await,
+                    None => {
+                        debug!(ip = %peer.ip(), "0x90: malformed tag set — dropping");
+                        Ok(())
+                    }
+                }
+            }
             // 0xA1 SERVER_LIST_RES — response to our gossip SERVER_LIST_REQ.
             // Seed servers send this back after we query them on startup.
             0xA1 => self.handle_server_list_res(payload, peer).await,
@@ -551,43 +661,104 @@ impl UdpServer {
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
-        if payload.len() < 16 { return Ok(()); }
-        let mut hash = [0u8; 16];
-        hash.copy_from_slice(&payload[..16]);
-        self.send_found_sources(&hash, peer, obf).await
+        // 0x9A is a BATCH: the payload is a plain run of 16-byte hashes, and
+        // eMule packs up to 31 of them into one datagram
+        // (DownloadQueue.cpp:690-740). Only the first was answered, so every
+        // other file in a batched request got silence and the client waited out
+        // its timeout before asking again.
+        //
+        // Rarer in practice than it sounds — a 30-minute production capture had
+        // 1201 single-hash requests against 2 batched ones (of 31 and 4 hashes,
+        // 33 lookups lost) — because modern clients prefer 0x94. But the loss is
+        // total for the clients that do batch, and the fix is a loop.
+        if payload.len() < 16 {
+            return Ok(());
+        }
+        // Cap the reply fan-out. Each hash produces its own GLOBFOUNDSOURCES
+        // datagram, so an oversized (or forged) request must not turn one inbound
+        // packet into an unbounded outbound burst — that is a reflector.
+        const MAX_BATCH: usize = 32;
+        for chunk in payload.chunks_exact(16).take(MAX_BATCH) {
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(chunk);
+            self.send_found_sources(&hash, peer, obf).await?;
+        }
+        Ok(())
     }
 
     // ─── GLOBGETSOURCES2 (0x94) ─────────────────────────────────────────────
 
-    /// Multi-hash source lookup (SPEC.md §2.3.3, variant A or B).
+    /// Multi-hash source lookup (0x94).
     ///
-    /// Variant A (observed in production): packed list of N × 16-byte hashes.
-    /// Variant B (newer clients):          hash(16) + size_lo(4) [+ size_hi(4)].
+    /// The payload is a sequence of RECORDS, not a flat array of hashes. Each is
     ///
-    /// Distinguish: if (payload.len() % 16 == 0) → variant A, else → variant B.
+    /// ```text
+    ///   hash(16) + size_lo(4)                 -- normal file
+    ///   hash(16) + 0(4) + size(8)             -- large file (>4 GiB)
+    /// ```
+    ///
+    /// which is what eMule emits (DownloadQueue.cpp:1352-1357), and record sizes
+    /// therefore MIX inside one datagram.
+    ///
+    /// This used to branch on `payload.len() % 16 == 0`, treating the whole
+    /// payload as bare 16-byte hashes when divisible and as a single record
+    /// otherwise. Both readings are wrong for a batch:
+    ///
+    /// * 100 bytes = five 20-byte records → answered 1 (not divisible by 16);
+    /// * 80 bytes = four 20-byte records → answered 5, slicing hashes out of
+    ///   alignment so four of the five were fabricated;
+    /// * 528 bytes = 26 mixed records → answered 33 fabricated ones.
+    ///
+    /// Measured on a 30-minute production capture: **3381 of 6357** 0x94
+    /// datagrams were sliced wrongly — over half. The failure was silent in both
+    /// directions: real hashes went unanswered, and invented hashes produced
+    /// empty replies for files nobody asked about.
+    ///
+    /// Walking the records with the sentinel is the only correct reading, and it
+    /// accounted for 6357 of 6374 captured frames exactly (the remaining 17 were
+    /// truncated or malformed and are now rejected rather than guessed at).
     async fn handle_getsources_multi(
         &self,
         payload: &[u8],
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
-        if payload.len() < 16 { return Ok(()); }
+        // Cap the fan-out: each record yields its own reply datagram, so one
+        // inbound packet must not become an unbounded outbound burst.
+        const MAX_BATCH: usize = 64;
 
-        if payload.len() % 16 == 0 {
-            // Variant A: packed hashes
-            let count = payload.len() / 16;
-            for i in 0..count {
-                let mut hash = [0u8; 16];
-                hash.copy_from_slice(&payload[i * 16..(i + 1) * 16]);
-                self.send_found_sources(&hash, peer, obf).await?;
-            }
-        } else {
-            // Variant B: single hash + size
+        let mut hashes: Vec<[u8; 16]> = Vec::new();
+        let mut i = 0usize;
+        while i + 20 <= payload.len() && hashes.len() < MAX_BATCH {
             let mut hash = [0u8; 16];
-            hash.copy_from_slice(&payload[..16]);
-            self.send_found_sources(&hash, peer, obf).await?;
+            hash.copy_from_slice(&payload[i..i + 16]);
+            let size_lo =
+                u32::from_le_bytes([payload[i + 16], payload[i + 17], payload[i + 18], payload[i + 19]]);
+            i += 20;
+            if size_lo == 0 {
+                // Large-file sentinel: a u64 follows. A truncated tail here means
+                // the frame is malformed — stop rather than resynchronise at an
+                // arbitrary offset and invent hashes.
+                if i + 8 > payload.len() {
+                    debug!(ip = %peer.ip(), "0x94: truncated large-file record — stopping");
+                    break;
+                }
+                i += 8;
+            }
+            hashes.push(hash);
         }
 
+        // A single bare hash with no size field is still accepted: some clients
+        // send exactly 16 bytes.
+        if hashes.is_empty() && payload.len() >= 16 {
+            let mut hash = [0u8; 16];
+            hash.copy_from_slice(&payload[..16]);
+            hashes.push(hash);
+        }
+
+        for hash in hashes {
+            self.send_found_sources(&hash, peer, obf).await?;
+        }
         Ok(())
     }
 
@@ -598,13 +769,29 @@ impl UdpServer {
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
-        let sources: Vec<(std::net::IpAddr, u16)> = self.state
+        // The hash lists apply here too: a UDP source query is another way to
+        // start a download, so a listed file must stop being served on this
+        // channel as well.
+        if self.state.filter.hash_is_listed(hash) {
+            let mut out = BytesMut::new();
+            out.put_u8(PROTO_EDONKEY);
+            out.put_u8(OP_GLOB_FOUNDSOURCES);
+            out.put_slice(hash);
+            out.put_u8(0);
+            self.reply(&out, peer, obf).await?;
+            return Ok(());
+        }
+
+        // Collect (user_hash, ip, port) so the encoder below can resolve a LowID
+        // publisher to its assigned id — see the note there.
+        let sources: Vec<([u8; 16], std::net::IpAddr, u16)> = self
+            .state
             .file_slab
-            .get_by_hash(hash)
-            .map(|e| {
-                e.sources.iter()
+            .with_record_by_hash(hash, |_id, e| {
+                e.sources
+                    .iter()
                     .take(UDP_MAX_SOURCES)
-                    .map(|s| (s.ip(), s.port()))
+                    .map(|s| (s.user_hash, s.ip(), s.port()))
                     .collect()
             })
             .unwrap_or_default();
@@ -615,10 +802,25 @@ impl UdpServer {
         out.put_u8(OP_GLOB_FOUNDSOURCES);
         out.put_slice(hash);
         out.put_u8(sources.len() as u8);
-        for (ip, port) in &sources {
-            let id = match ip {
-                std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
-                _ => 0,
+        for (user_hash, ip, port) in &sources {
+            // Encode the source ID the way eD2k clients expect — identical to
+            // the TCP path in server/get_sources.rs:
+            //   * HighID source -> its real IPv4 (the peer connects directly)
+            //   * LowID source  -> its server-assigned low id (< 0x01000000), so
+            //     the downloader recognises it as LowID (::IsLowID) and goes
+            //     through callback / NAT-T instead of dialling an address that
+            //     cannot accept connections.
+            //
+            // This path used to write the real IPv4 unconditionally, while the
+            // TCP path resolved it. The same client was therefore anonymised on
+            // one channel and exposed on the other — and, just as importantly,
+            // looked like a HighID peer that nobody could ever reach.
+            let id = match self.state.clients.get(user_hash) {
+                Some(handle) if !handle.is_high_id => handle.assigned_id,
+                _ => match ip {
+                    std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
+                    _ => 0,
+                },
             };
             out.put_u32_le(id);
             out.put_u16_le(*port);
@@ -1022,8 +1224,16 @@ impl UdpServer {
         };
 
         // Guard 1: connected client → certainly not a peer server.
-        let sender_is_client = self.state.clients.iter()
-            .any(|e| match e.ip { std::net::IpAddr::V4(v4) => v4 == sender_v4, _ => false });
+        //
+        // `recent_client_ips` is keyed by IPv4 and is populated for every client
+        // that connects, so an O(1) hit there answers the common case. The walk
+        // over `clients` stays as a fallback for the window before an entry
+        // lands (or after its TTL expires while the client is still connected),
+        // but it now runs only when the cheap check misses.
+        let sender_is_client = self.state.recent_client_ips.contains_key(&sender_v4)
+            || self.state.clients.iter().any(|e| {
+                match e.ip { std::net::IpAddr::V4(v4) => v4 == sender_v4, _ => false }
+            });
         if sender_is_client {
             debug!(ip = %from.ip(),
                    "rejecting 0xA1 from connected client (mldonkey-style packet)");
@@ -1063,9 +1273,12 @@ impl UdpServer {
         // within the last 30 minutes (recent_client_ips). The latter is
         // important because mldonkey clients often disconnect quickly but
         // re-appear in 0xA1 from seeds for many minutes afterwards.
-        const CLIENT_BLOCK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-        // Opportunistically purge stale entries to keep the set bounded.
-        self.state.recent_client_ips.retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
+        // NOTE: pruning `recent_client_ips` used to happen right here, on every
+        // 0xA1. That is an O(map) pass on a packet an untrusted peer can send at
+        // will — with tens of thousands of entries it was real work per packet
+        // for a map that only needs sweeping every few minutes. The TTL retain
+        // now lives in the periodic cleanup in main.rs.
+
         let client_ips: std::collections::HashSet<std::net::Ipv4Addr> = {
             let mut set = std::collections::HashSet::new();
             for e in self.state.clients.iter() {
@@ -1285,15 +1498,19 @@ impl UdpServer {
         let mut sent = 0;
         for fid in candidate_ids {
             if sent >= UDP_MAX_SEARCH_RESULTS { break; }
-            // Resolve the compact FileId to its hash (keyword_index keys on id).
-            let hash = match self.state.file_slab.hash_of(fid) {
-                Some(h) => h,
-                None => continue, // tombstoned id
-            };
-            let entry = match self.state.file_slab.get_by_hash(&hash) {
+            // One lock, no id → hash → id round trip: with_record resolves the
+            // FileId in place. A tombstoned id yields None and is skipped.
+            let entry = match self.state.file_slab.with_record(fid, |r| r.clone()) {
                 Some(e) => e,
                 None => continue,
             };
+            let hash = entry.hash;
+            // Hash lists apply to what is SERVED — see the note in
+            // server/search.rs. Without this a takedown only takes effect on
+            // re-publish, i.e. never for a file whose sources keep refreshing.
+            if self.state.filter.hash_is_listed(&hash) {
+                continue;
+            }
             // Skip orphans (no live source). See src/server/search.rs for the
             // full rationale — orphans are useless to return.
             if entry.sources.is_empty() {

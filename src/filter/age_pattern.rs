@@ -85,9 +85,15 @@ fn contains_minor_age_token(s: &str) -> Option<String> {
             // Non-Latin — no FP risk inside Latin words. A digit 0-17 directly
             // followed by one of these is an explicit minor-age claim.
             "歳", "才", "세", "歲",
-            // School-grade suffixes that imply a minor: Japanese "年生"
-            // (e.g. "小学6年生"), Korean "학년" (e.g. "6학년").
-            "年生", "学年", "학년",
+            // NOTE: the school-grade suffixes "年生"/"学年"/"학년" are NOT here.
+            // They were, and it was wrong: the digit in front of them is a GRADE,
+            // not an age. "中学2年生" is a 14-year-old in the second year of
+            // junior high, and this scanner rendered it as "age 2"; "小学6年生"
+            // became "age 6". Worse than the mislabelling, the reading is unsafe
+            // in the other direction — "大学1年生" is a university FRESHMAN, 18
+            // or 19, and parsed as "age 1" it was a minor-age claim. Grades are
+            // handled by `contains_school_grade_marker`, which knows what school
+            // level each grade belongs to.
         ];
         let mut matched: Option<&str> = None;
         let rest_lower = rest.to_lowercase();
@@ -123,6 +129,26 @@ fn contains_minor_age_token(s: &str) -> Option<String> {
                     // Reference word right before the number. Kept deliberately
                     // small; "after" covers "Back After 10 Years".
                     const BEFORE: &[&str] = &["after", "spanning"];
+                    // Anniversary markers, matched as a SUBSTRING of the text just
+                    // before the number rather than as an exact preceding word.
+                    //
+                    // "anniversary" is already in AFTER, which covers the English
+                    // order ("16 Years Anniversary"). Romance languages put it
+                    // first — "Aniversário 16 anos" — and that got through as
+                    // "age 16" on a Brazilian studio's 16th-anniversary release.
+                    //
+                    // Substring, and not the exact-word test used for BEFORE,
+                    // because the word carries accents: the word-extraction below
+                    // splits on non-ASCII-alphabetic characters, so "aniversário"
+                    // arrives as "rio". Prefixes also survive the mojibake these
+                    // filenames are full of ("AniversÃ¡rio" still contains
+                    // "anivers").
+                    const ANNIVERSARY: &[&str] =
+                        &["annivers", "anivers", "jubil", "jahrestag", "годовщин", "юбиле"];
+                    // How far back to look. Short on purpose: the marker has to be
+                    // next to the number, so "Anniversary Edition ... 12 years old
+                    // girl" is still an age.
+                    const ANNIVERSARY_LOOKBACK: usize = 32;
                     if spelled {
                         let tail_hit = AFTER.iter().any(|w| tail.starts_with(w));
                         // Word immediately before the digit run.
@@ -133,7 +159,20 @@ fn contains_minor_age_token(s: &str) -> Option<String> {
                             .unwrap_or("")
                             .to_ascii_lowercase();
                         let before_hit = BEFORE.iter().any(|w| *w == prev_word);
-                        if tail_hit || before_hit {
+                        // Lookback is in CHARS, not bytes — these names are full of
+                        // multi-byte text and slicing by byte offset would panic.
+                        let lookback: String = prefix
+                            .chars()
+                            .rev()
+                            .take(ANNIVERSARY_LOOKBACK)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<String>()
+                            .to_lowercase();
+                        let anniversary_hit =
+                            ANNIVERSARY.iter().any(|w| lookback.contains(w));
+                        if tail_hit || before_hit || anniversary_hit {
                             continue;
                         }
                     }
@@ -317,28 +356,65 @@ pub(super) fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
     }
 }
 
-/// Detect Japanese/Korean lower-school grade markers where the grade number
-/// follows the school prefix: "中1" (JHS yr1 ≈ 12-13yo), "小6" (elementary yr6),
-/// "중1"/"초6" (Korean). These are minor-age claims that the digit+suffix
-/// scanner misses because the digit comes AFTER the marker, not before.
-/// Elementary (小/초) any grade, and junior-high (中/중) grades 1-3 (≈12-15yo)
-/// are minors. We do NOT match 高 (high school) — can include 18yo.
+/// School words paired with the highest grade that level actually has.
+///
+/// The grade cap is what makes the marker a MINOR-age claim rather than a bare
+/// number: elementary runs 1-6 (ages ~6-12), junior high 1-3 (~12-15). A digit
+/// outside the level's range is not a grade at all and must not match — "田中4"
+/// is a surname followed by a number, not a fourth-year junior-high student.
+///
+/// ⚠ High school (高/고) and university (大学/대학) are deliberately ABSENT.
+///   Their students can be 18 or over, so a grade there is not a minor-age
+///   claim. This is the same reasoning that keeps 女子校生 out of
+///   `CJK_MINOR_WORDS`. In particular "大学1年生" (a freshman, 18-19) must NOT
+///   read as an age claim of any kind.
+///
+/// Longer school words come first so the specific form is tried before the bare
+/// one; the scan returns on the first hit either way, so this is for clarity.
+const SCHOOL_GRADES: &[(&str, u32)] = &[
+    ("小学", 6),     // JP elementary, long form: 小学6年生
+    ("小學", 6),     // ditto, traditional
+    ("초등학교", 6), // KR elementary, long form: 초등학교 6학년
+    ("中学", 3),     // JP junior high, long form: 中学2年生
+    ("中學", 3),     // ditto, traditional
+    ("初中", 3),     // CN junior high: 初中3年级
+    ("중학교", 3),   // KR junior high
+    ("小", 6),       // short forms: 小6
+    ("초", 6),       // 초6
+    ("中", 3),       // 中1
+    ("중", 3),       // 중1
+];
+
+/// Detect Japanese/Korean/Chinese lower-school grade markers, where the grade
+/// number follows the school word: "中1", "小6", "중1", "초6", and the long
+/// forms "小学6年生", "中学2年生", "초등학교 6학년".
+///
+/// These are minor-age claims that `contains_minor_age_token` cannot see,
+/// because the digit comes AFTER the school word rather than before a unit.
+///
+/// The long forms used to be reached by listing "年生"/"学年"/"학년" as age
+/// suffixes, which read the grade number as an age and — since it never
+/// consulted the school word — accepted university years as ages 1-4. Matching
+/// the school word first is what supplies the missing context.
 fn contains_school_grade_marker(s: &str) -> bool {
-    let prefixes = ["小", "초", "中", "중"];
-    for p in prefixes {
+    for (word, max_grade) in SCHOOL_GRADES {
         let mut from = 0;
-        while let Some(rel) = s[from..].find(p) {
+        while let Some(rel) = s[from..].find(word) {
             let abs = from + rel;
-            let after = abs + p.len();
-            // Next char must be a grade digit 1-6.
-            if let Some(c) = s[after..].chars().next() {
+            let mut i = abs + word.len();
+            // Tolerate spacing between the school word and the grade, as in
+            // "초등학교 6학년".
+            while s[i..].starts_with(' ') {
+                i += 1;
+            }
+            if let Some(c) = s[i..].chars().next() {
                 if let Some(d) = c.to_digit(10) {
-                    if (1..=6).contains(&d) {
+                    if (1..=*max_grade).contains(&d) {
                         return true;
                     }
                 }
             }
-            from = abs + p.len();
+            from = abs + word.len();
         }
     }
     false
@@ -352,6 +428,30 @@ mod tests {
     // Every string below is a REAL filename observed on the server. The blocked
     // ones passed all filter layers before this revision; the allowed ones were
     // wrongly blocked by it.
+
+    #[test]
+    fn anniversary_before_the_number_is_not_an_age() {
+        // Live false positive: a Brazilian studio's 16th-anniversary release.
+        // The marker precedes the number, and it is accented.
+        assert!(contains_minor_age_token(
+            "Hot Boys - Aniversário 16 anos (16th Anniversary) HotBoys, Parte 2.mp4"
+        )
+        .is_none());
+        // Mojibake form, which is how these arrive over the wire more often than not.
+        assert!(contains_minor_age_token("Hot Boys - AniversÃ¡rio 16 anos, Parte 2.mp4").is_none());
+        assert!(contains_minor_age_token("Jubiläum 15 Jahre Studio.avi").is_none());
+        assert!(contains_minor_age_token("Юбилей 10 лет студии.avi").is_none());
+        // English order was already covered by the AFTER list; keep it covered.
+        assert!(contains_minor_age_token("16 Years Anniversary Edition.mp4").is_none());
+
+        // The marker must be NEXT to the number. Far away, an age is still an age.
+        assert!(contains_minor_age_token(
+            "Anniversary Edition of a long and rambling title here - 12 years old girl sex.avi"
+        )
+        .is_some());
+        // And an ordinary age near an unrelated word is untouched.
+        assert!(contains_minor_age_token("universe 12 years old sex.avi").is_some());
+    }
 
     #[test]
     fn regression_numbering_and_timespans_are_not_ages() {
@@ -587,6 +687,41 @@ mod tests {
         assert!(contains_school_grade_marker("小6 video"));        // elem yr6
         assert!(contains_school_grade_marker("중1 clip"));         // KR JHS yr1
         assert!(contains_school_grade_marker("초6 file"));         // KR elem yr6
+
+        // Long forms — these used to be reached only via the "年生" age suffix,
+        // which read the grade digit as an age.
+        assert!(contains_school_grade_marker("小学6年生 ミミ"));
+        assert!(contains_school_grade_marker("中学2年生 14歳 千鶴"));
+        assert!(contains_school_grade_marker("小學6年生"));
+        assert!(contains_school_grade_marker("初中3年级"));
+        assert!(contains_school_grade_marker("초등학교 6학년"));
+        assert!(contains_school_grade_marker("중학교 2학년"));
+
+        // Grades that do not exist at that level are not grades.
+        assert!(!contains_school_grade_marker("中学9年生"));
+        assert!(!contains_school_grade_marker("田中4"));  // surname + number
+        assert!(!contains_school_grade_marker("田中5号"));
+
+        // ⚠ THE REGRESSION the suffix list caused: post-compulsory school years
+        // belong to people who may be adults. A university freshman is 18-19 and
+        // must never register as an age claim.
+        assert!(!contains_school_grade_marker("大学1年生"));
+        assert!(!contains_school_grade_marker("大学4年生"));
+        assert!(!contains_school_grade_marker("高校3年生"));
+        assert!(!contains_school_grade_marker("専門学校2年生"));
+        assert!(!contains_school_grade_marker("대학교 1학년"));
+    }
+
+    #[test]
+    fn grade_digits_are_not_read_as_ages() {
+        // The digit before 年生/학년 is a GRADE. It must not reach the age
+        // scanner at all — neither as a true age nor as a mislabelled one.
+        assert!(contains_minor_age_token("大学1年生 の彼女.mp4").is_none());
+        assert!(contains_minor_age_token("高校3年生 video.avi").is_none());
+        assert!(contains_minor_age_token("초등학교 6학년.mp4").is_none());
+        // A real age token in the same name still fires, and reports the AGE.
+        let r = contains_minor_age_token("中学2年生 14歳 千鶴.avi");
+        assert_eq!(r.as_deref(), Some("age 14 (歳)"));
         // High-school marker (高) must NOT match — can include 18yo.
         assert!(!contains_school_grade_marker("高3 video"));
         // Grade > 6 must not match (out of elementary/JHS range).

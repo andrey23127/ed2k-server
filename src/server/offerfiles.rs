@@ -114,26 +114,42 @@ pub fn handle_offerfiles(
         match state.filter.check(&file.hash, &file.filename) {
             FilterResult::Block(layer, reason) => {
                 blocked += 1;
-                client.csam_attempts = client.csam_attempts.saturating_add(1);
+                // Does this block say anything about the PUBLISHER?
+                //
+                // For every layer but L5 the answer is yes: the client offered
+                // material the filter rejected, and repeat offences end in a ban.
+                // L5 is the poisoned-index list — the client is offering a decoy
+                // it downloaded like anyone else. The file still must not be
+                // indexed, but nothing about the client changes: no csam_attempts,
+                // no unique-IP tally, no ban progress. Ask the layer rather than
+                // testing it here, so a future layer cannot inherit the wrong
+                // treatment by being pattern-matched in the wrong place.
+                let counts = layer.counts_against_publisher();
+                if counts {
+                    client.csam_attempts = client.csam_attempts.saturating_add(1);
+                }
                 // Count this hash exactly ONCE in block_stats and csam_unique_ips.
                 // Without dedup, a client republishing the same blocked file every
                 // keepalive cycle inflated counters massively (observed 464925
                 // counted blocks against only 264700 indexed files in production).
-                let is_new_hash = state.csam_blocked_hashes.insert(file.hash, ()).is_none();
+                let is_new_hash = state
+                    .csam_blocked_hashes
+                    .insert(file.hash, std::time::Instant::now())
+                    .is_none();
                 if is_new_hash {
-                    *state.block_stats.entry("csam".to_string()).or_insert(0) += 1;
+                    // Keep the headline "csam" counter meaning CSAM. Poisoned-index
+                    // hits get their own total; folding them in would inflate the
+                    // number the operator reports and watches for trends.
+                    let total_key = if counts { "csam" } else { "poison" };
+                    *state.block_stats.entry(total_key.to_string()).or_insert(0) += 1;
                     // Break down by layer so the operator can see WHICH filter
                     // catches most files — helps spot if a specific layer is
                     // producing false positives.
-                    let layer_key = match layer {
-                        crate::filter::Layer::L1Jargon     => "csam_L1_jargon",
-                        crate::filter::Layer::L2AgePattern => "csam_L2_age",
-                        crate::filter::Layer::L3HashBlock  => "csam_L3_hash",
-                        crate::filter::Layer::L4Extra      => "csam_L4_extra",
-                    };
-                    *state.block_stats.entry(layer_key.to_string()).or_insert(0) += 1;
-                    if let std::net::IpAddr::V4(v4) = client.ip {
-                        *state.csam_unique_ips.entry(v4).or_insert(0) += 1;
+                    *state.block_stats.entry(layer.stat_key().to_string()).or_insert(0) += 1;
+                    if counts {
+                        if let std::net::IpAddr::V4(v4) = client.ip {
+                            *state.csam_unique_ips.entry(v4).or_insert(0) += 1;
+                        }
                     }
                 }
                 // Q1: ban CSAM publishers by USER_HASH (stable across the IP
@@ -143,14 +159,18 @@ pub fn handle_offerfiles(
                 // single rare FP can never accumulate to a ban across reconnects.
                 // Done OUTSIDE the global is_new_hash guard because that dedup is
                 // server-wide; we need a PER-USER distinct-file count here.
-                {
+                if counts {
                     let cfg = state.live_cfg.load();
                     let threshold = cfg.content_filter.publisher_attempt_disconnect_threshold;
-                    let ttl = std::time::Duration::from_secs(
-                        cfg.content_filter.publisher_blacklist_seconds);
+                    // Two different windows: files count toward the threshold over
+                    // `count_window` (short — judge recent behaviour), while the
+                    // records themselves are retained for `ban_ttl` so the review
+                    // exports keep their history.
+                    let count_window = cfg.content_filter.count_window();
+                    let retention = cfg.content_filter.ban_ttl();
                     if state.record_csam_file_for_user(
-                        client.user_hash, file.hash, &file.filename,
-                        layer, &reason, threshold, ttl)
+                        client.user_hash, file.hash, &file.filename, file.size,
+                        layer, &reason, threshold, count_window, retention)
                     {
                         // Threshold of distinct blocked files reached. ban_publisher
                         // is idempotent (it reports whether the ban was newly
@@ -195,15 +215,28 @@ pub fn handle_offerfiles(
                 let mut hasher = sha2::Sha256::new();
                 hasher.update(file.filename.as_bytes());
                 let name_sha = hex::encode(hasher.finalize());
-                warn!(
-                    publisher_ip = %client.ip,
-                    publisher_user_hash = hex::encode(client.user_hash),
-                    layer = ?layer,
-                    file_hash = hex::encode(file.hash),
-                    filename_sha256 = %name_sha,
-                    csam_attempt_count = client.csam_attempts,
-                    "csam_publish_blocked"
-                );
+                if counts {
+                    warn!(
+                        publisher_ip = %client.ip,
+                        publisher_user_hash = hex::encode(client.user_hash),
+                        layer = ?layer,
+                        file_hash = hex::encode(file.hash),
+                        filename_sha256 = %name_sha,
+                        csam_attempt_count = client.csam_attempts,
+                        "csam_publish_blocked"
+                    );
+                } else {
+                    // INFO, not WARN: a decoy is routine and carries no accusation.
+                    // The health tab's ring buffer only keeps WARN/ERROR, and a
+                    // poisoned swarm can touch thousands of files — logging these
+                    // at WARN would evict the records an operator actually needs.
+                    info!(
+                        publisher_ip = %client.ip,
+                        file_hash = hex::encode(file.hash),
+                        filename_sha256 = %name_sha,
+                        "poisoned_index_publish_blocked"
+                    );
+                }
                 continue;
             }
             FilterResult::Allow => {}

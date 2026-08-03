@@ -1,0 +1,24 @@
+# whitelist_hashes.txt (EXAMPLE; copy to whitelist_hashes.txt)
+#
+# Verified false positives: files a human has looked at and ruled legal.
+#
+# One eD2k hash (32 hex chars) per line. A ';' starts an inline comment — use it
+# to record WHY the entry is here, since that is the only record of the decision.
+#
+# SCOPE: an entry here overrides EVERY filter layer, not just the hash lists.
+#   That is deliberate. The false positives that occur in practice are TERM
+#   matches, not hash matches: song titles that happen to contain a marker word,
+#   historical medical texts whose title contains one. An override that left the
+#   term layers running did nothing for the only class of mistake that happens.
+#
+# The override is per-FILE, not per-name: a different file sharing the same name
+# is still filtered normally.
+#
+# Hot-reloaded within ~30 s of an mtime change. Copy with `cp` and NOT `cp -p`,
+# or the mtime does not change and nothing reloads.
+#
+# An EMPTY file is applied as written — clearing the list is how an override gets
+# retracted. A failed READ is different and keeps the current list, so a
+# permissions slip cannot silently re-block everything.
+#
+# 0123456789abcdef0123456789abcdef ; "<Band> - <Song>.mp3" — real song title

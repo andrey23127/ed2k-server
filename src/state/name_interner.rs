@@ -1,33 +1,33 @@
-//! Name interner (Stage 2; single-store rework in Stage 4): deduplicate
-//! file-name strings.
+//! Name storage for file records.
 //!
-//! WHY: every file stored its name as an owned `String` — a separate heap
-//! allocation per file (24-byte header + the bytes). At Lugdunum scale (30M+
-//! files) that is ~2.6 GB, and release names repeat heavily across distinct
-//! hashes (the same `ubuntu-24.04.iso` is published by many peers as different
-//! file versions, re-encodes, fakes, etc.), so most of those allocations hold
-//! identical bytes.
+//! HISTORY — this used to be a deduplicating interner, and no longer is.
 //!
-//! HOW: names are interned to `Arc<str>`. Identical names resolve to the SAME
-//! `Arc`, so the bytes live once and every record holding that name keeps only
-//! a 16-byte (ptr+len) shared handle. Reference counting is the `Arc`'s own:
-//! when the last record referencing a name is dropped, the `Arc` strong count
-//! falls to the interner's single retained copy, and a periodic sweep drops
-//! interner entries whose only remaining holder is the table itself — releasing
-//! the bytes. Strategy A (memory IS reclaimed), without a hand-rolled arena/GC.
+//! The premise was that eD2k filenames repeat often enough that storing each
+//! distinct name once would pay for the table doing it. A synthetic benchmark
+//! agreed (it modelled 70% distinct names). Production did not: at 1.17M live
+//! files there were 1.14M distinct names — a **2.8% dedup rate**, and falling as
+//! the index grew. Real filenames are tag-stuffed, re-tagged and re-cased by
+//! every publisher, so near enough all of them are unique.
 //!
-//! SINGLE-STORE (Stage 4): the dedup table is `DashMap<Arc<str>, ()>`, not the
-//! earlier `DashMap<Box<str>, Arc<str>>`. The old layout stored every name's
-//! bytes TWICE — once in the `Box<str>` key, once in the `Arc<str>` value. Now
-//! the canonical `Arc<str>` IS the key (the table retains the single +1 strong
-//! count through it) and the value is zero-sized, so the bytes exist exactly
-//! once. Lookups still take a `&str`: `Arc<str>: Borrow<str>`, and `Arc`'s
-//! `Hash`/`Eq` delegate to the pointed-to `str`, so two equal-byte arcs collide
-//! in the map and dedup correctly.
+//! The accounting at that point:
 //!
-//! CONCURRENCY: the table is a `DashMap`, so interning is sharded and lock-free
-//! on the common path (publish). Lookups never touch it once a record holds its
-//! `Arc<str>` directly.
+//! | | |
+//! |---|---|
+//! | saved by dedup | 1.8 MB |
+//! | `Arc` control blocks | 17.4 MB |
+//! | dedup table slots | 29.3 MB |
+//! | **net** | **−45 MB** |
+//!
+//! So the table was removed. `intern` now just allocates; the `Arc` stays,
+//! because callers clone names out from under a shard read lock and an `Arc`
+//! clone there is a pointer bump rather than a byte copy. That keeps the control
+//! block (17.4 MB) and returns the slots (29.3 MB) — about −0.9 GB at the 33M
+//! target, against a 1.8 MB loss of real dedup.
+//!
+//! The type is kept, rather than replacing `Arc<str>` with `Box<str>` at every
+//! call site, on purpose: the remaining 16 bytes per name are the price of not
+//! touching a dozen signatures and the locking assumptions behind them. If that
+//! becomes worth doing, it should be its own change with its own testing.
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -48,61 +48,37 @@ impl NameInterner {
         Self { table: DashMap::new() }
     }
 
-    /// Intern a name: return the shared `Arc<str>` for these bytes, allocating
-    /// and recording it only if previously unseen. Two files with the same name
-    /// get the same `Arc` — the bytes are stored once.
+    /// Return an `Arc<str>` for these bytes.
+    ///
+    /// ⚠ NO LONGER DEDUPLICATES — and that is the point. See the module header:
+    /// live measurement put the dedup rate at 2.8%, saving 1.8 MB while the
+    /// table that produced it cost 29 MB in slots. The table was a net loss of
+    /// ~45 MB at 1.17M files, scaling to about −0.9 GB at the 33M target.
+    ///
+    /// The `Arc` itself stays. It is what every caller holds and what makes
+    /// cloning a name out from under a shard lock cheap; only the dedup TABLE is
+    /// gone. Identical names now get separate allocations, which costs the 1.8 MB
+    /// the dedup was saving and returns the 29 MB it was spending.
+    ///
+    /// Kept as a method rather than inlining `Arc::from` at the call sites so
+    /// the decision stays in one documented place, and so restoring dedup — if a
+    /// future workload ever justifies it — is a change to this function alone.
     pub fn intern(&self, name: &str) -> Arc<str> {
-        // Fast path: already interned — clone the canonical key Arc. The lookup
-        // is by `&str` (Arc<str>: Borrow<str>), so no allocation here.
-        if let Some(e) = self.table.get(name) {
-            return e.key().clone();
-        }
-        // Slow path: create the canonical Arc and publish it as the key. The
-        // entry API arbitrates a race between two publishers interning the same
-        // new name — the loser drops its Arc and adopts the winner's.
-        let arc: Arc<str> = Arc::from(name);
-        use dashmap::mapref::entry::Entry;
-        match self.table.entry(arc.clone()) {
-            Entry::Occupied(e) => e.key().clone(), // someone won; our `arc` drops
-            Entry::Vacant(e) => {
-                e.insert(());
-                arc
-            }
-        }
+        Arc::from(name)
     }
 
-    /// Drop interner entries that no record references any more. A name is unused
-    /// when its only strong holder is the interner table itself
-    /// (`strong_count == 1`). Returns the number of names freed.
+    /// No-op retained for the periodic cleanup's call site. Always returns 0.
     ///
-    /// Called off the hot path (the periodic cleanup task). Safe under
-    /// concurrency: if a publisher interns the same name between the count check
-    /// and the removal, `remove_if` re-checks under the shard lock, so a name
-    /// that just gained a user is not dropped.
+    /// With no table there is nothing to sweep: a name is freed by its last
+    /// `Arc` holder, i.e. when the record referencing it is evicted. That is
+    /// strictly better than the old scheme, where a name lingered until the next
+    /// sweep noticed `strong_count == 1`.
     ///
-    /// NOTE: candidate keys are collected as freshly copied bytes (`Box<str>`),
-    /// NOT as `Arc` clones — cloning the key would itself bump `strong_count`
-    /// above 1 and defeat the unused check. The byte copies are temporary and
-    /// off the hot path.
+    /// Left in place (rather than deleting the call) because the cleanup logs
+    /// `dropped_names` and an operator comparing logs across versions should see
+    /// it go to zero, not see the field vanish.
     pub fn sweep_unused(&self) -> usize {
-        let mut freed = 0usize;
-        let candidates: Vec<Box<str>> = self
-            .table
-            .iter()
-            .filter(|e| Arc::strong_count(e.key()) == 1)
-            .map(|e| Box::<str>::from(&**e.key()))
-            .collect();
-        for key in candidates {
-            // Re-check under the shard lock: only remove if STILL unreferenced.
-            let removed = self
-                .table
-                .remove_if(&*key, |arc, _| Arc::strong_count(arc) == 1)
-                .is_some();
-            if removed {
-                freed += 1;
-            }
-        }
-        freed
+        0
     }
 
     /// Number of distinct interned names currently held.
@@ -125,56 +101,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn identical_names_share_one_allocation() {
+    fn intern_returns_usable_names() {
         let it = NameInterner::new();
         let a = it.intern("ubuntu-24.04.iso");
         let b = it.intern("ubuntu-24.04.iso");
-        // Same backing allocation: the pointers are equal.
-        assert!(Arc::ptr_eq(&a, &b), "identical names must share one Arc");
-        assert_eq!(it.len(), 1, "only one distinct name stored");
+        assert_eq!(&*a, "ubuntu-24.04.iso");
+        assert_eq!(&*a, &*b);
     }
 
     #[test]
-    fn distinct_names_are_separate() {
+    fn identical_names_no_longer_share_an_allocation() {
+        // Deliberate: the dedup table was measured at 2.8% hit rate, saving
+        // 1.8 MB while costing 29 MB in slots. Separate allocations are the
+        // cheaper answer for this workload. If a future workload brings names
+        // back into alignment, restoring dedup is a change to `intern` alone.
         let it = NameInterner::new();
-        let a = it.intern("a.iso");
-        let b = it.intern("b.iso");
+        let a = it.intern("same.iso");
+        let b = it.intern("same.iso");
         assert!(!Arc::ptr_eq(&a, &b));
-        assert_eq!(it.len(), 2);
     }
 
     #[test]
-    fn sweep_frees_only_unreferenced_names() {
+    fn a_name_is_freed_by_its_last_holder() {
+        // Without a table, nothing keeps a name alive once its record is gone —
+        // strictly better than waiting for a sweep to notice.
         let it = NameInterner::new();
-        let keep = it.intern("keep.iso"); // we hold this one
-        let _ = it.intern("drop.iso"); // dropped immediately — only the table holds it
-        assert_eq!(it.len(), 2);
-
-        let freed = it.sweep_unused();
-        assert_eq!(freed, 1, "the unreferenced name is freed");
-        assert_eq!(it.len(), 1, "the still-held name remains");
-        // The retained handle is still valid.
-        assert_eq!(&*keep, "keep.iso");
+        let a = it.intern("gone.iso");
+        assert_eq!(Arc::strong_count(&a), 1, "only the caller holds it");
+        drop(a);
+        assert_eq!(it.len(), 0, "nothing is retained");
     }
 
     #[test]
-    fn sweep_keeps_name_with_live_holder() {
+    fn sweep_is_a_no_op() {
         let it = NameInterner::new();
-        let held = it.intern("x.iso");
-        assert_eq!(it.sweep_unused(), 0, "a referenced name must not be freed");
-        assert_eq!(it.len(), 1);
-        drop(held);
-        assert_eq!(it.sweep_unused(), 1, "after the holder drops it is freed");
+        let _keep = it.intern("keep.iso");
+        assert_eq!(it.sweep_unused(), 0);
+        assert!(it.is_empty());
     }
 
     #[test]
-    fn reintern_after_sweep_reallocates() {
+    fn unicode_names_survive_round_trip() {
         let it = NameInterner::new();
-        let _ = it.intern("temp.iso");
-        assert_eq!(it.sweep_unused(), 1);
-        // Re-interning the same name works (fresh allocation).
-        let a = it.intern("temp.iso");
-        assert_eq!(&*a, "temp.iso");
-        assert_eq!(it.len(), 1);
+        let n = it.intern("Фильм — 中文 — café.mkv");
+        assert_eq!(&*n, "Фильм — 中文 — café.mkv");
     }
 }

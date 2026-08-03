@@ -1,0 +1,13 @@
+# Layer 3 — ban list (EXAMPLE; copy to hash_banlist.txt).
+#
+# A hit here is BLOCKED and COUNTS AGAINST THE PUBLISHER: it raises
+# csam_attempts and counts toward publisher_attempt_disconnect_threshold.
+# This list is therefore for material whose publisher should answer for it —
+# child sexual abuse material and bestiality alike. The file used to be called
+# csam_hashes.txt, which was inaccurate once the second category went in.
+#
+# Anything that should merely disappear from the index — decoys, takedown
+# requests — belongs in hash_filter.txt instead, where the publisher is not
+# accused. Mixing the two dilutes a list whose whole value is that every entry
+# means one specific thing.
+#

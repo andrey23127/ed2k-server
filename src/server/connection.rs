@@ -266,6 +266,11 @@ pub async fn handle_connection(
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             state.clients.remove(&c.user_hash);
+            // Retract the id→user mapping. Guarded inside: a HighID client's
+            // assigned_id is its IPv4, so a reconnect from the same address may
+            // already have claimed this id — in that case the entry belongs to
+            // the live session and must survive this one's cleanup.
+            state.unindex_client_id(c.assigned_id, &c.user_hash);
             state.remove_sources_of(&c.user_hash);
         }
     }
@@ -354,6 +359,7 @@ async fn dispatch(
                 // takes effect on the next login attempt.
                 let ttl = std::time::Duration::from_secs(
                     state.live_cfg.load().content_filter.publisher_blacklist_seconds);
+                // NB: the BAN length, deliberately — not the counting window.
                 if state.is_publisher_banned(&req.user_hash, ttl) {
                     // Throttled: the ban lasts 30 days by default while the client
                     // keeps auto-reconnecting on a ~30 s timer, so this single peer
@@ -375,6 +381,7 @@ async fn dispatch(
             // adjustment our LowID counter would double-count until the old
             // task eventually times out and decrements. eMule then reports
             // a LowID count > total connected clients.
+            state.index_client_id(new_client.assigned_id, new_client.user_hash);
             let prev = state.clients.insert(new_client.user_hash, new_client.clone());
             // Maintain cached lowid count so handle_servstat doesn't do an O(N)
             // iter on every UDP probe (was 2.58% of CPU in v0.9.36 profile).

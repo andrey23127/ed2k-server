@@ -126,6 +126,7 @@ pub const SRVFLG_SUPPORTCRYPT: u32 = 0x0800;
 /// Server prefers obfuscated connections
 pub const SRVFLG_REQUESTCRYPT: u32 = 0x1000;
 
+
 // OFFERFILES self-source markers - SPEC.md §3.3
 pub const SELF_COMPLETE_ID: u32 = 0xFBFB_FBFB;
 pub const SELF_COMPLETE_PORT: u16 = 0xFBFB;

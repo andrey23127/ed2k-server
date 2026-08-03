@@ -5,7 +5,6 @@
 use crate::state::file_id::FileId;
 use crate::state::posting_codec;
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 32-bit token hash type. Keywords are stored by the FNV-1a hash of the
 /// lowercase token, NOT the token string itself (the Lugdunum approach). This
@@ -158,6 +157,22 @@ pub struct KeywordIndex {
     /// clears an id from pending when it re-adds it, so a delete-then-re-add
     /// sequence cannot resurrect the deletion at compact time.
     pending_removals: DashMap<TokenHash, Vec<FileId>>,
+}
+
+/// Shrink a DashMap only when it has at least 2x more slots than entries.
+///
+/// Unconditional shrinking would rebuild the table on every cycle for a map that
+/// is merely full, which costs far more than the slack it reclaims.
+fn shrink_if_slack<K, V>(map: &DashMap<K, V>)
+where
+    K: std::hash::Hash + Eq,
+{
+    let len = map.len();
+    // An empty map still holds its allocation; that is exactly the case worth
+    // reclaiming, and `len * 2` would be 0 and never trigger.
+    if map.capacity() > std::cmp::max(len * 2, 64) {
+        map.shrink_to_fit();
+    }
 }
 
 impl KeywordIndex {
@@ -391,6 +406,13 @@ impl KeywordIndex {
     /// - `blob_vec_headers_bytes`: the `Vec<u8>` header (ptr+len+cap) per keyword.
     /// - `key_slots_bytes`: hashbrown table slots (key + value + 1 ctrl), by the
     ///   map's capacity — the power-of-two/never-shrink-on-retain cost.
+    /// Slot capacity of the hot tier's table. Diagnostics and tests — capacity
+    /// is not otherwise observable, and it is what decides how much of the
+    /// keyword index is reserved but unused.
+    pub fn hot_capacity(&self) -> usize {
+        self.hot.capacity()
+    }
+
     pub fn size_report(&self) -> (u64, u64, u64) {
         let blob_hdr = std::mem::size_of::<Box<[u8]>>() as u64;
         let idvec_hdr = std::mem::size_of::<Vec<FileId>>() as u64;
@@ -486,6 +508,26 @@ impl KeywordIndex {
             .retain(|_, blob| posting_codec::decoded_len(blob).unwrap_or(0) != 0);
         self.hot.retain(|_, v| !v.is_empty());
         self.pending_removals.retain(|_, v| !v.is_empty());
+
+        // Give back table capacity the maps are no longer using.
+        //
+        // `hot` and `pending_removals` are drained to (near) empty every cycle,
+        // but their tables keep whatever capacity the busiest cycle ever needed —
+        // a burst that touched 200k keywords leaves 200k slots reserved
+        // permanently, holding nothing. `cold` grows for real, so it is only
+        // shrunk when it has genuinely over-reserved.
+        //
+        // Gated on a 2x ratio rather than run unconditionally: `shrink_to_fit`
+        // rebuilds every shard's table, which is far too expensive to do each
+        // cycle on a map that is simply full. With the gate, a steadily growing
+        // `cold` is left alone and only real slack is reclaimed.
+        //
+        // Safe here and nowhere else: compact() runs on the blocking pool, off
+        // the runtime, so a rebuild does not stall packet handling.
+        shrink_if_slack(&self.hot);
+        shrink_if_slack(&self.pending_removals);
+        shrink_if_slack(&self.cold);
+
         before - self.cold.len()
     }
 }
@@ -494,6 +536,41 @@ impl KeywordIndex {
 mod tests {
     use super::*;
     use crate::state::file_id::FileId;
+
+    #[test]
+    fn compact_returns_unused_table_capacity() {
+        // hot/pending are drained every cycle but keep the capacity of the
+        // busiest burst forever. After a big burst is compacted away, the slots
+        // must come back.
+        let kw = KeywordIndex::new();
+        // Each file gets a token unique to it plus one shared by all, so the
+        // burst creates ~5000 distinct keywords.
+        for i in 0..5000u32 {
+            kw.add_file(FileId(i), &format!("filexyz{i} commontoken"));
+        }
+        let hot_cap_peak = kw.hot_capacity();
+        assert!(hot_cap_peak > 1000, "burst should have grown the hot table");
+
+        kw.compact();
+        assert!(
+            kw.hot_capacity() < hot_cap_peak,
+            "hot table kept {} slots after being drained (peak {hot_cap_peak})",
+            kw.hot_capacity()
+        );
+
+        // The postings themselves survived: capacity is the only thing given
+        // back. A unique token resolves to exactly its file...
+        assert_eq!(
+            kw.find_intersection(&["filexyz4242".to_string()]),
+            vec![FileId(4242)],
+            "posting data must survive the shrink"
+        );
+        // ...and the token every file shares still lists them all.
+        assert_eq!(
+            kw.find_intersection(&["commontoken".to_string()]).len(),
+            5000
+        );
+    }
 
     #[test]
     fn tokenize_separators() {

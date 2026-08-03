@@ -28,15 +28,30 @@ impl GetSourcesRequest {
         let mut hash = [0u8; 16];
         hash.copy_from_slice(&payload[0..16]);
 
-        // v2: payload[16..20] = size_lo
-        // v2-large: payload[16..20] = 0, payload[20..24] = size_hi, payload[24..28] = size_lo
-        // (the hi=0 sentinel signals the v2-large variant)
+        // v2:       payload[16..20] = size as u32
+        // v2-large: payload[16..20] = 0 (sentinel), payload[20..28] = size as u64 LE
+        //
+        // The layout comes straight from eMule, DownloadQueue.cpp:1352-1357:
+        //
+        //     if (!cur_file->IsLargeFile())
+        //         smPacket.WriteUInt32((uint32)(uint64)cur_file->GetFileSize());
+        //     else {
+        //         smPacket.WriteUInt32(0);   // large-file marker, a u64 follows
+        //         smPacket.WriteUInt64(cur_file->GetFileSize());
+        //     }
+        //
+        // and `WriteUInt64` is `Write(&nVal, sizeof nVal)` (SafeFile.cpp:155), a
+        // raw little-endian u64 — LOW dword first.
+        //
+        // This used to read [20..24] as the HIGH half and [24..28] as the low
+        // one, i.e. the two words swapped, so a 6 GiB file decoded as
+        // 9223372036854775809 instead of 6442450944.
         let size = if payload.len() >= 20 {
             let lo = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
             if lo == 0 && payload.len() >= 28 {
-                let hi = u32::from_le_bytes([payload[20], payload[21], payload[22], payload[23]]);
-                let actual_lo = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
-                Some(((hi as u64) << 32) | (actual_lo as u64))
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&payload[20..28]);
+                Some(u64::from_le_bytes(b))
             } else {
                 Some(lo as u64)
             }
@@ -59,11 +74,37 @@ impl GetSourcesRequest {
 /// into a single map lookup. The cache key is the file hash; the requester is
 /// not part of the key, so we must still filter "self" out of a cache hit —
 /// but that's a cheap scan over an already-built payload, done below.
+/// A well-formed FOUNDSOURCES payload carrying zero sources.
+///
+/// Clients expect a reply to every request, so a listed file answers "nobody
+/// has it" rather than staying silent — silence just makes the client re-ask.
+fn encode_empty_sources(file_hash: &[u8; 16]) -> Vec<u8> {
+    let mut payload = BytesMut::with_capacity(17);
+    payload.put_slice(file_hash);
+    payload.put_u8(0);
+    payload.to_vec()
+}
+
 pub fn handle_get_sources(
     state: &ServerState,
     requester: &ClientHandle,
     req: GetSourcesRequest,
 ) -> Frame {
+    // Hash lists first, BEFORE the cache. Handing out sources is how a download
+    // actually starts, so a listed file must stop being served here too, not
+    // just stop appearing in search — otherwise a client that already has the
+    // ed2k link still gets peers for it.
+    //
+    // Ahead of the cache on purpose: a cached payload built before the hash was
+    // listed would otherwise keep being served for the life of its TTL.
+    if state.filter.hash_is_listed(&req.file_hash) {
+        debug!(
+            file_hash = hex::encode(req.file_hash),
+            "getsources refused: hash is listed"
+        );
+        return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
+    }
+
     // Fast path: a freshly-cached payload for this hash.
     if let Some(cached) = state.smart_sources.get(&req.file_hash) {
         debug!(
@@ -153,14 +194,54 @@ mod tests {
 
     #[test]
     fn parse_v2_large() {
-        // hash + size_lo=0 sentinel + size_hi + actual_size_lo
+        // The tail after the sentinel is a plain little-endian u64, exactly as
+        // eMule's WriteUInt64 emits it — NOT two dwords in high/low order.
+        //
+        // This test previously encoded the bug: it wrote the high dword first
+        // and asserted the swapped reading back, so it passed while real clients
+        // were being misparsed. Build the payload the way the wire does.
+        let size: u64 = (5u64 << 32) | 123;
         let mut payload = vec![0x42u8; 16];
-        payload.extend_from_slice(&0u32.to_le_bytes());        // sentinel
-        payload.extend_from_slice(&5u32.to_le_bytes());        // hi
-        payload.extend_from_slice(&123u32.to_le_bytes());      // lo
+        payload.extend_from_slice(&0u32.to_le_bytes()); // large-file sentinel
+        payload.extend_from_slice(&size.to_le_bytes()); // u64 LE, low dword first
         let r = GetSourcesRequest::parse(&payload).unwrap();
-        // Size = (5<<32) | 123 = 5*4G + 123
-        assert_eq!(r.size, Some((5u64 << 32) | 123));
+        assert_eq!(r.size, Some(size));
+    }
+
+    #[test]
+    fn parse_v2_large_six_gib_from_the_report() {
+        // The exact frame from the interop report: 6 GiB, which used to decode
+        // as 9223372036854775809 because the two dwords were swapped.
+        let mut payload = vec![0x33u8; 16];
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // sentinel
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x00]);
+        let r = GetSourcesRequest::parse(&payload).unwrap();
+        assert_eq!(r.size, Some(6_442_450_944));
+    }
+
+    #[test]
+    fn parse_v2_large_straddling_the_4gib_boundary() {
+        for size in [(1u64 << 32) - 1, 1u64 << 32, (1u64 << 32) + 1] {
+            let mut payload = vec![0x11u8; 16];
+            payload.extend_from_slice(&0u32.to_le_bytes());
+            payload.extend_from_slice(&size.to_le_bytes());
+            assert_eq!(
+                GetSourcesRequest::parse(&payload).unwrap().size,
+                Some(size),
+                "size {size} must round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_large_sentinel_without_the_u64_is_not_misread() {
+        // Sentinel present but the u64 truncated: must fall back to "size 0"
+        // rather than reading past the end or inventing a value.
+        let mut payload = vec![0x77u8; 16];
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&[0xFF; 4]); // only half of the u64
+        let r = GetSourcesRequest::parse(&payload).unwrap();
+        assert_eq!(r.size, Some(0));
     }
 
     // A LowID source must be encoded as its server-assigned low id (so the

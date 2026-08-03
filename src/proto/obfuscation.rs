@@ -164,6 +164,19 @@ pub enum CryptState {
 /// Waiting → [parse client DH + generate B] → Negotiating
 /// Negotiating → [decrypt and verify client ack] → Encrypting
 /// ```
+/// Client-side halves of the DH handshake, exported for tests only.
+///
+/// The end-to-end test in `server::obfuscated_conn` needs to act as a real
+/// eMule client over a real socket; without these it could only re-test the
+/// in-memory path this module already covers.
+#[cfg(test)]
+pub(crate) mod test_client {
+    pub use super::{
+        derive_rc4, dh_pow_mod, dh_shared, DH_PRIVATE_SIZE, EM_OBFUSCATE, MAGIC_SYNC,
+        MAGIC_VALUE_REQUESTER, MAGIC_VALUE_SERVER,
+    };
+}
+
 pub struct TcpObfuscation {
     pub state: CryptState,
     send_key: Option<Rc4>,

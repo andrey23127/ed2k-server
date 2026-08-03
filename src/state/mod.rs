@@ -201,6 +201,11 @@ pub struct CsamCatch {
     /// L3. Reviews group by this, so a few dozen causes replace thousands of
     /// individual filenames.
     pub reason: String,
+    /// Size as published. Exported alongside the name because size against
+    /// extension is the single cheapest masquerade test there is — a 690 MB
+    /// ".pdf" needs no further investigation — and doing it by hand for every
+    /// L3 hit with an innocent-looking name is the slowest part of a review.
+    pub size: u64,
     /// When it was caught (drives the review window).
     pub at: std::time::Instant,
 }
@@ -220,6 +225,14 @@ pub struct AliasRecord {
     pub seen: u32,
     /// File size — a `.pdf` of 690 MB is its own red flag.
     pub size: u64,
+    /// When this record was last touched, for TTL eviction.
+    ///
+    /// The table has a size cap but had no expiry, so once it filled it froze:
+    /// every slot held forever, and no newly-observed file could ever be
+    /// admitted. A decoy swarm from months ago would keep the table shut against
+    /// today's. Aging entries out keeps the cap meaning "the most recent 20k
+    /// candidates" rather than "the first 20k ever seen".
+    pub last_seen: Instant,
 }
 
 /// Cap per file. A dozen names is already conclusive; more adds no information.
@@ -276,7 +289,12 @@ pub struct ServerState {
     /// The seed encrypts its responses (0xA1, 0x97) using this value as the
     /// ServerKey. We need it to decrypt those responses in the UDP handler.
     /// Keyed by seed IPv4 address, updated each time we send an OBF ping.
-    pub our_sent_random_parts: DashMap<std::net::Ipv4Addr, u32>,
+    ///
+    /// Value carries the time it was stored so the map can be aged out: it is
+    /// keyed by arbitrary remote addresses and had no eviction, so it grew for
+    /// the life of the process. Expiring an entry costs one extra handshake with
+    /// that peer and nothing else.
+    pub our_sent_random_parts: DashMap<std::net::Ipv4Addr, (u32, Instant)>,
     /// Per-seed ServerKey for outbound obfuscated UDP. A seed tells us the
     /// key to use when talking to it via the ServerKey field of an obfuscated
     /// GLOBSERVSTATRES. Keyed by the seed's IPv4 address. Empty until the
@@ -362,7 +380,11 @@ pub struct ServerState {
     /// keepalive cycle should not inflate the "blocked files" metric — we
     /// count each hash once. This is the metric the operator actually cares
     /// about: how many unique candidate files we kept out of the index.
-    pub csam_blocked_hashes: DashMap<[u8; 16], ()>,
+    /// Value is the time the hash was first blocked, so the set can be aged
+    /// out. It was `()` and nothing ever removed from it: a pure dedup set that
+    /// grew for the lifetime of the process, one entry per distinct blocked file
+    /// ever seen (20k in the first 13 hours of one deployment).
+    pub csam_blocked_hashes: DashMap<[u8; 16], Instant>,
     /// Cache of (key, formula_id) that last successfully decoded an obfuscated
     /// UDP datagram from a given sender. formula_id: 0=Plain, 1=ObfA5, 2=Obf6B.
     /// Massively reduces CPU on the hot path: a busy peer that sends many obf
@@ -391,6 +413,20 @@ pub struct ServerState {
     /// reinstall — a far more stable identifier. Value = ban start time. Checked
     /// at login; a banned user_hash is refused for publisher_blacklist_seconds.
     pub banned_publishers: DashMap<UserHash, std::time::Instant>,
+
+    /// `assigned_id` → `UserHash`, so a client can be found by the id the
+    /// protocol uses without walking `clients`.
+    ///
+    /// Callback and hole-punch are how two LowID peers reach each other at all,
+    /// and both arrive carrying only a target id. They used to resolve it with
+    /// `clients.iter().find(...)` — O(connected clients) per request, and a
+    /// single hole-punch did it twice. At a few thousand clients that is a full
+    /// map walk on a routine control packet.
+    ///
+    /// Maintained ONLY by `register_client` / `unregister_client`, which is what
+    /// keeps it honest — see the note there about why removal must compare the
+    /// user hash before deleting.
+    pub client_id_index: DashMap<u32, UserHash>,
     /// Per-user set of DISTINCT CSAM file hashes seen from that user_hash, kept
     /// across reconnects. We count UNIQUE files, not block events: republishing
     /// the SAME (possibly false-positive) file never advances the count beyond
@@ -493,7 +529,38 @@ impl ServerState {
                 std::sync::atomic::AtomicU64::new(ClientHandle::now_ms()),
             ),
         };
+        self.index_client_id(handle.assigned_id, user_hash);
         self.clients.insert(user_hash, handle);
+    }
+
+    /// Resolve a protocol-level `assigned_id` to the connected client.
+    ///
+    /// O(1) against the id index instead of a walk over `clients`.
+    pub fn client_by_assigned_id(&self, id: u32) -> Option<ClientHandle> {
+        let uh = *self.client_id_index.get(&id)?;
+        self.clients.get(&uh).map(|e| e.clone())
+    }
+
+    /// Publish `id → user_hash`. Call whenever a handle enters `clients`.
+    pub fn index_client_id(&self, id: u32, user_hash: UserHash) {
+        // id 0 is "unassigned" and is never a routable target.
+        if id != 0 {
+            self.client_id_index.insert(id, user_hash);
+        }
+    }
+
+    /// Retract `id → user_hash`, but ONLY if it still points at this user.
+    ///
+    /// The guard matters: HighID clients get `assigned_id` = their IPv4, so two
+    /// clients behind one address — or one client reconnecting before the old
+    /// session's cleanup runs — share an id. Removing unconditionally would let
+    /// a departing session delete the live session's entry and silently break
+    /// callback for it. Compare-then-remove keeps the last writer.
+    pub fn unindex_client_id(&self, id: u32, user_hash: &UserHash) {
+        if id != 0 {
+            self.client_id_index
+                .remove_if(&id, |_, holder| holder == user_hash);
+        }
     }
 
     /// Temporarily ban an IP (flood-bot). Idempotent: re-banning refreshes the
@@ -538,18 +605,22 @@ impl ServerState {
         user_hash: UserHash,
         file_hash: FileHash,
         file_name: &str,
+        file_size: u64,
         layer: crate::filter::Layer,
         reason: &str,
         threshold: u32,
-        ttl: std::time::Duration,
+        count_window: std::time::Duration,
+        retention: std::time::Duration,
     ) -> bool {
         let now = std::time::Instant::now();
         let mut entry = self
             .csam_files_by_user
             .entry(user_hash)
             .or_insert_with(|| (std::collections::HashMap::new(), now));
-        // Restart if the user's record has gone stale (older than ttl).
-        if now.duration_since(entry.1) > ttl {
+        // Restart if the user's record has gone stale (older than the RETENTION
+        // window, not the counting window — the records outlive the count so the
+        // review exports keep their history).
+        if now.duration_since(entry.1) > retention {
             entry.0.clear();
         }
         // Keyed by hash (dedup unchanged); value is the name AND the moment it was
@@ -562,6 +633,7 @@ impl ServerState {
             name: file_name.to_string(),
             layer,
             reason: reason.to_string(),
+            size: file_size,
             at: now,
         });
         entry.1 = now;
@@ -576,7 +648,17 @@ impl ServerState {
         // dropped but never banned, so it reconnected immediately and repeated
         // forever — observed live as three IPs looping every 3-4 seconds,
         // re-publishing the same three hashes and flooding the log.
-        entry.0.len() as u32 > threshold
+        // Count only the files caught inside the counting window. Older entries
+        // stay in the map — /api/review and /api/publishers read them — but a
+        // publisher is judged on recent behaviour, not on everything since the
+        // record was created. When `count_window == retention` this is exactly
+        // the old `entry.0.len()`.
+        let counted = entry
+            .0
+            .values()
+            .filter(|c| now.duration_since(c.at) <= count_window)
+            .count() as u32;
+        counted > threshold
     }
 
     /// Ban a CSAM publisher by user_hash. Idempotent; refreshes ban start time.
@@ -648,6 +730,7 @@ impl ServerState {
             bot_detections: DashMap::new(),
             banned_bots: DashMap::new(),
             banned_publishers: DashMap::new(),
+            client_id_index: DashMap::new(),
             file_aliases: DashMap::new(),
             review_watermark: std::sync::Mutex::new(None),
             csam_files_by_user: DashMap::new(),
@@ -771,8 +854,10 @@ impl ServerState {
             names: vec![std::sync::Arc::clone(stored)],
             seen: 0,
             size,
+            last_seen: Instant::now(),
         });
         e.seen = e.seen.saturating_add(1);
+        e.last_seen = Instant::now();
         if e.names.len() < ALIAS_MAX_NAMES
             && !e.names.iter().any(|n| std::sync::Arc::ptr_eq(n, published_as))
         {
@@ -862,6 +947,7 @@ impl ServerState {
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
+        self.index_client_id(handle.assigned_id, user_hash);
         self.clients.insert(user_hash, handle);
     }
 
@@ -961,14 +1047,24 @@ impl ServerState {
             size_of::<std::collections::HashSet<file_id::FileId>>(),
         );
 
-        // names: interned bytes + one Arc control block per unique name + map slots
+        // names: bytes as stored, plus one Arc control block per LIVE record.
+        //
+        // Counted per record, not per interner entry: since the dedup table was
+        // removed (see state::name_interner) there is one allocation per record,
+        // and the interner holds nothing. Reading len()/capacity() here would
+        // report a flat zero and quietly understate the largest remaining name
+        // cost.
         let mut name_bytes = 0u64;
+        let mut live_names = 0u64;
         for (_src_len, name_len) in self.file_slab.iter_records_for_report() {
             name_bytes += name_len as u64;
+            live_names += 1;
         }
-        let name_arc_ctrl = self.name_interner.len() as u64 * 16;
-        let name_map_slots =
-            self.name_interner.capacity() as u64 * (size_of::<Arc<str>>() as u64 + 1);
+        // Arc<str> control block: two usize counters, plus allocator rounding.
+        let name_arc_ctrl = live_names * 16;
+        // No dedup table any more. Kept as a named zero so the /api/memsize key
+        // stays put for anyone diffing across versions.
+        let name_map_slots = 0u64;
 
         // ── clients ───────────────────────────────────────────────────────────
         // ClientHandle carries three Strings (nick/country/software) whose heap
@@ -1010,7 +1106,7 @@ impl ServerState {
         };
 
         let mut misc = 0u64;
-        misc += dm_slots(self.our_sent_random_parts.capacity(), IPV4, 4);
+        misc += dm_slots(self.our_sent_random_parts.capacity(), IPV4, 4 + INSTANT);
         misc += dm_slots(self.seed_server_keys.capacity(), IPV4, 4);
         misc += dm_slots(self.incoming_seed_challenges.capacity(), IPV4, 4);
         misc += dm_slots(self.observed_udp_ports.capacity(), IPV4, 2 + INSTANT);
@@ -1018,7 +1114,7 @@ impl ServerState {
         misc += dm_slots(self.verified_servers.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.csam_unique_ips.capacity(), IPV4, 8);
-        misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 0);
+        misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 16);
         misc += dm_slots(self.obf_decode_cache.capacity(), IPV4, 5);
         misc += dm_slots(self.banned_bots.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
@@ -1210,6 +1306,100 @@ mod user_files_index_tests {
     fn uhash(n: u8) -> UserHash { [n; 16] }
 
     #[test]
+    fn only_files_inside_the_counting_window_count() {
+        use std::time::Duration;
+        let s = build_state();
+        let retention = Duration::from_secs(3600);
+
+        // Counting window of zero: every record is already outside it, so no
+        // number of distinct files can ban. This is the degenerate end of the
+        // split — the ban decision looks only at recent behaviour.
+        let u = uhash(9);
+        for i in 0..10u8 {
+            let banned = s.record_csam_file_for_user(
+                u, fhash(i), "test.mp4", 1024,
+                crate::filter::Layer::L1Jargon, "t", 3,
+                Duration::from_secs(0), retention,
+            );
+            assert!(!banned, "nothing may count when the counting window is zero");
+        }
+        // The records are still THERE — retention is a separate window and the
+        // review exports read these same records. Only the COUNT is windowed.
+        assert_eq!(s.csam_files_by_user.get(&u).map(|e| e.0.len()), Some(10));
+
+        // With a live window the same records count, and the 4th distinct file
+        // trips a threshold of 3 exactly as before the split.
+        let v = uhash(8);
+        for i in 0..3u8 {
+            assert!(!s.record_csam_file_for_user(
+                v, fhash(i), "test.mp4", 1024,
+                crate::filter::Layer::L1Jargon, "t", 3, retention, retention,
+            ));
+        }
+        assert!(s.record_csam_file_for_user(
+            v, fhash(3), "test.mp4", 1024,
+            crate::filter::Layer::L1Jargon, "t", 3, retention, retention,
+        ));
+    }
+
+    #[test]
+    fn alias_records_carry_a_timestamp_for_eviction() {
+        // The table is size-capped but used to have no expiry, so once full it
+        // froze — no newly-observed file could ever be admitted again. The
+        // periodic cleanup ages entries out; this checks the stamp it reads is
+        // actually maintained, including on update rather than only on insert.
+        let s = build_state();
+        let h = fhash(1);
+        let a: std::sync::Arc<str> = std::sync::Arc::from("Some Movie 2019.avi");
+        let b: std::sync::Arc<str> = std::sync::Arc::from("Totally Different Thing.rar");
+        s.note_alias(h, 50 * 1024 * 1024, &a, &b);
+        let first = s.file_aliases.get(&h).map(|e| e.last_seen);
+        assert!(first.is_some(), "divergent names must be tracked");
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.note_alias(h, 50 * 1024 * 1024, &a, &b);
+        let second = s.file_aliases.get(&h).map(|e| e.last_seen).unwrap();
+        assert!(second > first.unwrap(), "an update must refresh last_seen");
+    }
+
+    #[test]
+    fn client_id_index_survives_a_reconnect_on_the_same_id() {
+        // HighID clients get assigned_id = their IPv4, so an id is NOT unique
+        // over time: a reconnect from the same address claims the same id while
+        // the previous session's cleanup may not have run yet.
+        let s = build_state();
+        let old_u = uhash(1);
+        let new_u = uhash(2);
+        let id = 0x0A00_0001u32;
+
+        s.index_client_id(id, old_u);
+        assert_eq!(s.client_id_index.get(&id).map(|v| *v), Some(old_u));
+
+        // New session claims the id.
+        s.index_client_id(id, new_u);
+        assert_eq!(s.client_id_index.get(&id).map(|v| *v), Some(new_u));
+
+        // The OLD session now cleans up. It must not delete the live mapping —
+        // an unconditional remove here would silently break callback and
+        // hole-punch for the client that is actually connected.
+        s.unindex_client_id(id, &old_u);
+        assert_eq!(s.client_id_index.get(&id).map(|v| *v), Some(new_u));
+
+        // The live session's own cleanup does retract it.
+        s.unindex_client_id(id, &new_u);
+        assert!(s.client_id_index.get(&id).is_none());
+    }
+
+    #[test]
+    fn client_id_zero_is_never_indexed() {
+        // 0 means "unassigned" and is not a routable target; indexing it would
+        // collide every client that has not been given an id yet.
+        let s = build_state();
+        s.index_client_id(0, uhash(3));
+        assert!(s.client_id_index.is_empty());
+    }
+
+    #[test]
     fn publisher_ban_triggers_above_threshold_not_at() {
         use std::time::Duration;
         let s = build_state();
@@ -1217,12 +1407,12 @@ mod user_files_index_tests {
         let ttl = Duration::from_secs(3600);
         // threshold = 3 = MAX tolerated distinct files. Files 1-3 are filtered
         // but must NOT ban (headroom for false positives).
-        assert!(!s.record_csam_file_for_user(u, fhash(10), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "1st file");
-        assert!(!s.record_csam_file_for_user(u, fhash(11), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "2nd file");
-        assert!(!s.record_csam_file_for_user(u, fhash(12), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "3rd file (at threshold)");
+        assert!(!s.record_csam_file_for_user(u, fhash(10), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "1st file");
+        assert!(!s.record_csam_file_for_user(u, fhash(11), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "2nd file");
+        assert!(!s.record_csam_file_for_user(u, fhash(12), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "3rd file (at threshold)");
         assert!(!s.is_publisher_banned(&u, ttl), "not banned at threshold");
         // The 4th DISTINCT file EXCEEDS the threshold → ban.
-        assert!(s.record_csam_file_for_user(u, fhash(13), "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl), "4th distinct file");
+        assert!(s.record_csam_file_for_user(u, fhash(13), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "4th distinct file");
         s.ban_publisher(u);
         assert!(s.is_publisher_banned(&u, ttl), "banned above threshold");
     }
@@ -1241,7 +1431,7 @@ mod user_files_index_tests {
         let fp_file = fhash(99);
         for _ in 0..50 {
             assert!(
-                !s.record_csam_file_for_user(u, fp_file, "test.mp4", crate::filter::Layer::L4Extra, "t", 3, ttl),
+                !s.record_csam_file_for_user(u, fp_file, "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl),
                 "republishing the same file must never reach the threshold"
             );
         }

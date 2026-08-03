@@ -106,14 +106,13 @@ pub fn handle_holepunch_request(
         return Some(FAIL_BAD_REQUEST);
     }
 
-    // Look up the target by assigned server ID. We copy out the few fields we
-    // need and DROP the DashMap guard immediately: holding an iterator guard
-    // while calling state.clients.get(requester) below could deadlock if the two
-    // keys land on the same shard. So extract-then-drop.
+    // Look up the target by assigned server ID — O(1) through the id index
+    // rather than a walk over every connected client. We copy out the few fields
+    // we need and DROP the guard immediately: holding a `clients` guard while
+    // calling state.clients.get(requester) below could deadlock if the two keys
+    // land on the same shard. So extract-then-drop.
     let target_data = state
-        .clients
-        .iter()
-        .find(|e| e.assigned_id == target_id)
+        .client_by_assigned_id(target_id)
         .map(|t| (t.ip, t.port, t.udp_port, t.user_hash, t.is_high_id, t.is_alive()));
 
     let Some((t_ip, t_tcp, t_udp, t_hash, t_high, t_alive)) = target_data else {
@@ -177,9 +176,15 @@ pub fn handle_holepunch_request(
         if requester_is_initiator { 1 } else { 0 },
     );
 
-    // Both lookups below take fresh short-lived guards (the target iterator
-    // guard was already dropped above), so there is no cross-shard deadlock.
-    if let Some(target) = state.clients.iter().find(|e| e.assigned_id == target_id) {
+    // Both lookups below take fresh short-lived guards (the earlier target guard
+    // was already dropped above), so there is no cross-shard deadlock.
+    //
+    // Resolve by user hash, not by id: the id was already resolved once at the
+    // top of this function, and re-resolving could pick up a DIFFERENT client if
+    // a reconnect claimed the id in between — HighID ids are IPv4 addresses and
+    // are not unique over time. The hash identifies the client we actually
+    // validated, so the frame cannot be delivered to a stranger.
+    if let Some(target) = state.clients.get(&t_hash) {
         target.send_frame(to_target);
     }
     if let Some(me) = state.clients.get(requester_user_hash) {

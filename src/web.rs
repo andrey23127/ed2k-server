@@ -35,6 +35,62 @@ use tracing::{info, warn};
 use crate::config::Config;
 use crate::state::ServerState;
 
+// ── Review helpers ───────────────────────────────────────────────────────────
+//
+// Shared by the alias table and the /api/review export so both apply the same
+// thresholds. Kept at module scope (rather than nested in the handler) for that
+// reason, and placed here so they do not sit between a handler's doc comment and
+// the handler itself.
+
+/// Words of a filename long enough to identify its subject. Short tokens
+/// ("the", "2010", "avi") are shared by unrelated files and would hide the
+/// signal.
+fn name_tokens(name: &str) -> std::collections::HashSet<String> {
+    name.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 4)
+        .map(|w| w.to_string())
+        .collect()
+}
+
+/// How many of `names` share NO significant word with the first one.
+///
+/// This is what separates the two reasons a file carries several names. A
+/// release renamed by different users keeps its subject: "American Beauty (Sam
+/// Mendes, 1999).mkv" and "American.Beauty.1999.BDrip.mkv" still share
+/// "american"/"beauty"/"1999". A decoy does not — one 698 MB file was published
+/// as "Magma Tittenshow", "Marc Dorcel 6 Bourgeoises" AND "Joe Cocker -
+/// Discography.rar", which have nothing in common.
+///
+/// Generic over the string type so it serves both the alias table (which holds
+/// interned `Arc<str>`) and the review export (plain `String`).
+fn unrelated_name_count<S: AsRef<str>>(names: &[S]) -> usize {
+    let Some(first) = names.first() else { return 0 };
+    let base = name_tokens(first.as_ref());
+    names
+        .iter()
+        .skip(1)
+        .filter(|n| name_tokens(n.as_ref()).is_disjoint(&base))
+        .count()
+}
+
+/// True when a filename's extension cannot plausibly hold a file this large:
+/// a 690 MB ".pdf" is a masquerade, no further investigation needed.
+///
+/// This is the cheapest signal a reviewer has for telling a genuinely
+/// mis-blocklisted file apart from known material republished under an innocent
+/// name, and doing it by hand is the slowest part of a review. Shared by the
+/// alias table and the CSV export so both agree on the threshold.
+fn size_contradicts_extension(name: &str, size: u64) -> bool {
+    const DOC_LIKE: &[&str] = &[
+        ".pdf", ".txt", ".doc", ".docx", ".epub", ".djvu", ".chm", ".mobi",
+        ".jpg", ".jpeg", ".png", ".gif",
+    ];
+    let l = name.to_ascii_lowercase();
+    DOC_LIKE.iter().any(|e| l.ends_with(e)) && size > 50 * 1024 * 1024
+}
+
+
 /// Live-collected counters wired into hot paths. Atomic so they can be
 /// touched from any task without locks. The web handler just reads them.
 #[derive(Default)]
@@ -659,9 +715,14 @@ struct BlockStatRow {
 /// to 24h on the first call. `?hours=N` overrides, `?all=1` ignores the window,
 /// `?peek=1` reports without advancing the watermark.
 ///
-/// `?format=csv` dumps every entry as `hash;layer;reason;name` with no example
-/// caps — that is the machine-readable side, used to turn per-cause verdicts into
-/// blocklist/whitelist hash files.
+/// `?format=csv` dumps every entry with no example caps — that is the
+/// machine-readable side, used to turn per-cause verdicts into blocklist /
+/// whitelist / poison hash files. Columns:
+/// `hash;layer;reason;size;sizeflag;names;unrelated;name`, where `sizeflag` is
+/// "!" when the extension cannot hold a file that large, `names` counts the
+/// distinct names the hash was offered under, and `unrelated` how many of those
+/// share no significant word with the first. `name` is last because it is the
+/// only field that can contain arbitrary bytes.
 async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl IntoResponse {
     let qs = uri.query().unwrap_or("");
     let param = |key: &str| -> Option<&str> {
@@ -701,8 +762,16 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
 
     // Collect, de-duplicated by file hash: the same file caught from several
     // publishers is ONE decision to review.
-    let mut by_hash: std::collections::HashMap<[u8; 16], crate::state::CsamCatch> =
-        std::collections::HashMap::new();
+    // Value is the first catch PLUS every distinct name the hash was offered
+    // under. The names were always there — one record per publisher — and were
+    // being thrown away by keeping only the first. Collecting them costs nothing
+    // on the publish path and is the only view of decoys we can have: a blocked
+    // file never reaches `add_file_with_source`, so the alias table is
+    // structurally blind to exactly the hashes under review here.
+    let mut by_hash: std::collections::HashMap<
+        [u8; 16],
+        (crate::state::CsamCatch, Vec<String>),
+    > = std::collections::HashMap::new();
     for e in s.server.csam_files_by_user.iter() {
         for (h, c) in e.value().0.iter() {
             if let Some(cutoff) = since {
@@ -710,20 +779,36 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
                     continue;
                 }
             }
-            by_hash.entry(*h).or_insert_with(|| c.clone());
+            let slot = by_hash
+                .entry(*h)
+                .or_insert_with(|| (c.clone(), Vec::new()));
+            if !slot.1.iter().any(|n| n == &c.name) {
+                slot.1.push(c.name.clone());
+            }
         }
     }
 
     if csv {
-        let mut out = String::from("hash;layer;reason;name\n");
-        for (h, c) in &by_hash {
+        // `size` and `sizeflag` exist so the masquerade test can be done by
+        // sorting a column instead of opening each file in a client. `sizeflag`
+        // is "!" when the extension cannot hold a file that large. `name` stays
+        // LAST: it is the only field that can contain arbitrary bytes, so a
+        // stray separator can never shift another column.
+        let mut out =
+            String::from("hash;layer;reason;size;sizeflag;names;unrelated;name\n");
+        for (h, (c, names)) in &by_hash {
             // ';' cannot appear in the fields we emit except possibly the name.
             let name = c.name.replace(';', ",");
+            let flag = if size_contradicts_extension(&c.name, c.size) { "!" } else { "" };
             out.push_str(&format!(
-                "{};{:?};{};{}\n",
+                "{};{:?};{};{};{};{};{};{}\n",
                 hex::encode(h),
                 c.layer,
                 c.reason,
+                c.size,
+                flag,
+                names.len(),
+                unrelated_name_count(names),
                 name
             ));
         }
@@ -736,18 +821,26 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     }
 
     // Group by (layer, reason). L3 is tallied separately.
-    let mut groups: std::collections::HashMap<(String, String), Vec<([u8; 16], String)>> =
+    let mut groups: std::collections::HashMap<(String, String), Vec<([u8; 16], String, u64)>> =
         std::collections::HashMap::new();
     let mut l3_count = 0usize;
-    for (h, c) in &by_hash {
+    // Blocklisted hashes that look like decoys rather than material: several
+    // names with nothing in common, or a size the extension cannot hold. These
+    // are the candidates to MOVE from the CSAM list to the poisoned-index list.
+    let mut decoys: Vec<([u8; 16], String, u64, usize, usize)> = Vec::new();
+    for (h, (c, names)) in &by_hash {
         if c.layer == crate::filter::Layer::L3HashBlock {
             l3_count += 1;
+            let unrelated = unrelated_name_count(names);
+            if unrelated > 0 || size_contradicts_extension(&c.name, c.size) {
+                decoys.push((*h, c.name.clone(), c.size, names.len(), unrelated));
+            }
             continue;
         }
         groups
             .entry((format!("{:?}", c.layer), c.reason.clone()))
             .or_default()
-            .push((*h, c.name.clone()));
+            .push((*h, c.name.clone(), c.size));
     }
 
     let mut keys: Vec<_> = groups.keys().cloned().collect();
@@ -767,7 +860,8 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     ));
     out.push_str(&format!(
         "# causes to review: {} (verdict per cause applies to all its files)\n\
-         # names truncated to 120 chars; up to {} examples per cause\n\n",
+         # names truncated to 120 chars; up to {} examples per cause\n\
+         # per file: size in MB, then [!] if the extension cannot hold that size\n\n",
         keys.len(),
         max_examples
     ));
@@ -775,12 +869,62 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     for k in keys {
         let items = &groups[&k];
         out.push_str(&format!("=== {} | {} | {} files ===\n", k.0, k.1, items.len()));
-        for (h, name) in items.iter().take(max_examples) {
+        for (h, name, size) in items.iter().take(max_examples) {
             let short: String = name.chars().take(120).collect();
-            out.push_str(&format!("{} {}\n", &hex::encode(h)[..8], short));
+            // Size inline, and "[!]" when the extension cannot hold it. A cause
+            // whose files are all the same implausible size is a decoy swarm, not
+            // a filter question — visible at a glance, without opening the CSV.
+            let flag = if size_contradicts_extension(name, *size) { " [!]" } else { "" };
+            out.push_str(&format!(
+                "{} {:>6} MB{} {}\n",
+                &hex::encode(h)[..8],
+                *size / 1048576,
+                flag,
+                short
+            ));
         }
         if items.len() > max_examples {
             out.push_str(&format!("... +{} more\n", items.len() - max_examples));
+        }
+        out.push('\n');
+    }
+
+    // ── Blocklisted hashes that look like decoys ─────────────────────────
+    //
+    // The hash blocklist accumulates by hand, and a decoy caught once under a
+    // CSAM-flavoured name ends up in it permanently. From then on it is blocked
+    // as CSAM under every innocent name it also carries, and — worse — every
+    // ordinary user who downloaded the decoy is counted toward a publisher ban.
+    //
+    // The two tells here are the ones a human uses: names that share no word,
+    // and a size the extension cannot hold. Neither is a verdict. Both are
+    // reasons to look, and a confirmed decoy belongs in the poisoned-index list,
+    // where it is still blocked but no longer accuses anyone.
+    if !decoys.is_empty() {
+        decoys.sort_by_key(|d| std::cmp::Reverse((d.4, d.3)));
+        out.push_str(&format!(
+            "=== BLOCKLISTED HASHES THAT LOOK LIKE DECOYS ({} of {} L3 hits) ===\n\
+             # Candidates to MOVE from hash_banlist.txt to hash_filter.txt.\n\
+             # Verify before moving: a real file republished under a cover name\n\
+             # produces the same signature.\n\n",
+            decoys.len(),
+            l3_count
+        ));
+        for (h, name, size, total, unrelated) in decoys.iter().take(60) {
+            let short: String = name.chars().take(120).collect();
+            let flag = if size_contradicts_extension(name, *size) { " [!]" } else { "" };
+            out.push_str(&format!(
+                "{} {} names ({} unrelated), {} MB{}\n    {}\n",
+                hex::encode(h),
+                total,
+                unrelated,
+                size / 1048576,
+                flag,
+                short
+            ));
+        }
+        if decoys.len() > 60 {
+            out.push_str(&format!("... +{} more\n", decoys.len() - 60));
         }
         out.push('\n');
     }
@@ -802,30 +946,13 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     //
     // Computed here rather than on the publish path — it only runs over the
     // tracked set when a report is requested.
-    fn tokens(name: &str) -> std::collections::HashSet<String> {
-        name.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| w.len() >= 4)
-            .map(|w| w.to_string())
-            .collect()
-    }
-    fn unrelated_count(names: &[std::sync::Arc<str>]) -> usize {
-        let Some(first) = names.first() else { return 0 };
-        let base = tokens(first);
-        names
-            .iter()
-            .skip(1)
-            .filter(|n| tokens(n).is_disjoint(&base))
-            .count()
-    }
-
     let mut aliases: Vec<_> = s
         .server
         .file_aliases
         .iter()
         .map(|e| {
             let a = e.value().clone();
-            let unrelated = unrelated_count(&a.names);
+            let unrelated = unrelated_name_count(&a.names);
             (*e.key(), a, unrelated)
         })
         .collect();
@@ -839,24 +966,34 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
              # under two names sharing NO word: a renamed release keeps its subject,\n\
              # a masqueraded file does not. Sorted by how many names are unrelated\n\
              # to the first. [!] marks a size that contradicts the extension (a\n\
-             # 690 MB \"PDF\"). Files under 10 MB are not tracked.\n\n",
+             # 690 MB \"PDF\"). Size is given in exact bytes as well as MB — the\n\
+             # rounded figure hides which files came from one generator; see the\n\
+             # size-collision section that follows. Files under 10 MB are not\n\
+             # tracked.\n\n",
             aliases.len()
         ));
         for (h, a, unrelated) in aliases.iter().take(60) {
             // A document/image extension on a huge file is its own red flag.
-            let doclike = a.names.iter().any(|n| {
-                let l = n.to_ascii_lowercase();
-                [".pdf", ".txt", ".doc", ".epub", ".jpg", ".jpeg", ".png", ".gif"]
-                    .iter()
-                    .any(|e| l.ends_with(e))
-            });
-            let flag = if doclike && a.size > 50 * 1024 * 1024 { " [!]" } else { "" };
+            let flag = if a
+                .names
+                .iter()
+                .any(|n| size_contradicts_extension(n, a.size))
+            {
+                " [!]"
+            } else {
+                ""
+            };
+            // Exact byte count alongside the rounded MB. Rounding is what hides
+            // the campaign signal: nine entries all printing "700 MB" may be
+            // nine different files or one generator's output, and only the exact
+            // figure tells them apart. See the size-collision section below.
             out.push_str(&format!(
-                "{} {} names ({} unrelated), {:.0} MB{}\n",
+                "{} {} names ({} unrelated), {:.0} MB / {} B{}\n",
                 hex::encode(h),
                 a.names.len(),
                 unrelated,
                 a.size as f64 / 1048576.0,
+                a.size,
                 flag
             ));
             for n in a.names.iter().take(6) {
@@ -867,6 +1004,72 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
                 out.push_str(&format!("    ... +{} more\n", a.names.len() - 6));
             }
             out.push('\n');
+        }
+
+        // ── Distinct hashes of the SAME EXACT size ───────────────────────
+        //
+        // A decoy generator pads its output to a fixed target, so one campaign
+        // produces many different hashes that are byte-for-byte the same length.
+        // Genuine files do not collide that way: two unrelated rips landing on
+        // the same byte count is a coincidence, a dozen of them is not.
+        //
+        // This is the discriminator that a SIZE BAND is not. Roughly 40% of the
+        // tracked set sits between 680 and 714 MB, but that is just the CD era —
+        // a real 700 MB rip is the most ordinary object on this network, so a
+        // band flags mostly honest files. Exact equality does not.
+        //
+        // Grouping runs over every tracked alias, not the 60 printed above:
+        // members of a campaign are individually unremarkable and would rank
+        // nowhere near the top by unrelated-name count.
+        let mut by_size: std::collections::HashMap<u64, Vec<([u8; 16], usize, usize)>> =
+            std::collections::HashMap::new();
+        for (h, a, unrelated) in &aliases {
+            by_size
+                .entry(a.size)
+                .or_default()
+                .push((*h, a.names.len(), *unrelated));
+        }
+        let mut campaigns: Vec<(u64, Vec<([u8; 16], usize, usize)>)> =
+            by_size.into_iter().filter(|(_, v)| v.len() >= 2).collect();
+        // Biggest cluster first — that is the one worth a bulk decision.
+        campaigns.sort_by_key(|(size, v)| (std::cmp::Reverse(v.len()), std::cmp::Reverse(*size)));
+
+        if !campaigns.is_empty() {
+            let total: usize = campaigns.iter().map(|(_, v)| v.len()).sum();
+            out.push_str(&format!(
+                "=== SIZE COLLISIONS AMONG TRACKED FILES ({} hashes in {} groups) ===\n\
+                 # Distinct hashes with an IDENTICAL byte count, each already\n\
+                 # carrying unrelated names. That combination is a decoy campaign:\n\
+                 # one generator, one padded target size, many fake hashes.\n\
+                 # A whole group is normally one decision — candidates for the\n\
+                 # poisoned-index list, NOT for the CSAM hash list.\n\
+                 # Two members is weak evidence; ten is not. Judge by group size.\n\n",
+                total,
+                campaigns.len()
+            ));
+            for (size, members) in campaigns.iter().take(20) {
+                out.push_str(&format!(
+                    "--- {} B ({:.1} MB) — {} hashes ---\n",
+                    size,
+                    *size as f64 / 1048576.0,
+                    members.len()
+                ));
+                for (h, names, unrelated) in members.iter().take(12) {
+                    out.push_str(&format!(
+                        "    {} {} names ({} unrelated)\n",
+                        hex::encode(h),
+                        names,
+                        unrelated
+                    ));
+                }
+                if members.len() > 12 {
+                    out.push_str(&format!("    ... +{} more\n", members.len() - 12));
+                }
+                out.push('\n');
+            }
+            if campaigns.len() > 20 {
+                out.push_str(&format!("... +{} more groups\n\n", campaigns.len() - 20));
+            }
         }
     }
 
@@ -957,11 +1160,17 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
 
     let cf = &s.config.content_filter;
     let blocklist_total = s.server.filter.blocklist_size() as u64;
-    for (i, p) in cf.hash_blocklists.iter().enumerate() {
+    for (i, p) in cf.hash_banlist.iter().enumerate() {
         // The loader merges every blocklist into one set, so the count is
         // reported once (on the first file) rather than duplicated per file.
         let n = if i == 0 { Some(blocklist_total) } else { None };
         push_file("hash blocklist (L3)", p, n, &mut files);
+    }
+    let filter_total = s.server.filter.hash_filter_size() as u64;
+    for (i, p) in cf.hash_filter.iter().enumerate() {
+        // Same merge-into-one-set reporting as the blocklist above.
+        let n = if i == 0 { Some(filter_total) } else { None };
+        push_file("filter list (L5)", p, n, &mut files);
     }
     if let Some(p) = &cf.extra_terms_file {
         push_file("extra terms (L4)", p, Some(s.server.filter.extra_terms_count() as u64), &mut files);
@@ -1152,6 +1361,8 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
             "keyword_pending_removal_keys": s.server.keyword_index.tier_sizes().2,
             "alias_tracked_files": s.server.file_aliases.len(),
             "keyword_postings": s.server.keyword_index.posting_stats().1,
+            // Always 0 since the dedup table was removed; kept so the JSON
+            // shape does not change under a monitoring script.
             "unique_names": s.server.name_interner.len(),
             "clients": s.server.clients.len(),
             "user_files_users": s.server.user_files.len(),

@@ -30,13 +30,28 @@ impl LoginRequest {
         user_hash.copy_from_slice(&payload[0..16]);
         let claimed_id = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
         let port = u16::from_le_bytes([payload[20], payload[21]]);
-        let tag_count = if payload.len() >= 26 {
-            u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]])
+        // Tag count and the tag area are read together, or not at all.
+        //
+        // These used to be separate: the count was guarded by `len() >= 26`, the
+        // slice `&payload[26..]` was not. A payload of 22..=25 bytes therefore
+        // passed the `< 22` check, took the `else { 0 }` branch — which exists
+        // precisely for that length — and then panicked on the slice. Remotely
+        // reachable by an unauthenticated peer on its first message, since
+        // connection.rs calls this straight off the wire.
+        //
+        // 22 bytes is a legitimate minimum: user_hash(16) + id(4) + port(2) with
+        // no tag section at all. Stock eMule always sends the count (see
+        // ServerConnect.cpp, which writes 4 tags unconditionally), but a leaner
+        // client may not, and either way a short frame must be answered with an
+        // error rather than a panic.
+        let (tag_count, mut slice): (u32, &[u8]) = if payload.len() >= 26 {
+            (
+                u32::from_le_bytes([payload[22], payload[23], payload[24], payload[25]]),
+                &payload[26..],
+            )
         } else {
-            0
+            (0, &[])
         };
-
-        let mut slice = &payload[26..];
         // read_tag_list stops gracefully on unknown types, never panics.
         let tags = read_tag_list(&mut slice, tag_count);
 
@@ -422,4 +437,68 @@ pub async fn handle_login(
     debug!(?req.tags, "login tags");
 
     handle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// user_hash(16) + claimed_id(4) + port(2) = the shortest legitimate login.
+    fn head() -> Vec<u8> {
+        let mut v = vec![0xAAu8; 16];
+        v.extend_from_slice(&0u32.to_le_bytes()); // claimed id
+        v.extend_from_slice(&4662u16.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn login_boundary_lengths_never_panic() {
+        // The reported bug: 22..=25 bytes passed the `< 22` guard, took the
+        // no-tags branch, then panicked slicing `&payload[26..]`. Unauthenticated
+        // and reachable on a client's first message.
+        for extra in 0..4usize {
+            let mut p = head();
+            p.extend(std::iter::repeat(0u8).take(extra));
+            assert_eq!(p.len(), 22 + extra);
+            let r = LoginRequest::parse(&p).expect("22..=25 bytes must parse, not panic");
+            assert_eq!(r.port, 4662);
+            assert!(r.tags.is_empty(), "no tag section at this length");
+        }
+    }
+
+    #[test]
+    fn login_too_short_is_an_error_not_a_panic() {
+        for len in 0..22usize {
+            let p = vec![0u8; len];
+            assert!(
+                LoginRequest::parse(&p).is_err(),
+                "{len} bytes is below the minimum and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn login_with_tags_still_parses() {
+        // 26 bytes and up: the normal path stock eMule takes — ServerConnect.cpp
+        // always writes a tag count, so a real client is never in the short case.
+        let mut p = head();
+        p.extend_from_slice(&0u32.to_le_bytes()); // tag_count = 0
+        assert_eq!(p.len(), 26);
+        let r = LoginRequest::parse(&p).expect("26 bytes with zero tags");
+        assert!(r.tags.is_empty());
+        assert_eq!(r.claimed_id, 0);
+    }
+
+    #[test]
+    fn declared_tag_count_beyond_the_buffer_is_survivable() {
+        // This test found a worse bug than the one it was written for:
+        // read_tag_list pre-allocated from the wire-supplied count, so this
+        // frame asked the allocator for ~240 GB and ABORTED THE PROCESS. Fixed
+        // in proto::tags; kept here because login is the reachable path — an
+        // unauthenticated peer's first message.
+        let mut p = head();
+        p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let r = LoginRequest::parse(&p).expect("must not panic on a lying tag count");
+        assert!(r.tags.is_empty());
+    }
 }

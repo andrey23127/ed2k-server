@@ -1,0 +1,30 @@
+# Layer 5 — filter-only hash list (EXAMPLE; copy to hash_filter.txt).
+#
+# One eD2k hash (32 hex chars) per line. A ';' starts an inline comment, so the
+# name that justified the entry can be kept next to it — do that, it is the only
+# record of why the hash is here.
+#
+# WHAT BELONGS HERE
+#   Decoys. One hash advertised under many unrelated names: a 700 MB file that
+#   claims at once to be a Beatles compilation, Pulp Fiction and an Office
+#   installer. Such a file is junk and must not enter the index.
+#
+# WHAT DOES NOT
+#   Child sexual abuse material. That goes in the file named by
+#   `content_filter.hash_blocklists` and nowhere else.
+#
+# WHY THE LISTS ARE SEPARATE
+#   A hash here is blocked but carries NO accusation: it does not raise the
+#   publisher's csam_attempts and does not count toward
+#   publisher_attempt_disconnect_threshold. Someone offering a decoy downloaded
+#   it like anyone else, and someone sharing a film is not a criminal.
+#
+#   Keeping such hashes in the ban list did two kinds of damage — it pushed
+#   ordinary users toward a ban, and it diluted a list whose whole value is that
+#   every entry means one specific thing. The ban list gets shared with other
+#   operators, with its provenance stated; this one should not be.
+#
+# Hot-reloaded within ~30 s of an mtime change. Copy with `cp` and NOT `cp -p`,
+# or the mtime does not change and nothing reloads.
+#
+# 0123456789abcdef0123456789abcdef ; 700 MB, 12 names, "Ben E. King - Stand By Me.mp3" + 11 unrelated

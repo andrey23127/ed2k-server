@@ -18,6 +18,21 @@ use tracing::{debug, info};
 /// Maximum results per response (SPEC.md §3.4.1, default 200).
 const MAX_RESULTS: usize = 200;
 
+/// Upper bound on records examined by a search with no indexable token.
+///
+/// Such a query ("*", or metadata-only like Type=Video plus a size range) has no
+/// keyword posting to narrow it, so the only way to answer it exactly is to walk
+/// every live file — O(live files) with a shard read lock held, blocking
+/// publishes into the shard being walked. At the target scale that is tens of
+/// millions of records, and any client can ask for it repeatedly: a one-token
+/// query whose token happens to miss the index takes the same path.
+///
+/// 50k is far more than a client can use (MAX_RESULTS is 200) and small enough
+/// that a walk stays in the millisecond range. Past the cap the answer is
+/// best-effort — the right trade, since a metadata-only query has no precise
+/// answer worth protecting, while a stalled server affects every user.
+const MAX_UNINDEXED_SCAN: usize = 50_000;
+
 /// Decoded search request.
 pub struct SearchRequest {
     pub tree: SearchNode,
@@ -50,57 +65,108 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
     // Candidates: keyword lookup if we have tokens, otherwise full scan
     // (handles "*" search and metadata-only queries like Type=Video + size).
     //
-    // IMPORTANT: when there are no keyword tokens, we must scan the ENTIRE
-    // index and apply the tree predicates to every file, THEN limit to
-    // MAX_RESULTS. Doing `.take(MAX_RESULTS)` on the raw DashMap iterator
-    // before filtering is a bug: DashMap iteration order is arbitrary and
-    // unstable, so we'd test a random 200 files and a metadata query
+    // IMPORTANT: with no keyword token the tree predicate must be applied
+    // BEFORE the MAX_RESULTS cap. Taking the first 200 records and filtering
+    // afterwards is a bug: iteration order is arbitrary, so a metadata query
     // (Type=Video, size range, no filename) would return a different,
-    // mostly-tiny result set every time.
+    // mostly-tiny result set every time. The walk is bounded by
+    // MAX_UNINDEXED_SCAN instead, which caps the WORK rather than the input to
+    // the predicate.
     let keyword_filtered = !token_lower.is_empty();
-    let candidates: Vec<[u8; 16]> = if keyword_filtered {
-        // keyword_index returns compact FileIds; resolve each to its hash via
-        // the slab so the rest of the scan (which keys `files` on hash) is
-        // unchanged. A FileId that has been tombstoned resolves to None and is
-        // dropped — it can't be a live match anyway.
-        state
-            .keyword_index
-            .find_intersection(&token_lower)
-            .into_iter()
-            .filter_map(|fid| state.file_slab.hash_of(fid))
-            .collect()
-    } else {
-        // Full scan — every live file hash. Filtering happens in the loop below;
-        // the MAX_RESULTS cap is applied AFTER the tree predicate.
-        let mut all = Vec::new();
-        state.file_slab.for_each_live(|_id, r| all.push(r.hash));
-        all
-    };
 
     // Walk candidates and apply the full tree (handles negation, numeric, meta).
+    //
+    // Candidates stay as FileIds. They used to be converted to hashes and looked
+    // up again by hash, which cost two extra shard locks and a hash-chain walk
+    // per candidate to arrive back at the id we already had.
+    //
+    // The predicate is evaluated IN PLACE via `with_record`, and only a match is
+    // cloned. Cloning first and filtering second paid for a full `FileRecord`
+    // copy — sources SmallVec plus an Arc bump — on every candidate, when a busy
+    // query examines thousands and keeps at most MAX_RESULTS.
     let mut matches: Vec<crate::state::file_id::FileRecord> = Vec::new();
-    let n_candidates = candidates.len();
+    let mut n_candidates = 0usize;
     let mut scanned = 0usize;
-    for hash in candidates {
-        if let Some(entry) = state.file_slab.get_by_hash(&hash) {
-            scanned += 1;
-            // Skip orphans (no live source). These exist transiently when a
-            // source removal races a concurrent re-publish, until the periodic
-            // cleanup evicts them (or a client republishes). They're useless to
-            // return — clients can't download from a file with no sources, which
-            // is also why such entries would show "0% (0)" in the eMule
-            // complete-sources column.
-            if entry.sources.is_empty() {
-                continue;
-            }
-            let name_lower = entry.name.to_lowercase();
-            if evaluate(&req.tree, &name_lower, entry.size) {
-                matches.push(entry);
-                if matches.len() >= MAX_RESULTS {
-                    break;
-                }
+    let mut scan_capped = false;
+
+    // Test one candidate. Returns false once enough matches are collected.
+    // Shared by both paths below so they cannot drift apart.
+    let mut consider = |entry: &crate::state::file_id::FileRecord,
+                        matches: &mut Vec<crate::state::file_id::FileRecord>| -> bool {
+        scanned += 1;
+        // Hash lists apply to what is SERVED, not only to what is published.
+        // Adding a hash stops re-indexing, but a copy already in the index keeps
+        // being handed out — for a live file, forever, since its sources keep
+        // refreshing it. Checking here is what makes a takedown or a decoy
+        // vanish from results within one hot-reload cycle instead of requiring a
+        // restart that drops every connected user.
+        if state.filter.hash_is_listed(&entry.hash) {
+            return true;
+        }
+        // Skip orphans (no live source). These exist transiently when a source
+        // removal races a concurrent re-publish, until the periodic cleanup
+        // evicts them (or a client republishes). They're useless to return —
+        // clients can't download from a file with no sources, which is also why
+        // such entries would show "0% (0)" in the eMule complete-sources column.
+        if entry.sources.is_empty() {
+            return true;
+        }
+        let name_lower = entry.name.to_lowercase();
+        if evaluate(&req.tree, &name_lower, entry.size) {
+            matches.push(entry.clone());
+            if matches.len() >= MAX_RESULTS {
+                return false;
             }
         }
+        true
+    };
+
+    if keyword_filtered {
+        let ids = state.keyword_index.find_intersection(&token_lower);
+        n_candidates = ids.len();
+        for fid in ids {
+            // A tombstoned id yields None and is skipped — it can't be a live
+            // match anyway.
+            let keep_going = state
+                .file_slab
+                .with_record(fid, |r| consider(r, &mut matches))
+                .unwrap_or(true);
+            if !keep_going {
+                break;
+            }
+        }
+    } else {
+        // No indexable token: "*" searches and metadata-only queries
+        // (Type=Video + size range). There is no candidate set to narrow with,
+        // so the tree has to be applied to live records directly.
+        //
+        // The predicate must run BEFORE the MAX_RESULTS cap: taking the first N
+        // records and filtering afterwards would test an arbitrary N — shard
+        // iteration order is not meaningful — so a metadata query would return a
+        // different, mostly-tiny result set every time.
+        //
+        // But an unbounded scan is a liability: it is O(live files) with a shard
+        // read lock held, it blocks publishes into the shard being walked, and
+        // any client can trigger it repeatedly with a one-token query that
+        // happens to miss the index. So the scan is capped at
+        // MAX_UNINDEXED_SCAN and the answer is best-effort past that point,
+        // which is the correct trade: a metadata-only query has no precise
+        // answer to protect, while a stalled server affects everyone.
+        state.file_slab.for_each_live_while(|_id, r| {
+            if n_candidates >= MAX_UNINDEXED_SCAN {
+                scan_capped = true;
+                return false;
+            }
+            n_candidates += 1;
+            consider(r, &mut matches)
+        });
+    }
+    if scan_capped {
+        debug!(
+            limit = MAX_UNINDEXED_SCAN,
+            matched = matches.len(),
+            "unindexed search hit the scan cap; result set is partial"
+        );
     }
 
     info!(
@@ -109,6 +175,7 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
         keyword_filtered,
         candidates = n_candidates,
         scanned,
+        scan_capped,
         matched = matches.len(),
         "search processed"
     );

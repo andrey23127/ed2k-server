@@ -177,6 +177,39 @@ impl SlabShard {
         }
     }
 
+    /// Grow `records`/`next` by a fixed fraction instead of letting `Vec` double.
+    ///
+    /// `Vec`'s doubling is the right default for a short-lived buffer and the
+    /// wrong one for a slab that only ever grows and holds the largest single
+    /// allocation in the process. Doubling means the capacity spends its life
+    /// between 50% and 100% used: at 1.17M records the shards had reserved room
+    /// for ~1.9M, with 62 MB standing idle, and the waste scales — at the 33M
+    /// target the same pattern reserves gigabytes to hold nothing.
+    ///
+    /// Growing by a quarter keeps the idle fraction under ~20% instead of up to
+    /// 50%. The cost is more frequent reallocation, but this is still amortised
+    /// O(1) growth (geometric, just with a smaller ratio), and a slab that fills
+    /// over hours cares far more about resident memory than about how often it
+    /// memcpys.
+    ///
+    /// `GROW_MIN` keeps small/new shards from reallocating on nearly every push
+    /// while a quarter of a tiny number is still tiny.
+    #[inline]
+    fn reserve_gently(&mut self) {
+        const GROW_NUM: usize = 1;
+        const GROW_DEN: usize = 4;
+        const GROW_MIN: usize = 1024;
+        let len = self.records.len();
+        if len < self.records.capacity() {
+            return; // room already
+        }
+        let extra = std::cmp::max(len * GROW_NUM / GROW_DEN, GROW_MIN);
+        // reserve_exact, NOT reserve: reserve would apply Vec's own amplification
+        // on top of ours and put the doubling right back.
+        self.records.reserve_exact(extra);
+        self.next.reserve_exact(extra);
+    }
+
     /// Link an existing record (already in `records`/`next`) into its bucket.
     /// Caller holds the shard write lock.
     #[inline]
@@ -249,6 +282,7 @@ impl SlabShard {
     /// `link` separately when we did NOT grow (else we'd double-link).
     fn push_and_link(&mut self, rec: FileRecord) -> u32 {
         let index = self.records.len() as u32;
+        self.reserve_gently();
         self.records.push(rec);
         self.next.push(NIL);
         if self.records.len() > self.buckets.len() {
@@ -484,6 +518,19 @@ impl FileSlab {
     }
 
     /// Number of live files.
+    /// (len, capacity) of one shard's record vector. Diagnostics and tests —
+    /// the capacity is not observable any other way, and it is the number that
+    /// decides how much of the slab stands idle.
+    pub fn shard_len_cap(&self, shard: usize) -> (usize, usize) {
+        match self.shards.get(shard) {
+            Some(sh) => {
+                let g = sh.read().unwrap();
+                (g.records.len(), g.records.capacity())
+            }
+            None => (0, 0),
+        }
+    }
+
     pub fn live_count(&self) -> usize {
         self.live.load(Ordering::Relaxed) as usize
     }
@@ -632,6 +679,63 @@ impl FileSlab {
     /// shards proceed; within a shard, writers wait — same granularity as the
     /// old per-bucket DashMap iteration. `f` must not call back into the slab
     /// for the same shard (would deadlock); callers collect what they need.
+    /// Run `f` against a live record IN PLACE, without cloning it.
+    ///
+    /// `get`/`get_by_hash` clone the whole `FileRecord` — sources SmallVec, an
+    /// Arc bump on the name — which is right when the caller keeps the record,
+    /// and wasteful when it only wants to test a predicate. Search does the
+    /// latter for every candidate and keeps a handful, so cloning first and
+    /// filtering second was paying the clone for results that get thrown away.
+    ///
+    /// The shard read lock is held for the duration of `f`. Keep `f` short and
+    /// pure: it must not touch the slab again (same-shard re-entry would
+    /// deadlock on a non-reentrant RwLock) and must not await.
+    pub fn with_record<R, F: FnOnce(&FileRecord) -> R>(&self, id: FileId, f: F) -> Option<R> {
+        let shard = self.shards.get(id_shard(id))?;
+        let recs = shard.read().unwrap();
+        let r = recs.records.get(id_index(id))?;
+        if !r.alive {
+            return None;
+        }
+        Some(f(r))
+    }
+
+    /// Same, resolved by hash. One lock acquisition, not two.
+    ///
+    /// Callers that already hold a `FileId` should use `with_record`: going
+    /// FileId → hash → FileId costs an extra lock and an extra hash-chain walk
+    /// for nothing.
+    pub fn with_record_by_hash<R, F: FnOnce(FileId, &FileRecord) -> R>(
+        &self,
+        hash: &FileHash,
+        f: F,
+    ) -> Option<R> {
+        let shard_no = shard_of_hash(hash);
+        let sh = self.shards[shard_no as usize].read().unwrap();
+        let idx = sh.find(hash)?;
+        let r = sh.records.get(idx as usize)?;
+        if !r.alive {
+            return None;
+        }
+        Some(f(make_id(shard_no, idx), r))
+    }
+
+    /// Like `for_each_live`, but stops as soon as `f` returns false.
+    ///
+    /// Exists so a caller can bound its own work: the full walk holds a shard
+    /// read lock and is O(live files), which is not something an unauthenticated
+    /// request should be able to trigger without a ceiling.
+    pub fn for_each_live_while<F: FnMut(FileId, &FileRecord) -> bool>(&self, mut f: F) {
+        for (s_no, shard) in self.shards.iter().enumerate() {
+            let sh = shard.read().unwrap();
+            for (i, r) in sh.records.iter().enumerate() {
+                if r.alive && !f(make_id(s_no as u32, i as u32), r) {
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn for_each_live<F: FnMut(FileId, &FileRecord)>(&self, mut f: F) {
         for (s_no, shard) in self.shards.iter().enumerate() {
             let sh = shard.read().unwrap();
@@ -666,6 +770,75 @@ mod tests {
 
     fn src() -> Source {
         Source::new([1u8; 16], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, true)
+    }
+
+    #[test]
+    fn shard_capacity_does_not_double() {
+        // The slab is the largest allocation in the process and only grows, so
+        // Vec's doubling leaves up to half of it idle. This checks the growth
+        // stays proportional rather than exponential.
+        let slab = FileSlab::new();
+        for i in 0..40000u32 {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&i.to_le_bytes());
+            slab.get_or_insert(h, 100, "f".into(), src());
+        }
+        let (len, cap) = slab.shard_len_cap(0);
+        assert!(len > 0, "shard 0 must have received records");
+        // Doubling would allow up to 2.0; the gentle growth keeps it near 1.25.
+        // The bound is loose enough not to be brittle, tight enough to catch a
+        // regression back to Vec's default.
+        assert!(
+            cap as f64 <= len as f64 * 1.5 + 2048.0,
+            "capacity {cap} is too far above len {len} — is the growth doubling again?"
+        );
+        assert!(cap >= len, "capacity must cover len");
+    }
+
+    #[test]
+    fn with_record_sees_the_same_data_as_get_without_cloning() {
+        let slab = FileSlab::new();
+        let h = [7u8; 16];
+        let (id, _) = slab.get_or_insert(h, 4242, "name.avi".into(), src());
+
+        let via_get = slab.get(id).expect("live record");
+        let via_with = slab
+            .with_record(id, |r| (r.hash, r.size, r.sources.len()))
+            .expect("live record");
+        assert_eq!(via_with, (via_get.hash, via_get.size, via_get.sources.len()));
+
+        // By hash, one lock instead of two, and it hands back the id.
+        let (rid, size) = slab
+            .with_record_by_hash(&h, |id, r| (id, r.size))
+            .expect("live record");
+        assert_eq!(rid, id);
+        assert_eq!(size, 4242);
+
+        // Tombstoned records are invisible to both, like get().
+        slab.tombstone(id);
+        assert!(slab.with_record(id, |_| ()).is_none());
+        assert!(slab.with_record_by_hash(&h, |_, _| ()).is_none());
+    }
+
+    #[test]
+    fn for_each_live_while_stops_when_asked() {
+        let slab = FileSlab::new();
+        for i in 0..20u8 {
+            let mut h = [0u8; 16];
+            h[0] = i;
+            slab.get_or_insert(h, 100, "f".into(), src());
+        }
+        let mut seen = 0;
+        slab.for_each_live_while(|_id, _r| {
+            seen += 1;
+            seen < 5
+        });
+        assert_eq!(seen, 5, "the walk must stop the moment the closure says so");
+
+        // Returning true always is equivalent to for_each_live.
+        let mut all = 0;
+        slab.for_each_live_while(|_, _| { all += 1; true });
+        assert_eq!(all, 20);
     }
 
     #[test]

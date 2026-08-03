@@ -204,7 +204,21 @@ pub fn read_tag(buf: &mut &[u8]) -> Result<Tag, TagError> {
 /// Parse N tags, stopping early on unknown type rather than erroring.
 /// This matches Lugdunum's tolerance for extended client tags.
 pub fn read_tag_list(buf: &mut &[u8], count: u32) -> Vec<Tag> {
-    let mut tags = Vec::with_capacity(count as usize);
+    // NEVER pre-allocate from `count` — it is an attacker-controlled u32 read
+    // straight off the wire.
+    //
+    // `Vec::with_capacity(count)` on a declared count of 0xFFFFFFFF asks the
+    // allocator for 4.29e9 * size_of::<Tag>() bytes — 240 GB in practice — and
+    // aborts the PROCESS. Not an unwind that a connection task can contain: a
+    // failed allocation is a hard abort, so one 26-byte login frame from any
+    // unauthenticated peer takes the whole server down.
+    //
+    // The smallest possible tag is a few bytes, so a buffer of length N can hold
+    // at most N tags; reserving that is both safe and generous. The loop below
+    // already stops the moment a tag fails to parse, which is what actually
+    // bounds the result.
+    let sane = std::cmp::min(count as usize, buf.len());
+    let mut tags = Vec::with_capacity(sane);
     for _ in 0..count {
         match read_tag(buf) {
             Ok(tag) => tags.push(tag),
@@ -381,6 +395,32 @@ mod tests {
         assert_eq!(tags[0].value, TagValue::String("[DivX ITA] NCIS 4x01 - Shalom.avi".into()));
         assert_eq!(tags[1].as_u32(), Some(366465024));
         assert_eq!(tags[2].as_u32(), Some(2));
+    }
+
+    #[test]
+    fn a_declared_tag_count_never_drives_the_allocator() {
+        // THE BUG this caught: `Vec::with_capacity(count)` on a wire-supplied
+        // u32. A declared count of 0xFFFFFFFF asks for 4.29e9 * size_of::<Tag>()
+        // — about 240 GB — and a failed allocation ABORTS THE PROCESS. Not an
+        // unwind a connection task can contain: one short frame from any
+        // unauthenticated peer would take the whole server down.
+        //
+        // Found by a login-parser test, but the exposure is every caller that
+        // reads a tag count off the wire.
+        let mut empty: &[u8] = &[];
+        let tags = read_tag_list(&mut empty, u32::MAX);
+        assert!(tags.is_empty(), "no bytes, no tags");
+
+        // A few real bytes behind a huge count: parse what is there, stop, and
+        // never reserve for the claim.
+        let mut buf = Vec::new();
+        buf.push(TYPE_STRING | TYPE_NEWTAG_BIT);
+        buf.push(0x01); // short name: CT_NAME
+        buf.extend_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(b"nick");
+        let mut slice: &[u8] = &buf;
+        let tags = read_tag_list(&mut slice, u32::MAX);
+        assert_eq!(tags.len(), 1, "the one real tag is returned");
     }
 }
 

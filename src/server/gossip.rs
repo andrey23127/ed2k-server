@@ -260,7 +260,7 @@ async fn handshake_with_seed(
         }
 
         // Stash BEFORE sending so the main handler can decode the reply.
-        state.our_sent_random_parts.insert(*seed.ip(), random_part);
+        state.our_sent_random_parts.insert(*seed.ip(), (random_part, std::time::Instant::now()));
         let ping_dst = SocketAddrV4::new(*seed.ip(), seed_obfping_port);
         obf_sock.send_to(&ping, ping_dst).await?;
         info!(
@@ -422,7 +422,7 @@ async fn handshake_with_seed(
 
     // Stash our random_part — udp.rs will need it to decode incoming
     // obfuscated frames from this seed (it encrypts replies with this value).
-    state.our_sent_random_parts.insert(*seed.ip(), random_part);
+    state.our_sent_random_parts.insert(*seed.ip(), (random_part, std::time::Instant::now()));
 
     // Wait for OBF reply. Reply arrives on our ephemeral socket from seed:4673.
     let mut buf = vec![0u8; 4096];
