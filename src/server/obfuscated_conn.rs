@@ -129,6 +129,24 @@ mod tests {
     ///
     /// `pad_len` is the parameter that matters: 0 reproduces the minimal hello
     /// from the report, and a non-zero value reproduces what real clients send.
+    /// Read exactly `want` bytes, however the stream chooses to deliver them.
+    ///
+    /// `CryptStream::poll_read` returns the pushed-back marker byte as its own
+    /// read before touching the socket, so a single `read()` on a plain
+    /// connection yields ONE byte. That is correct — `read` is never obliged to
+    /// fill the buffer — but a test that calls `read` once and asserts on three
+    /// bytes fails against working code, which is exactly what happened here.
+    async fn read_n<R: tokio::io::AsyncRead + Unpin>(r: &mut R, want: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(want);
+        let mut chunk = vec![0u8; want];
+        while out.len() < want {
+            let n = r.read(&mut chunk).await.expect("read");
+            assert!(n > 0, "stream closed after {} of {want} bytes", out.len());
+            out.extend_from_slice(&chunk[..n]);
+        }
+        out
+    }
+
     async fn run_handshake(pad_len: u8, split_writes: bool) -> Vec<u8> {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -137,10 +155,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.expect("accept");
             let mut stream = make_stream(sock, true).await.expect("make_stream");
-            let mut buf = vec![0u8; 64];
-            let n = stream.read(&mut buf).await.expect("read payload");
-            buf.truncate(n);
-            buf
+            // 8 bytes = the eD2k test frame the client appends to its ack.
+            read_n(&mut stream, 8).await
         });
 
         // ── client side: a real eMule obfuscated hello ──
@@ -234,10 +250,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (sock, _) = listener.accept().await.unwrap();
             let mut stream = make_stream(sock, true).await.expect("plain make_stream");
-            let mut buf = vec![0u8; 16];
-            let n = stream.read(&mut buf).await.unwrap();
-            buf.truncate(n);
-            buf
+            read_n(&mut stream, 8).await
         });
         let mut sock = TcpStream::connect(addr).await.unwrap();
         sock.write_all(b"\xE3\x05\x00\x00\x00\x38hi").await.unwrap();
@@ -246,6 +259,8 @@ mod tests {
             .await
             .expect("must not hang")
             .unwrap();
-        assert_eq!(&got[..3], &[0xE3, 0x05, 0x00], "the consumed marker must be restored");
+        // Whole frame, not just the marker: the pushed-back byte must land in
+        // front of the socket data, not replace or duplicate any of it.
+        assert_eq!(&got, b"\xE3\x05\x00\x00\x00\x38hi");
     }
 }
