@@ -103,6 +103,63 @@ pub fn resolve_seckey(cfg: &Config) -> [u8; 16] {
     key
 }
 
+#[cfg(test)]
+mod searchreq_tests {
+    use super::*;
+
+    #[test]
+    fn searchreq2_payload_is_a_bare_tree_like_searchreq1() {
+        // 0x92 and 0x98 carry the same thing: a bare expression tree. Frames
+        // captured live from four peers, byte for byte:
+        //
+        //   0x92:  01 19 00 "El día de la revelación"
+        //   0x98:  01 0f 00 "febrero de 1933"
+        //
+        // Same leading 01 (string node), same u16 length, same text. 0x92 was
+        // reaching no handler at all — 114 datagrams in one capture, each peer
+        // retrying an unanswered query.
+        //
+        // The tag set that distinguishes 0x90 must NOT be stripped from either,
+        // which is what this checks: strip_searchreq3_tags would eat the first
+        // four bytes and leave a truncated tree.
+        let bare: &[u8] = &[0x01, 0x0f, 0x00, b'f', b'e', b'b'];
+        assert_eq!(
+            strip_searchreq3_tags(bare).map(<[u8]>::len),
+            // A bare tree read as a tag set gives count = 0x000f0f01, far past
+            // the sanity bound, so it is rejected rather than mangled.
+            None,
+            "a bare tree must not survive tag-stripping — it is not a 0x90 payload"
+        );
+    }
+
+    #[test]
+    fn searchreq3_tagset_is_stripped_to_the_same_shape() {
+        // A real 0x90 frame from the capture, byte for byte:
+        //
+        //   01 00 00 00        tag count = 1
+        //   89                 type 0x09 (u8) with the short-name bit set
+        //   0e                 tag name
+        //   01                 value
+        //   01 0a 00 "dampyr 313"   <- the tree
+        //
+        // What is left after stripping must look exactly like a 0x92/0x98
+        // payload: a string node whose u16 length matches the text that follows.
+        let framed: &[u8] = &[
+            0x01, 0x00, 0x00, 0x00, // tag count = 1
+            0x89, 0x0e, 0x01, // one u8 tag, short name
+            0x01, 0x0a, 0x00, b'd', b'a', b'm', b'p', b'y', b'r', b' ', b'3', b'1', b'3',
+        ];
+        let tree = strip_searchreq3_tags(framed).expect("tag set must strip");
+        assert_eq!(tree[0], 0x01, "what remains starts a string node, as 0x98 does");
+        assert_eq!(
+            u16::from_le_bytes([tree[1], tree[2]]) as usize,
+            tree.len() - 3,
+            "the declared term length must match what follows it"
+        );
+        assert_eq!(&tree[3..], b"dampyr 313");
+    }
+}
+
 /// Strip the leading tag set from an `OP_GLOBSEARCHREQ3` (0x90) payload,
 /// returning the expression tree that follows.
 ///
@@ -549,7 +606,7 @@ impl UdpServer {
         // skip TCP login from appearing as "peer servers".
         match opcode {
             OP_GLOB_GETSOURCES | OP_GLOB_GETSOURCES2
-            | OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ3 => {
+            | OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 | OP_GLOB_SEARCHREQ3 => {
                 if let std::net::IpAddr::V4(v4) = peer.ip() {
                     self.state.recent_client_ips.insert(v4, std::time::Instant::now());
                     // Bot detector: track query rate and interval patterns.
@@ -614,7 +671,11 @@ impl UdpServer {
             // 0x97 = GLOBSERVSTATRES — seed server responding to our keepalive ping
             0x97 => self.handle_pingreply(payload, peer).await,
             OP_SERVER_DESC_REQ   => self.handle_server_desc(payload, peer, obf).await,
-            OP_GLOB_SEARCHREQ    => self.handle_search(payload, peer, obf).await,
+            // 0x92 and 0x98 carry the same payload — a bare expression tree. See
+            // the note on OP_GLOB_SEARCHREQ2.
+            OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 => {
+                self.handle_search(payload, peer, obf).await
+            }
             // 0x90 carries a leading tag set before the expression tree; 0x98
             // does not. See strip_searchreq3_tags.
             OP_GLOB_SEARCHREQ3   => {
@@ -769,10 +830,15 @@ impl UdpServer {
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> Result<()> {
-        // The hash lists apply here too: a UDP source query is another way to
-        // start a download, so a listed file must stop being served on this
-        // channel as well.
-        if self.state.filter.hash_is_listed(hash) {
+        // The filter applies here too: a UDP source query is another way to start
+        // a download, so a withheld file must stop being served on this channel
+        // as well. The name comes from the index — see is_withheld_opt for what
+        // happens when the file is not there.
+        let name = self
+            .state
+            .file_slab
+            .with_record_by_hash(hash, |_id, r| r.name.to_string());
+        if self.state.filter.is_withheld_opt(hash, name.as_deref()) {
             let mut out = BytesMut::new();
             out.put_u8(PROTO_EDONKEY);
             out.put_u8(OP_GLOB_FOUNDSOURCES);
@@ -865,8 +931,9 @@ impl UdpServer {
         let max_conn = live.limits.max_clients;
         let soft     = live.limits.soft_limit_files;
         let hard     = live.limits.hard_limit_files;
-        // Full capability flags — matches Lugdunum 17.15 (0x17fb observed in captures)
-        let pingflg: u32 = 0x0000_17FB;
+        // Same mask as ST_UDPFLAGS at login — the two must not diverge, or a
+        // client sees one set of capabilities on connect and another on ping.
+        let pingflg: u32 = crate::proto::opcodes::SERVER_UDP_FLAGS;
 
         // Check for server-to-server magic: challenge bytes [2:3] == 0x55AA
         // (payload[2] == 0xAA, payload[3] == 0x55 in LE)
@@ -1505,10 +1572,11 @@ impl UdpServer {
                 None => continue,
             };
             let hash = entry.hash;
-            // Hash lists apply to what is SERVED — see the note in
-            // server/search.rs. Without this a takedown only takes effect on
-            // re-publish, i.e. never for a file whose sources keep refreshing.
-            if self.state.filter.hash_is_listed(&hash) {
+            // Full filter, not just the hash lists — see
+            // ContentFilter::is_withheld. The UDP and TCP search paths must
+            // withhold the same records, or a file merely moves from one to the
+            // other.
+            if self.state.filter.is_withheld(&hash, &entry.name) {
                 continue;
             }
             // Skip orphans (no live source). See src/server/search.rs for the
@@ -1554,6 +1622,13 @@ impl UdpServer {
                 FT_COMPLETE_SOURCES,
                 TagValue::U32(entry.complete_source_count()),
             ));
+            // FT_FILETYPE as an integer — see the note in server/search.rs. The
+            // UDP and TCP result paths must carry the same tags, or a client
+            // gets different metadata depending on which one answered it.
+            let ftype = crate::proto::search::ed2k_file_type_id(&entry.name.to_lowercase());
+            if ftype != crate::proto::search::ed2k_file_type::ANY {
+                tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
+            }
             write_tag_list(&mut out, &tags);
 
             self.reply(&out, peer, obf).await?;
@@ -1573,6 +1648,24 @@ const OP_GLOB_SERVSTATREQ: u8 = 0x96;
 const OP_SERVER_DESC_REQ:  u8 = 0xA2;
 const OP_GLOB_SEARCHREQ:   u8 = 0x98;
 const OP_GLOB_SEARCHREQ3:  u8 = 0x90;
+/// Middle rung of eMule's three-way UDP search ladder.
+///
+/// Payload is IDENTICAL to `OP_GLOB_SEARCHREQ` (0x98) — a bare expression tree,
+/// no tag set. The only difference is that 0x92 permits 64-bit file sizes.
+/// eMule picks between the three in `SearchResultsWnd.cpp`:
+///
+/// ```text
+///   SupportsLargeFilesUDP() && (udp_flags & SRV_UDPFLG_EXT_GETFILES) -> 0x90
+///   udp_flags & SRV_UDPFLG_EXT_GETFILES                              -> 0x92
+///   otherwise                                                        -> 0x98
+/// ```
+///
+/// We advertise EXT_GETFILES, so clients that land on the middle rung sent us
+/// 0x92 and got silence: a live capture caught 114 of them, from four peers,
+/// each retrying the same query unanswered. Routing it to the same handler as
+/// 0x98 is the whole fix — the alternative, dropping the capability bit, would
+/// push those clients down to 0x98 and lose large-file search for no reason.
+const OP_GLOB_SEARCHREQ2:  u8 = 0x92;
 // NAT-traversal: client→server UDP keepalive carrying the sender's userhash.
 // Lets us record the client's external (post-NAT) UDP port for hole punching.
 const OP_SERVER_NATT_KEEPALIVE: u8 = 0x9F;

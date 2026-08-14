@@ -94,13 +94,11 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
     let mut consider = |entry: &crate::state::file_id::FileRecord,
                         matches: &mut Vec<crate::state::file_id::FileRecord>| -> bool {
         scanned += 1;
-        // Hash lists apply to what is SERVED, not only to what is published.
-        // Adding a hash stops re-indexing, but a copy already in the index keeps
-        // being handed out — for a live file, forever, since its sources keep
-        // refreshing it. Checking here is what makes a takedown or a decoy
-        // vanish from results within one hot-reload cycle instead of requiring a
-        // restart that drops every connected user.
-        if state.filter.hash_is_listed(&entry.hash) {
+        // The FULL filter applies to what is SERVED, not only to what is
+        // published — see ContentFilter::is_withheld. A term added today has to
+        // remove the copies indexed yesterday, or the term lists are prospective
+        // only and the index keeps serving what the filter already rejects.
+        if state.filter.is_withheld(&entry.hash, &entry.name) {
             return true;
         }
         // Skip orphans (no live source). These exist transiently when a source
@@ -246,6 +244,20 @@ pub fn build_search_result_page(
             FT_COMPLETE_SOURCES,
             TagValue::U32(file.complete_source_count()),
         ));
+        // FT_FILETYPE as an INTEGER — what the SRV_TCPFLG_TYPETAGINTEGER
+        // capability bit (0x0080) promises, and what eserver 17.6+ emits.
+        //
+        // The bit was advertised for a long time while no type tag was sent at
+        // all, in either form. Clients that filter by type therefore had nothing
+        // to filter on and had to guess from the extension themselves.
+        //
+        // Only sent when the extension actually classifies: ANY (0) means "no
+        // opinion", and a client filtering by type would read a literal 0 as a
+        // category that matches nothing.
+        let ftype = crate::proto::search::ed2k_file_type_id(&file.name.to_lowercase());
+        if ftype != crate::proto::search::ed2k_file_type::ANY {
+            tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
+        }
 
         write_tag_list(&mut payload, &tags);
     }

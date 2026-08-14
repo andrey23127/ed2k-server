@@ -209,14 +209,18 @@ fn is_word_char(b: u8) -> bool {
 /// These cannot reasonably appear inside innocent English/Russian words.
 const SEX_TERMS_SUBSTRING: &[&str] = &[
     // English (5+ chars, specific)
-    "porn", "blowjob", "dildo", "orgasm", "masturbat",
+    "porn", "blowjob", "handjob", "dildo", "orgasm", "masturbat",
     // German
     "sexuell", "ficken",
     // Spanish/Portuguese (5+ chars)
     "porno", "follar", "desnud",
     // Italian
     "sesso",
-    // Russian (Cyrillic — no FP risk in Latin filenames)
+    // Russian. "секс" and "голая" are broad on purpose — they are how these
+    // files are actually named — and are made safe by SEX_TERM_EXCEPTIONS below
+    // rather than by narrowing them. Dropping them was tried and cost five of
+    // six catches in a sample ("детский секс видео", "голая девочка",
+    // "секс с малолеткой"); the phrase list keeps both.
     "секс", "порн", "голая", "обнаж",
     // French
     "sexe",
@@ -238,18 +242,81 @@ const SEX_TERMS_SUBSTRING: &[&str] = &[
 /// "sex" matches "Sussex"/"unisex", causing massive false positives when
 /// combined with age tokens like "16 yo behavioral analysis study.pdf".
 const SEX_TERMS_WORD_BOUNDED: &[&str] = &[
-    "sex", "xxx", "fuck", "nude", "naked", "anal", "oral", "cum",
+    "sex", "xxx", "anal", "oral", "cum",
     "nackt",        // German
     "nud", "scopa", // Italian
+    // Bounded on both sides because each is a prefix of ordinary words:
+    // analysis/analog/Anals, Cumberland/cumbia, Sexton/Sexto, Nudge.
+];
+
+/// Sex terms that may be FOLLOWED by anything, but must still start at a word
+/// boundary.
+///
+/// English inflects, and the two-sided rule silently lost the inflected forms:
+/// `fuck` did not match "Fucking" or "fucked", `nude` did not match "nudes".
+/// A live capture found `14Yo Girl And Boy Fucking Live.mp4` being served from
+/// the index — the age token was seen, the sexual context was written in plain
+/// English, and Layer 2 still did not fire.
+///
+/// This is the same correction `jargon.rs` received earlier; the two matchers
+/// had drifted, and this list is the narrow version of that fix. Only terms
+/// whose continuations are safe belong here — measured against ordinary titles:
+/// `anal` would take Analog/analysis/Anals, `cum` would take Cumberland/cumbia,
+/// `sex` would take Sexton/Sexto, so those stay two-sided above.
+const SEX_TERMS_PREFIX: &[&str] = &[
+    "fuck",  // fucking, fucked, fucks
+    "nude",  // nudes
+    "naked",
+    "molest", // molested, molesting, molestation
+    "rape",   // raped, raping
+];
+
+// NOTE on the two above: each does have an innocent host word — "Molestation
+// awareness seminar", "Rapeseed oil" — that the left rule does NOT exclude,
+// because the term starts those words too. ( "grape" IS excluded: there the
+// term starts after a letter.) They are still safe here because Layer 2 fires
+// only when a MINOR-AGE token co-occurs, and neither an agricultural paper nor
+// a safeguarding seminar carries one. That gate is what makes the whole list
+// affordable; a term list without it could not contain these words at all.
+
+/// Sex terms specific enough to match anywhere, including inside a word.
+///
+/// Checked against ordinary titles: none of these has an innocent host word.
+/// Deliberately absent: `dick` (Dick Tracy, Moby Dick), `virgin` (Virginia,
+/// Virgin Media), `pussy` (Pussy Riot, Pussycat Dolls) — each has real
+/// collisions, and `pussy` only just: it needs word bounds, kept below.
+const SEX_TERMS_SUBSTRING_EXTRA: &[&str] = &[
+    "vagina", "penis", "cunt", "boobs", "tits",
+];
+
+/// Sex terms needing bounds on both sides, added alongside the originals.
+const SEX_TERMS_BOUNDED_EXTRA: &[&str] = &[
+    "pussy",  // Pussy Riot, Pussycat Dolls
+    "incest", // "Incest taboo anthropology" is a real title; bounds do not help
+              // there, but the age gate does — such a paper carries no age token.
+    "cock",   // Cockney, cocktail, peacock
 ];
 
 /// Returns true if `lowered` contains a substring sex term OR a word-bounded short term.
 fn contains_sex_term(lowered: &str) -> bool {
-    if SEX_TERMS_SUBSTRING.iter().any(|t| lowered.contains(t)) {
+    if SEX_TERMS_SUBSTRING.iter().any(|t| lowered.contains(t))
+        || SEX_TERMS_SUBSTRING_EXTRA.iter().any(|t| lowered.contains(t))
+    {
         return true;
     }
     let bytes = lowered.as_bytes();
-    for term in SEX_TERMS_WORD_BOUNDED {
+    // Prefix terms: must START at a boundary, may continue into an inflection.
+    for term in SEX_TERMS_PREFIX {
+        let mut start = 0;
+        while let Some(pos) = lowered[start..].find(term) {
+            let abs = start + pos;
+            if abs == 0 || !is_word_char(bytes[abs - 1]) {
+                return true;
+            }
+            start = abs + 1;
+        }
+    }
+    for term in SEX_TERMS_WORD_BOUNDED.iter().chain(SEX_TERMS_BOUNDED_EXTRA) {
         let tb = term.as_bytes();
         let mut start = 0;
         while let Some(pos) = lowered[start..].find(term) {
@@ -333,10 +400,71 @@ fn contains_cjk_minor_word(s: &str) -> bool {
     CJK_MINOR_WORDS.iter().any(|w| s.contains(w))
 }
 
+/// Latin-script words that name an age range entirely below 18, with no adult
+/// reading.
+///
+/// These belong in Layer 2 rather than in the operator term list, and the reason
+/// is worth stating: as a bare L4 substring "toddler" blocks parenting books,
+/// cookbooks and a reality TV series — all checked against real titles. Gated
+/// behind Layer 2's sex-term requirement it cannot: "Toddler Nutrition Guide"
+/// carries no sexual context, while "[Toddler HC][Handjob]" — the live sample
+/// that prompted this — carries two.
+///
+/// Kept deliberately short. "child", "kid", "baby", "little" and "young" are NOT
+/// here: each has ordinary adult readings ("baby" as an endearment, "young" as a
+/// comparative) and each appears in legal adult titles, so even age-gating them
+/// would not make them safe.
+const LATIN_MINOR_WORDS: &[&str] = &[
+    "kleinkind", // German, 1-3 years
+];
+
+// "toddler" was here and MOVED BACK to the operator term list (Layer 4).
+//
+// The reasoning for putting it here was sound and the outcome was not. Gated
+// behind Layer 2's sexual-term requirement it protects parenting books — but a
+// search-result capture found ten files it let through, because their sexual
+// context is not in the term list: "Mom Suck 2 Toddler Boy Boner", "Toddler Boy
+// Shows His Dick", "toddler fick" (German), "[Toddler HC][Latina] Sobrinita
+// Daniela 5 anos" (no verb at all).
+//
+// As a bare L4 term it catches all of them and also blocks a handful of
+// legitimate titles — parenting guides, cookbooks, a reality series. The
+// operator accepted that trade: those go in the hash whitelist as they appear,
+// which is a few entries, against tens of files getting through.
+
+/// Bounded on the LEFT only, so a plural still matches.
+///
+/// "infant" was tried here and removed: allowing a trailing letter makes it
+/// match "Infantry", and forbidding one loses "infants". Neither is acceptable,
+/// and the word is rare enough in this material that a narrower rule is not
+/// worth the risk. "toddler" has no such collision — no ordinary English word
+/// continues past it except its own plural.
+fn contains_latin_minor_word(lowered: &str) -> bool {
+    let bytes = lowered.as_bytes();
+    for w in LATIN_MINOR_WORDS {
+        let mut start = 0;
+        while let Some(pos) = lowered[start..].find(w) {
+            let abs = start + pos;
+            let before_ok = abs == 0 || !is_word_char(bytes[abs - 1]);
+            // Trailing letters are allowed ("toddlers"), a leading one is not.
+            if before_ok {
+                return true;
+            }
+            start = abs + 1;
+        }
+    }
+    false
+}
+
 /// Returns a description of WHY layer 2 fired ("age 12 (yo)", "CJK minor word",
 /// ...), or None. The description travels with the block so a reviewer can judge
 /// the decision without re-deriving it.
 pub(super) fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
+    // A fixed innocent phrase overrides everything below — see
+    // SEX_TERM_EXCEPTIONS.
+    if has_sex_term_exception(lowered) {
+        return None;
+    }
     // Both conditions must hold in the same filename: an age claim AND a sexual
     // context. Neither alone is actionable — a 12-year-old's birthday video is
     // not CSAM, and adult pornography is not our concern.
@@ -346,14 +474,249 @@ pub(super) fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
         })
         .or_else(|| contains_cjk_minor_word(original).then(|| "CJK minor word".to_string()))
         .or_else(|| {
+            contains_latin_minor_word(lowered).then(|| "minor-age word".to_string())
+        })
+        .or_else(|| {
             (count_gender_age_tokens(original) >= 2)
                 .then(|| "gender-age pair".to_string())
-        })?;
-    if contains_sex_term(lowered) {
-        Some(age_claim)
-    } else {
-        None
+        })
+        .or_else(|| contains_ru_minor_word(lowered).then(|| "RU minor word".to_string()))?;
+    if contains_sex_term(lowered) || contains_ru_sex_term(lowered) {
+        return Some(age_claim);
     }
+    // No sexual term — but an age of 12 or under stands on its own. See
+    // UNPAIRED_AGE_MAX for why the pairing rule has to be relaxed there.
+    contains_unpaired_minor_age(original, lowered)
+}
+
+/// Phrases that make a broad sexual term innocent.
+///
+/// Checked BEFORE the term scan and against the whole name: a match here means
+/// Layer 2 does not fire at all.
+///
+/// The problem these solve: "секс" and "голая" are exactly the words these files
+/// use, and also exactly the words a sex-education title, a documentary or a
+/// 2009 romantic comedy uses. Narrowing the terms loses the catches — removing
+/// the two cost five of six in a sample. Naming the innocent PHRASES keeps both,
+/// because the phrases are fixed and few.
+///
+/// Кept to fixed expressions. A phrase list is a maintenance burden that grows
+/// with every false positive, so it earns its place only where the single word
+/// cannot be fixed and is worth keeping.
+const SEX_TERM_EXCEPTIONS: &[&str] = &[
+    "голая правда", "голой правды", "голую правду", // the idiom and the film
+    "сексуальное воспитан", "половое воспитан",     // sex education
+    "сексуальная революц",
+    "секс-просвет", "сексолог", "сексопатолог",     // the discipline
+];
+
+fn has_sex_term_exception(lowered: &str) -> bool {
+    SEX_TERM_EXCEPTIONS.iter().any(|p| lowered.contains(p))
+}
+
+/// Russian words naming a minor.
+///
+/// The Russian-speaking segment is a large share of this network and NOTHING in
+/// any list covered it — not the jargon file, not the operator terms, not the
+/// age scanner. English, German, Spanish, Italian and CJK were all represented;
+/// Russian was simply absent. A search sample found
+/// `! - Летняя Лолита реально ШКОЛЬНИЦА)) - но как ЕБЁТСЯ!!о)).mp4` sitting in
+/// the index with both halves of the Layer 2 rule written out in plain Russian.
+///
+/// STEMS, not whole words, because Russian inflects heavily: `школьниц` covers
+/// школьница / школьницы / школьницу / школьницей. The stems stop short of the
+/// endings on purpose.
+///
+/// ⚠ These are ordinary words and are ONLY safe behind the sexual-term
+/// requirement. Measured against thirteen legitimate Russian titles — the film
+/// «Школьница 2», «Дневник школьницы», Dostoevsky's «Подросток», a law lecture
+/// on «Несовершеннолетние», an «Ералаш» episode — a bare term list matched NINE
+/// of the thirteen. Paired with a sexual term: zero.
+const RU_MINOR_WORDS: &[&str] = &[
+    // First set, from the sample that exposed the gap.
+    "школьниц",        // schoolgirl
+    "школьник",        // schoolboy
+    "малолет",         // underage (малолетка, малолетний)
+    "несовершеннолет", // minor, legal register
+    "подростк",        // teenager (подростковый, подростка)
+    // Second set. The first was written from one filename and turned out to
+    // guess the wrong register: a review window with 428 Cyrillic names used
+    // none of those words and all of these — "детское порно", "Русские Дети
+    // 6-14 Лет", "девочка лет 13-14". Publishers write plainly, not in the
+    // legal or scholastic register the first list assumed.
+    "девочк",  // girl
+    "мальчик", // boy
+    "детск",   // child- (детское, детская)
+    "дети",    // children
+    "ребён", "ребен", // child, both spellings
+    "малыш",   // little one
+    "дочк",    // daughter (дочка, дочки)
+    "сынок",   // son, diminutive
+    "юная", "юные", "юной", // young, feminine and plural
+];
+
+/// Russian sexual terms, as they appear in filenames rather than in dictionaries.
+///
+/// Both ё and е spellings are listed: filenames use them interchangeably, and
+/// `ебёт`/`ебет` are the same word to everyone except a byte comparison.
+///
+/// Kept crude and specific. Nothing here has an innocent reading — unlike
+/// "секс" or "голая", which appear in medical, artistic and news titles and are
+/// deliberately absent.
+const RU_SEX_TERMS: &[&str] = &[
+    "ебёт", "ебет", "ебля", "ебут", "ебал",
+    "трахае", "трахну", "трахал",
+    "сосёт", "сосет",
+    "минет", "дрочит", "дрочь",
+    "изнасил", // изнасилование, изнасиловал
+    "порево",
+    // Second set, from the same review window.
+    "сексом",    // "занимаются сексом" — the inflected form only
+                 // ("порн" already lives in SEX_TERMS_SUBSTRING)
+    "мастурбац", // masturbation
+    "развратн",  // depraved
+    "стриптиз",  // striptease
+    "совращ",    // corruption of a minor
+    "инцест",    // incest
+    "голенькая", // naked, diminutive — the diminutive is the tell
+];
+
+// NOT added, and worth recording why:
+//
+//   "секс"       — "сексуальное воспитание", "сексуальная революция", and the
+//                  bare noun in any documentary title. Only the instrumental
+//                  case "сексом" is listed, which is what "заниматься сексом"
+//                  produces and which no lecture title uses.
+//   "сексуальн"  — same problem, and it is the word that leaves
+//                  "Мальчик и его сексуальная зайка" uncaught. Accepted: that
+//                  file needs its hash listed.
+//   "эротик"     — European art cinema of the 1970s is full of it.
+//   "обнажён"    — art and photography.
+//   "голая"      — "Голая правда" is a 2009 romantic comedy and a stock phrase
+//                  ("голая правда о детском питании"). Only the diminutive
+//                  "голенькая" is kept: nobody titles a documentary that.
+//
+// A LIMIT that no word list fixes: "Дети и порнография — доклад ЮНЕСКО" pairs a
+// minor marker with a sexual term and is a UNESCO report on the subject. Any
+// pairing rule blocks writing ABOUT the crime along with the crime. Such files
+// go in whitelist_hashes.txt; there is no phrasing that separates them
+// automatically, because the words genuinely are the same.
+
+/// Substring match: Cyrillic has no ASCII word characters, so the boundary rules
+/// used for Latin terms would never apply here anyway — and stems are meant to
+/// match inside inflected forms.
+fn contains_ru_minor_word(lowered: &str) -> bool {
+    RU_MINOR_WORDS.iter().any(|w| lowered.contains(w))
+}
+
+fn contains_ru_sex_term(lowered: &str) -> bool {
+    RU_SEX_TERMS.iter().any(|w| lowered.contains(w))
+}
+
+/// Ages at or below this need no sexual term to be actionable on their own.
+///
+/// Layer 2 normally requires an age claim AND a sexual context, because a
+/// 12-year-old's birthday video is not our concern. That pairing has a blind
+/// spot: publishers write the age and then describe the act in a language the
+/// term list does not cover, or not at all. A live capture of search results
+/// found twelve such files being served — "Webcam - 12yo UK girl & 10yo
+/// brother", "Artem(12yo) - Дрочь", "jenny 3yo sdpa moscow" — every one
+/// carrying an explicit age and no English sexual term.
+///
+/// Below 13, an age written into a filename on a file-sharing network is itself
+/// the anomaly. Legal material does not label its participants "11yo"; the
+/// notation exists to advertise. Measured on a 22 007-name review window: 4224
+/// names carry an age of 12 or under, 88 of them have neither jargon nor a
+/// sexual term — and all 88 are unambiguous. Not one false positive.
+///
+/// 12 rather than higher on purpose. At 13-17 the notation does appear in legal
+/// contexts (a teenager's own upload, a documentary), and the pairing rule still
+/// applies there.
+const UNPAIRED_AGE_MAX: u32 = 12;
+
+/// Words that make a small number an age of something OTHER than a person.
+///
+/// Whisky is the real case: "Macallan 12yo", "12 yo single malt", "aged 15 yr"
+/// are ordinary product descriptions using exactly the notation this rule keys
+/// on. Service intervals and warranties do the same.
+///
+/// Checked WITHIN A WINDOW around the number, not across the whole name: the
+/// review window contains 25 names where a guard word sits far from the age and
+/// the file is plainly CSAM — "(Pthc) Vintage Collection ... 11Yo Girl". A
+/// whole-name check would have lost every one of them.
+const AGE_GUARD_WORDS: &[&str] = &[
+    "whisk", "malt", "scotch", "bourbon", "cognac", "brandy", "tequila",
+    "cask", "barrel", "reserva", "solera", "anejo", "distiller", "tasting",
+    "aged", "vintage",
+    "service manual", "warranty", "guarantee", "mileage",
+];
+
+// "vintage" and "aged" are in the list despite appearing in CSAM names too
+// ("(Pthc) Vintage Collection ... 11Yo Girl"). The proximity window is what
+// makes that safe: in those names the word sits many words away from the age,
+// while "12yo vintage port" has it adjacent. Verified on the review window —
+// all 25 names where a guard word co-occurs with an age still match.
+
+/// How far either side of the number a guard word disqualifies it, in bytes.
+/// Deliberately tight — "12yo single malt" is 15 characters, while the CSAM
+/// names that merely contain "vintage" have it many words away.
+const AGE_GUARD_WINDOW: usize = 24;
+
+/// True if a guard word sits close enough to `pos` to explain the number.
+fn age_is_guarded(lowered: &str, pos: usize) -> bool {
+    let lo = pos.saturating_sub(AGE_GUARD_WINDOW);
+    let hi = (pos + AGE_GUARD_WINDOW).min(lowered.len());
+    // Snap to char boundaries — filenames are full of multi-byte text and
+    // slicing mid-character panics.
+    let lo = (lo..=pos).find(|i| lowered.is_char_boundary(*i)).unwrap_or(pos);
+    let hi = (pos..=hi).rev().find(|i| lowered.is_char_boundary(*i)).unwrap_or(pos);
+    let window = &lowered[lo..hi];
+    AGE_GUARD_WORDS.iter().any(|w| window.contains(w))
+}
+
+/// Does this name carry an age of 12 or under, unguarded?
+///
+/// Returns the same reason string shape as `contains_minor_age_token`, with the
+/// age spelled out, so a reviewer reading the export can see which number fired.
+fn contains_unpaired_minor_age(original: &str, lowered: &str) -> Option<String> {
+    let reason = contains_minor_age_token(original)?;
+    // ONLY the compact notations. "12yo", "11yr" are file-sharing shorthand that
+    // appears in a filename to advertise; "12 years" is ordinary English and
+    // appears in "12 Years a Slave", "12 Years After", "aged 10 years". Spelled-
+    // out units, and every non-English unit, keep the pairing requirement.
+    //
+    // This distinction is the whole reason the rule is safe. It was missed on
+    // the first pass — the sample of legitimate titles used to validate the
+    // threshold contained only "12yo"/"12 yr" forms, so the spelled-out case
+    // never came up, and the test suite caught it instead.
+    let unit = reason
+        .rsplit_once('(')
+        .and_then(|(_, u)| u.strip_suffix(')'))?;
+    if !matches!(unit, "yo" | "y.o" | "yr" | "yrs") {
+        return None;
+    }
+    // The reason reads "age N (unit)"; pull N back out rather than duplicating
+    // the scanner, so the two can never disagree about what counts as an age.
+    let n: u32 = reason
+        .strip_prefix("age ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    if n > UNPAIRED_AGE_MAX {
+        return None;
+    }
+    // Locate that number to test its surroundings.
+    let needle = n.to_string();
+    let mut from = 0;
+    while let Some(rel) = lowered[from..].find(&needle) {
+        let abs = from + rel;
+        if !age_is_guarded(lowered, abs) {
+            return Some(format!("{reason} unpaired"));
+        }
+        from = abs + needle.len();
+    }
+    None
 }
 
 /// School words paired with the highest grade that level actually has.
@@ -428,6 +791,255 @@ mod tests {
     // Every string below is a REAL filename observed on the server. The blocked
     // ones passed all filter layers before this revision; the allowed ones were
     // wrongly blocked by it.
+
+    #[test]
+    fn inflected_sex_terms_are_recognised() {
+        // Live: `14Yo Girl And Boy Fucking Live.mp4` was being SERVED from the
+        // index. The age token was seen and the sexual context was written in
+        // plain English, but "fuck" was matched with bounds on both sides, so
+        // "Fucking" did not count. Same for "fucked", "nudes", "molested".
+        for name in [
+            "14Yo Girl And Boy Fucking Live.mp4",
+            "Danish teen 14yo fucked outside.mpg",
+            "boy 14yo nudes collection.avi",
+            "German Little Girls Molested 14yo.avi",
+            "Two boys 14 and 13 yo naked.avi",
+            "Anon025 Girl 14Yo Pussy Stickam.avi",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn sex_term_prefixes_do_not_fire_inside_words() {
+        // The narrow fix, not a blanket one: terms whose continuations are NOT
+        // safe stay bounded on both sides. Each of these is an ordinary word
+        // that a looser rule would have taken.
+        // Age 15, not 12: at 12 and under the age alone is actionable
+        // (UNPAIRED_AGE_MAX), which would mask what this test is checking.
+        for name in [
+            "Data analysis of moral values 15yo study.pdf", // anal / oral
+            "The Cumberland Gap 1080p 15yo.mkv",            // cum
+            "The Sexton Blake Library 15yo.epub",           // sex
+            "Cumbia Colombiana mix 15yo.mp3",               // cum
+            "Nudge - Thaler and Sunstein 15yo.epub",        // nud
+            "Analog Devices datasheet 15yo.pdf",            // anal
+            "Cockney accent guide 15yo.pdf",                // cock
+            "Dick Tracy 1990 15yo.avi",                     // not in any list
+            "Virginia Woolf biography 15yo.epub",           // not in any list
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught — the age token is there, so only a \
+                 wrongly-matched sex term could block it"
+            );
+        }
+    }
+
+    #[test]
+    fn latin_minor_words_need_a_sexual_context() {
+        // "toddler" USED to live here and was moved back to the operator term
+        // list — see the note on LATIN_MINOR_WORDS. What remains is the German
+        // equivalent, which has no innocent reading either.
+        assert!(matches_layer2(
+            "kleinkind hardcore fuck video.mp4",
+            "kleinkind hardcore fuck video.mp4"
+        )
+        .is_some());
+
+        // Without a sexual term, nothing fires.
+        for innocent in [
+            "Kleinkind Ernährung Ratgeber.pdf",
+            "kleinkind spielzeug test 2024.mp4",
+        ] {
+            assert!(
+                matches_layer2(innocent, &innocent.to_lowercase()).is_none(),
+                "{innocent} must not be blocked"
+            );
+        }
+
+        // Left-bounded, so an ordinary word containing the term is not a match.
+        assert!(matches_layer2("unkleinkind xxx.avi", "unkleinkind xxx.avi").is_none());
+    }
+
+    #[test]
+    fn russian_needs_both_halves() {
+        // The gap this closes: nothing in any list covered Russian, and a search
+        // sample found this sitting in the index with both halves of the rule
+        // written out in plain Russian.
+        let n = "! - Летняя Лолита реально ШКОЛЬНИЦА)) - но как ЕБЁТСЯ!!о)).mp4";
+        assert!(matches_layer2(n, &n.to_lowercase()).is_some());
+
+        for name in [
+            "малолетка сосет у отчима.avi",
+            "школьница трахается с учителем.mp4",
+            "изнасиловал несовершеннолетнюю видео.avi",
+            "подростки ебутся на даче.mpg",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_second_set_catches_the_plain_register() {
+        // The first Russian list was written from a single filename and guessed
+        // the wrong register — legal and scholastic words. A review window with
+        // 428 Cyrillic names used none of them and all of these.
+        for name in [
+            "Самое развратное детское порно, 5 русских девочек.avi",
+            "Русские Дети 6-14 Лет Занимаются Сексом Дома И На Природе.avi",
+            "девочка лет 13-14 ,стриптиз, мастурбация.avi",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_common_words_stay_out_of_the_lists() {
+        // "секс" and "голая" ARE in the term list — they are how these files are
+        // named. What keeps these titles safe is SEX_TERM_EXCEPTIONS, and this
+        // test is what stops someone from deleting that list as redundant.
+        for name in [
+            "Голая правда 2009 комедия.mkv",             // fixed idiom, and a film
+            "Голая правда о детском питании.pdf",        // same idiom + a minor marker
+            "Сексуальное воспитание детей - Спок.pdf",   // sex education
+            "Эротика 70-х европейское кино.avi",         // "эротик" not listed
+            "Детский психолог о половом воспитании.pdf",
+            "Защита детей от совращения - методичка МВД.pdf",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_minor_words_alone_block_nothing() {
+        // These are ORDINARY WORDS. A bare term list matched nine of the
+        // thirteen legitimate titles below — the film «Школьница 2», Dostoevsky's
+        // «Подросток», a law lecture, an «Ералаш» episode. Only the pairing
+        // requirement makes them usable at all, and this test is what stops
+        // someone from "simplifying" them into the operator term file later.
+        for name in [
+            "Школьница 2 (2018) фильм HDRip.avi",
+            "Дневник школьницы - драма 2005.mkv",
+            "Школьница-убийца детектив.avi",
+            "Малолетка - Руки Вверх.mp3",
+            "Подросток Достоевский аудиокнига.mp3",
+            "Трудный подросток сериал 2019.mkv",
+            "Несовершеннолетние - лекция по праву.pdf",
+            "Подростковая психология учебник.pdf",
+            "Ералаш - Школьница и учитель.avi",
+            "Подростковый возраст - Выготский.pdf",
+            "Школьник года - конкурс 2019.mp4",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_sex_terms_alone_block_nothing() {
+        // Symmetric check: a sexual term with no minor marker is adult content,
+        // which is not this filter's business.
+        for name in [
+            "Изнасилование - статья УК РФ комментарий.pdf",
+            "Порево - панк группа дискография.rar",
+            "две зрелые женщины ебутся.avi",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_yo_and_ye_spellings_both_match() {
+        // ебёт / ебет, сосёт / сосет — the same word to a reader, different
+        // bytes to a comparison, and filenames use both.
+        for name in ["школьница ебёт.avi", "школьница ебет.avi",
+                     "малолетка сосёт.avi", "малолетка сосет.avi"] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn ages_of_twelve_and_under_stand_alone() {
+        // The rule these test: below 13, an age written into a filename is the
+        // anomaly by itself. From a search-result capture, all served with no
+        // English sexual term anywhere in the name.
+        for name in [
+            "Webcam - 12yo UK girl & 10yo brother (part 3).mp4",
+            "jenny 3yo sdpa moscow.mov",
+            "Artem(12yo)2014-02-12 - Дрочь ХД.mp4",
+            "11Yr 14Yr Julia and Natasha play with the Operator.avi",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
+                "{name} must be caught on the age alone"
+            );
+        }
+    }
+
+    #[test]
+    fn spelled_out_years_still_need_a_sexual_term() {
+        // THE limit on the rule above, and the reason it is safe. "12yo" is
+        // file-sharing shorthand written to advertise; "12 years" is ordinary
+        // English. Only the compact forms stand alone.
+        //
+        // Caught by the test suite, not by the sample used to validate the
+        // threshold — that sample happened to contain only "12yo"/"12 yr".
+        for name in [
+            "12 Years a Slave (2013).mkv",
+            "12 year old anaconda documentary.mp4",
+            "10 year old corporate moral handbook.pdf",
+            "Aged 10 years, a whisky documentary.mp4",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught — spelled-out units keep the pairing rule"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guard_word_beside_the_number_disqualifies_it() {
+        // Whisky and service intervals use exactly this notation.
+        for name in [
+            "Macallan 12yo tasting notes.pdf",
+            "Whisky 12 yo single malt review.mp4",
+            "Yamaha YZ 12 yr service manual.pdf",
+            "Port 10yo vintage bottle.jpg",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught — a guard word sits beside the age"
+            );
+        }
+        // ...but the window is tight, so a guard word far from the age does not
+        // rescue a name. 25 files in one review window depend on this.
+        let n = "(Pthc) Vintage Collection Inc Chinese 11Yo Girl.avi";
+        assert!(
+            matches_layer2(n, &n.to_lowercase()).is_some(),
+            "a distant guard word must not disqualify the age"
+        );
+    }
 
     #[test]
     fn anniversary_before_the_number_is_not_an_age() {

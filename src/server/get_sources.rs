@@ -97,10 +97,16 @@ pub fn handle_get_sources(
     //
     // Ahead of the cache on purpose: a cached payload built before the hash was
     // listed would otherwise keep being served for the life of its TTL.
-    if state.filter.hash_is_listed(&req.file_hash) {
+    let withheld_name = state
+        .file_slab
+        .with_record_by_hash(&req.file_hash, |_id, r| r.name.to_string());
+    if state
+        .filter
+        .is_withheld_opt(&req.file_hash, withheld_name.as_deref())
+    {
         debug!(
             file_hash = hex::encode(req.file_hash),
-            "getsources refused: hash is listed"
+            "getsources refused: file is withheld by the content filter"
         );
         return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
     }

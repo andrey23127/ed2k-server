@@ -215,6 +215,45 @@ impl ContentFilter {
             || self.hash_filter_set.load().contains(file_hash)
     }
 
+    /// Same decision for a caller that has only a hash.
+    ///
+    /// `name` is resolved from the index by the caller; when the file is not in
+    /// the index there is no name to test and only the hash lists apply, which
+    /// is correct — a hash-only query for an unknown file cannot be answered
+    /// from a filename that does not exist.
+    pub fn is_withheld_opt(&self, file_hash: &[u8; 16], filename: Option<&str>) -> bool {
+        match filename {
+            Some(n) => self.is_withheld(file_hash, n),
+            None => self.hash_is_listed(file_hash),
+        }
+    }
+
+    /// Should this record be withheld from search results and source lists?
+    ///
+    /// Runs the FULL filter, not just the hash lists, and that is the point.
+    ///
+    /// A file enters the index when nothing matches it. If a term is added
+    /// later — and terms are added constantly, from exactly the review data this
+    /// server produces — the copy already indexed keeps being served. It is
+    /// caught again on every re-publish, so it appears in the review export
+    /// faithfully, while remaining in the index and in every search result. The
+    /// only thing that removed it was an operator pasting its hash into
+    /// `hash_banlist.txt` by hand.
+    ///
+    /// That made the term lists retroactive on paper and prospective in
+    /// practice: adding a marker stopped NEW copies and left old ones serving
+    /// indefinitely, since a live file's sources keep refreshing it and eviction
+    /// never comes.
+    ///
+    /// Cost is one `to_lowercase` plus the term scan per served record. Real
+    /// filenames are short, the scan exits on the first match, and the serving
+    /// paths already cap how many records they touch (200 results, 30 UDP
+    /// sources), so this is bounded work on a bounded set — unlike the publish
+    /// path, which runs the same check on every offered file anyway.
+    pub fn is_withheld(&self, file_hash: &[u8; 16], filename: &str) -> bool {
+        !matches!(self.check(file_hash, filename), FilterResult::Allow)
+    }
+
     /// Number of filter-only hashes loaded (for startup logging / web panel).
     pub fn hash_filter_size(&self) -> usize {
         self.hash_filter_set.load().len()
@@ -302,6 +341,49 @@ impl ContentFilter {
     }
 
     /// Check a candidate file. Layer order is fastest-rejection-first.
+    /// Undo UTF-8 that was decoded as Latin-1 and re-encoded, once or twice.
+    ///
+    /// Filenames travel through clients that guess at encodings, and the damage
+    /// is reversible because it is a pure byte transformation: text encoded
+    /// UTF-8, read as Latin-1, encoded UTF-8 again. Each round doubles the
+    /// leading bytes of every non-ASCII character, so `幼女` arrives as
+    /// `Ã¥Â¹Â¼Ã¥Â¥Â³` and no CJK term can match it — the bytes are no longer
+    /// that character. 494 names in one review window carried this damage.
+    ///
+    /// STRICT decoding, deliberately. A lossy variant was tried and rejected: by
+    /// dropping bytes it cannot read it turns ordinary names into different
+    /// ordinary names — "España" into "Espaa", a Japanese title into ".avi" —
+    /// and scanning those for terms means scanning something the user never
+    /// wrote.
+    ///
+    /// LIMIT: names whose mojibake is itself lossy, where a client substituted
+    /// U+FFFD before re-encoding, are NOT recovered — their byte sequence is not
+    /// valid UTF-8 at any depth. Those need their hash listed instead.
+    ///
+    /// Returns None when nothing changes, so the caller skips the extra scan for
+    /// the overwhelming majority of names.
+    fn undo_mojibake(name: &str) -> Option<String> {
+        fn one_round(s: &str) -> Option<String> {
+            if !s.chars().any(|c| c as u32 >= 0x80) {
+                return None; // pure ASCII cannot be mojibake
+            }
+            // Every char must have come from a single byte for the Latin-1
+            // round-trip to be the explanation.
+            let bytes: Option<Vec<u8>> = s
+                .chars()
+                .map(|c| if (c as u32) < 0x100 { Some(c as u8) } else { None })
+                .collect();
+            let decoded = String::from_utf8(bytes?).ok()?;
+            (decoded != s).then_some(decoded)
+        }
+
+        let first = one_round(name)?;
+        // Two rounds are common — the damage often happens once on the way in
+        // and once on the way out. Stop there: a third round on legitimate text
+        // starts producing plausible-looking garbage.
+        Some(one_round(&first).unwrap_or(first))
+    }
+
     pub fn check(&self, file_hash: &[u8; 16], filename: &str) -> FilterResult {
         // Whitelist first, and it now overrides EVERY layer rather than only the
         // hash lists.
@@ -340,6 +422,25 @@ impl ContentFilter {
         let lowered = filename.to_lowercase();
 
         // Layer 1: jargon (list loaded at runtime; empty = inactive)
+        // Mojibake pass: if the name is recoverable text, test the recovered form
+        // too. Only the non-ASCII terms can gain anything — the ASCII part of a
+        // mangled name is untouched and the scans below already cover it — but
+        // those are exactly the terms this damage hides.
+        if let Some(recovered) = Self::undo_mojibake(filename) {
+            let rec_lower = recovered.to_lowercase();
+            let jt = self.jargon_terms.load();
+            if let Some(term) = jargon::matches_terms(&rec_lower, &jt) {
+                return FilterResult::Block(Layer::L1Jargon, format!("{term} (mojibake)"));
+            }
+            let ex = self.extra_terms.load();
+            if let Some(term) = jargon::matches_terms(&rec_lower, &ex) {
+                return FilterResult::Block(Layer::L4Extra, format!("{term} (mojibake)"));
+            }
+            if let Some(reason) = age_pattern::matches_layer2(&recovered, &rec_lower) {
+                return FilterResult::Block(Layer::L2AgePattern, format!("{reason} (mojibake)"));
+            }
+        }
+
         // Bind the guard first: the returned &str borrows from it, and a guard
         // created inline inside the `if let` condition is a temporary whose
         // lifetime rules changed between editions. An explicit binding is correct
@@ -546,6 +647,41 @@ mod tests {
             f.check(&h, "whatever.mp4"),
             FilterResult::Block(Layer::L3HashBlock, _)
         ));
+    }
+
+    #[test]
+    fn mojibake_names_are_tested_in_recovered_form() {
+        // "幼女" round-tripped through Latin-1 twice. As delivered no CJK term
+        // can match it — the bytes are no longer that character.
+        let f = ContentFilter::new().with_extra_terms(["幼女".to_string()]);
+        let mangled = "Ã¥Â¹Â¼Ã¥Â¥Â³ test.avi";
+        assert!(mangled.find('幼').is_none(), "the marker really is not there");
+        match f.check(&zh(), mangled) {
+            FilterResult::Block(Layer::L4Extra, reason) => {
+                assert!(reason.contains("mojibake"), "reason should say how it matched");
+            }
+            other => panic!("recovered form must match: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ordinary_names_survive_the_mojibake_pass() {
+        // The pass must not invent matches out of legitimate text. A lossy
+        // decoder was tried and rejected for exactly this: it turns "España"
+        // into "Espaa" and a Japanese title into ".avi", then scans the result.
+        let f = ContentFilter::new().with_extra_terms(["幼女".to_string(), "brosis".to_string()]);
+        for name in [
+            "España vs Argentina 2026.ts",
+            "El.joven.Sheldon.1x11.números.avi",
+            "普通の日本語ファイル.avi",
+            "Marc Dorcel - Girls At Work N°1.avi",
+            "plain ascii movie.avi",
+        ] {
+            assert!(
+                matches!(f.check(&zh(), name), FilterResult::Allow),
+                "{name} must pass"
+            );
+        }
     }
 
     #[test]

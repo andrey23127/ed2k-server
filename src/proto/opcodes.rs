@@ -123,6 +123,43 @@ pub const SRVFLG_UNICODE: u32 = 0x0010;
 pub const SRVFLG_LARGEFILES: u32 = 0x0100;
 /// Server supports obfuscated (RC4) connections — makes eMule show "Obfuscation: Yes"
 pub const SRVFLG_SUPPORTCRYPT: u32 = 0x0800;
+/// Server UDP capability mask advertised in ST_UDPFLAGS and GLOBSERVSTATRES.
+///
+/// 0x073B. Was 0x17FB, copied wholesale from Lugdunum 17.15 as seen in captures;
+/// bit 0x1000 is dropped because nothing on the network knows what it means —
+/// not eMule's `Server.h`, not aMule's `Client2Server/UDP.h`, not mldonkey's
+/// `donkeyProtoServer.ml`, which is the most permissive parser of the three.
+/// A bit no client can interpret promises nothing and can only mislead a reader
+/// of our own traffic.
+///
+/// What each remaining bit claims, and why it is earned:
+///
+/// | bit | name | evidence |
+/// |---|---|---|
+/// | 0x0001 | EXT_GETSOURCES | 0x9A answered with 0x9B carrying id+port per source |
+/// | 0x0002 | EXT_GETFILES | 0x92 and 0x90 both handled (0x92 added in 0.9.71) |
+/// | 0x0008 | NEWTAGS | all 987 tags in a 245-result capture use the 0x80 form |
+/// | 0x0010 | UNICODE | non-ASCII filenames decode as valid UTF-8 in replies |
+/// | 0x0020 | EXT_GETSOURCES2 | 0x94 records walked correctly (fixed in 0.9.71) |
+/// | 0x0040 | RELATEDSEARCH | NOT implemented — kept pending a decision |
+/// | 0x0080 | TYPETAGINTEGER | FT_FILETYPE emitted as an integer in both result paths |
+/// | 0x0100 | LARGEFILES | FT_FILESIZE_HI emitted; 17 GiB file observed correct |
+/// | 0x0200 | UDPOBFUSCATION | the large majority of our UDP output is obfuscated |
+/// | 0x0400 | TCPOBFUSCATION | handshake verified by capture against eMule/aMule |
+///
+/// 0x0040 RELATEDSEARCH is advertised and not implemented, deliberately. It is a
+/// real Lugdunum feature: `Is_related_search` (eserver decompile) recognises a
+/// search term literally beginning "related:", parses up to 32 `count:hash`
+/// pairs out of it, and rewrites the node to type 0x4F — so it is an ordinary
+/// search whose text has a special shape, not a separate opcode. Building it
+/// here is tractable (the user→files index already exists) but its value at this
+/// index size is unproven, and it would expose which publisher holds what.
+/// Documented rather than silently wrong; clearing the bit is one edit.
+///
+/// Note 0x0004 has never been set. Whoever assembled the original mask left it
+/// out, and no client defines it either.
+pub const SERVER_UDP_FLAGS: u32 = 0x0000_073B;
+
 /// Server prefers obfuscated connections
 pub const SRVFLG_REQUESTCRYPT: u32 = 0x1000;
 

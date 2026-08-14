@@ -216,8 +216,9 @@ pub fn build_welcome_batch(
             // ST_TCPFLAGS to have bit 0x400 (SRV_UDPFLG_TCPOBFUSCATION) set.
             // From eMule's server.h: SupportsObfuscationTCP() =
             //   GetObfuscationPortTCP() != 0 && ((UDPFlags & 0x400) || (TCPFlags & 0x400))
-            // 0x17FB = full Lugdunum 17.15 capability mask (matches GLOBSERVSTATRES udp_flags).
-            Tag::byte(ST_UDPFLAGS,    TagValue::U32(0x0000_17FB)),
+            // Single source of truth, shared with GLOBSERVSTATRES — see the
+            // per-bit table on SERVER_UDP_FLAGS.
+            Tag::byte(ST_UDPFLAGS,    TagValue::U32(SERVER_UDP_FLAGS)),
             // ST_TCPPORTOBFUSCATION / ST_UDPPORTOBFUSCATION — eMule casts to uint16,
             // but values are stored in tags as u32 (eMule code: m_nObfuscationPortTCP = (uint16)tag->GetInt()).
             // Non-zero TCP obf port is required for SupportsObfuscationTCP() to return true.

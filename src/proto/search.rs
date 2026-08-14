@@ -231,6 +231,92 @@ fn walk_terms(node: &SearchNode, out: &mut Vec<String>, in_negation: bool) {
 /// This mirrors how Lugdunum and other eD2k servers handle FT_FILETYPE search
 /// constraints — they map the extension to a category, since the server only
 /// stores filenames, not media metadata.
+// ── Extension sets per eD2k file-type category ──────────────────────────
+// Shared by the numeric classifier and the string matcher, so the two cannot
+// disagree about what counts as a video.
+const AUDIO_EXT: &[&str] = &[
+    "mp3", "mp2", "m4a", "wav", "wma", "ogg", "flac", "aac", "ac3",
+    "aif", "aiff", "ape", "mpc", "mid", "midi", "ra", "wv", "opus",
+    ];
+const VIDEO_EXT: &[&str] = &[
+    "avi", "mpg", "mpeg", "mp4", "mkv", "wmv", "mov", "flv", "ogm",
+    "m4v", "rm", "rmvb", "vob", "asf", "divx", "xvid", "3gp", "ts",
+    "m2ts", "webm", "mpe", "ifo",
+    ];
+const IMAGE_EXT: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "psd",
+    "ico", "svg", "raw", "cr2", "nef",
+    ];
+const PROGRAM_EXT: &[&str] = &[
+    "exe", "msi", "bat", "com", "dll", "deb", "rpm", "dmg", "apk",
+    "jar", "app", "bin", "run",
+    ];
+const DOCUMENT_EXT: &[&str] = &[
+    "doc", "docx", "pdf", "txt", "rtf", "odt", "xls", "xlsx", "ppt",
+    "pptx", "epub", "mobi", "djvu", "chm", "tex", "ods", "odp",
+    ];
+const ARCHIVE_EXT: &[&str] = &[
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "ace", "arj",
+    "cab", "lzh", "z", "tgz", "zst",
+    ];
+const CDIMAGE_EXT: &[&str] = &[
+    "iso", "nrg", "cue", "img", "bin", "mdf", "ccd", "cdi",
+    ];
+
+
+/// eD2k numeric file-type IDs, as defined by eserver 17.6+ and mirrored in
+/// eMule's `EED2KFileType` (OtherFunctions.h:442). These are what the
+/// `SRV_TCPFLG_TYPETAGINTEGER` capability bit promises: `FT_FILETYPE` delivered
+/// as an integer rather than as the older "Video"/"Audio" strings.
+pub mod ed2k_file_type {
+    pub const ANY: u32 = 0;
+    pub const AUDIO: u32 = 1;
+    pub const VIDEO: u32 = 2;
+    pub const IMAGE: u32 = 3;
+    pub const PROGRAM: u32 = 4;
+    pub const DOCUMENT: u32 = 5;
+    pub const ARCHIVE: u32 = 6;
+    pub const CDIMAGE: u32 = 7;
+    pub const EMULECOLLECTION: u32 = 8;
+}
+
+/// Classify a filename into an eD2k file-type ID by its extension.
+///
+/// Returns `ANY` (0) when the extension is unknown or absent, which is the
+/// "no opinion" value — a client filtering by type treats it as non-matching
+/// rather than as a wrong answer.
+///
+/// The server stores filenames and nothing else, so extension is all there is
+/// to go on; this is exactly how Lugdunum does it too.
+pub fn ed2k_file_type_id(name_lower: &str) -> u32 {
+    use ed2k_file_type as t;
+    let ext = match name_lower.rsplit('.').next() {
+        Some(e) if e != name_lower => e,
+        _ => return t::ANY,
+    };
+    // Order matters where an extension appears in two tables: "bin" is both a
+    // raw executable and a CD-image track, and PROGRAM is checked first. Either
+    // answer is defensible; what matters is that it is stable, since a client
+    // filtering by type will not find the file under the other category.
+    for (cat, set) in [
+        (t::AUDIO, AUDIO_EXT),
+        (t::VIDEO, VIDEO_EXT),
+        (t::IMAGE, IMAGE_EXT),
+        (t::PROGRAM, PROGRAM_EXT),
+        (t::DOCUMENT, DOCUMENT_EXT),
+        (t::ARCHIVE, ARCHIVE_EXT),
+        (t::CDIMAGE, CDIMAGE_EXT),
+    ] {
+        if set.contains(&ext) {
+            return cat;
+        }
+    }
+    if ext == "emulecollection" {
+        return t::EMULECOLLECTION;
+    }
+    t::ANY
+}
+
 fn file_type_matches(name_lower: &str, type_value: &str) -> bool {
     let ext = match name_lower.rsplit('.').next() {
         Some(e) if e != name_lower => e, // require an actual "." in the name
@@ -238,43 +324,14 @@ fn file_type_matches(name_lower: &str, type_value: &str) -> bool {
     };
 
     // Extension sets per eD2k file-type category.
-    const AUDIO: &[&str] = &[
-        "mp3", "mp2", "m4a", "wav", "wma", "ogg", "flac", "aac", "ac3",
-        "aif", "aiff", "ape", "mpc", "mid", "midi", "ra", "wv", "opus",
-    ];
-    const VIDEO: &[&str] = &[
-        "avi", "mpg", "mpeg", "mp4", "mkv", "wmv", "mov", "flv", "ogm",
-        "m4v", "rm", "rmvb", "vob", "asf", "divx", "xvid", "3gp", "ts",
-        "m2ts", "webm", "mpe", "ifo",
-    ];
-    const IMAGE: &[&str] = &[
-        "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "psd",
-        "ico", "svg", "raw", "cr2", "nef",
-    ];
-    const PROGRAM: &[&str] = &[
-        "exe", "msi", "bat", "com", "dll", "deb", "rpm", "dmg", "apk",
-        "jar", "app", "bin", "run",
-    ];
-    const DOCUMENT: &[&str] = &[
-        "doc", "docx", "pdf", "txt", "rtf", "odt", "xls", "xlsx", "ppt",
-        "pptx", "epub", "mobi", "djvu", "chm", "tex", "ods", "odp",
-    ];
-    const ARCHIVE: &[&str] = &[
-        "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "ace", "arj",
-        "cab", "lzh", "z", "tgz", "zst",
-    ];
-    const CDIMAGE: &[&str] = &[
-        "iso", "nrg", "cue", "img", "bin", "mdf", "ccd", "cdi",
-    ];
-
     let set: &[&str] = match type_value {
-        "audio" => AUDIO,
-        "video" => VIDEO,
-        "image" => IMAGE,
-        "pro"   => PROGRAM,
-        "doc"   => DOCUMENT,
-        "arc"   => ARCHIVE,
-        "iso"   => CDIMAGE,
+        "audio" => AUDIO_EXT,
+        "video" => VIDEO_EXT,
+        "image" => IMAGE_EXT,
+        "pro"   => PROGRAM_EXT,
+        "doc"   => DOCUMENT_EXT,
+        "arc"   => ARCHIVE_EXT,
+        "iso"   => CDIMAGE_EXT,
         // Unknown category — don't filter the file out.
         _ => return true,
     };
@@ -451,6 +508,48 @@ mod tests {
 #[cfg(test)]
 mod filetype_tests {
     use super::*;
+
+    #[test]
+    fn numeric_file_type_ids_match_the_ed2k_table() {
+        use ed2k_file_type as t;
+        // Values are fixed by eserver 17.6+ / eMule's EED2KFileType — a client
+        // filtering by type compares against these exact numbers.
+        assert_eq!(ed2k_file_type_id("song.mp3"), t::AUDIO);
+        assert_eq!(ed2k_file_type_id("movie.mkv"), t::VIDEO);
+        assert_eq!(ed2k_file_type_id("photo.jpeg"), t::IMAGE);
+        assert_eq!(ed2k_file_type_id("setup.exe"), t::PROGRAM);
+        assert_eq!(ed2k_file_type_id("book.pdf"), t::DOCUMENT);
+        assert_eq!(ed2k_file_type_id("pack.rar"), t::ARCHIVE);
+        assert_eq!(ed2k_file_type_id("disc.iso"), t::CDIMAGE);
+        assert_eq!(ed2k_file_type_id("list.emulecollection"), t::EMULECOLLECTION);
+
+        // ANY means "no opinion", and the caller must not emit a tag for it —
+        // a literal 0 would read as a category matching nothing.
+        assert_eq!(ed2k_file_type_id("readme"), t::ANY, "no extension at all");
+        assert_eq!(ed2k_file_type_id("data.qqq"), t::ANY, "unknown extension");
+        assert_eq!(ed2k_file_type_id(".hidden"), t::ANY, "dotfile, not an extension");
+
+        // Ambiguous extension resolves to the first table that lists it.
+        assert_eq!(ed2k_file_type_id("firmware.bin"), t::PROGRAM);
+    }
+
+    #[test]
+    fn numeric_and_string_classifiers_agree() {
+        // The two share one set of extension tables precisely so they cannot
+        // drift; this pins that.
+        use ed2k_file_type as t;
+        for (name, cat, s) in [
+            ("a.mp3", t::AUDIO, "audio"),
+            ("a.avi", t::VIDEO, "video"),
+            ("a.png", t::IMAGE, "image"),
+            ("a.exe", t::PROGRAM, "pro"),
+            ("a.epub", t::DOCUMENT, "doc"),
+            ("a.7z", t::ARCHIVE, "arc"),
+        ] {
+            assert_eq!(ed2k_file_type_id(name), cat);
+            assert!(file_type_matches(name, s), "{name} vs {s}");
+        }
+    }
 
     #[test]
     fn file_type_by_extension() {

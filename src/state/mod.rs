@@ -250,9 +250,30 @@ pub const ALIAS_MAX_FILES: usize = 20_000;
 /// 20k cap was exhausted within hours — which also meant genuine candidates were
 /// being refused admission.
 ///
-/// Masquerading targets large media files, so a floor costs nothing and removes
-/// essentially all of the noise.
-pub const ALIAS_MIN_SIZE: u64 = 10 * 1024 * 1024;
+/// LOWERED from 10 MB to 2 MB. The original figure came with the reasoning that
+/// "masquerading targets large media files, so a floor costs nothing". That was
+/// wrong, and the counterexample is instructive.
+///
+/// A verified decoy from a live review: a 7.2 MB file published as
+/// "<artist> - <track>.mp3". It is a technically valid MPEG layer III stream —
+/// `file(1)` identifies it, a player opens it, the duration reads 31 minutes —
+/// and its entire content is ONE 64-byte frame repeated 117 520 times. Since
+/// every eD2k chunk of it is byte-identical, every chunk hashes the same, and a
+/// downloader that has fetched any ~37 KB sees the rest "verified" and reports
+/// the file complete.
+///
+/// Nothing the server holds distinguishes that from a real track. The size is
+/// honest, the extension matches the content, the name is unremarkable. The only
+/// signal is the one the alias table exists to find — the same hash arriving
+/// under a different name from each source — and a 10 MB floor put the whole
+/// music range, which is where these live, outside the table's view. Three of
+/// nine decoys confirmed in one window were under the floor, and their review
+/// rows showed `names=1` purely because nothing was being collected.
+///
+/// 2 MB still excludes the noise the floor was introduced for (icons, saved
+/// pages, empty files, small archives) while covering ordinary audio. The table
+/// stays bounded by ALIAS_MAX_FILES and its TTL regardless.
+pub const ALIAS_MIN_SIZE: u64 = 2 * 1024 * 1024;
 
 pub struct ServerState {
     pub clients: DashMap<UserHash, ClientHandle>,

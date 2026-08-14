@@ -360,6 +360,29 @@ contain a marker word, or historical texts whose title does — so an override t
 left the term layers running did nothing for the one class of mistake that
 happens in practice.
 
+### Layer 2: age plus context
+
+Layer 2 normally needs BOTH an age claim and a sexual term, so a birthday video
+is not caught. Three refinements to that rule:
+
+- **Ages of 12 and under stand alone.** Below 13 an age written into a filename
+  is the anomaly by itself — legal material does not label participants "11yo".
+  Only the compact notations (`yo`, `yr`) qualify; `12 years` is ordinary English
+  and keeps the pairing rule, or "12 Years a Slave" would be blocked. Guard words
+  near the number (`whisk`, `malt`, `service manual`) disqualify it.
+- **Non-English contexts.** Russian minor/sexual word lists were added after a
+  search sample found files with both halves written in plain Russian and nothing
+  in any list covering them. These are ordinary words and work only behind the
+  pairing rule — measured against legitimate Russian titles, a bare term list
+  matched nine of thirteen.
+- **Fixed innocent phrases override everything** (`SEX_TERM_EXCEPTIONS`). Some
+  broad terms are common words inside set expressions — an idiom that is also a
+  film title, the name of a school subject. Naming the phrase keeps the term
+  usable; narrowing the term instead cost five of six real catches in testing.
+
+Filenames damaged by repeated UTF-8/Latin-1 round-trips are recovered and
+re-tested, so a CJK marker mangled into `Ã¥Â¹Â¼` still matches.
+
 ### Term matching
 
 L1 and L4 share one matcher. A term is classified by length: **≥6 chars** →
@@ -367,7 +390,8 @@ substring match, **≤5** → word-boundary match. Three refinements matter:
 
 - A long term must not begin immediately after an ASCII letter. Without this a
   six-character term that is a suffix of an ordinary English word fires inside
-  it — one such term blocked every medical paper mentioning *fibrosis*.
+  it — one such term was a suffix of a common medical word and blocked every
+  paper mentioning it.
 - Digits and `_` separate, letters bind: `term_001`, `2term` and `term2011` all
   match, `aterm` and `termly` do not.
 - A trailing `$` on a term additionally forbids digits and `_` after the match.

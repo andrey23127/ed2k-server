@@ -164,17 +164,38 @@ pub enum CryptState {
 /// Waiting → [parse client DH + generate B] → Negotiating
 /// Negotiating → [decrypt and verify client ack] → Encrypting
 /// ```
-/// Client-side halves of the DH handshake, exported for tests only.
+/// Client-side halves of the DH handshake, exposed for tests only.
 ///
-/// The end-to-end test in `server::obfuscated_conn` needs to act as a real
-/// eMule client over a real socket; without these it could only re-test the
-/// in-memory path this module already covers.
+/// The end-to-end test in `server::obfuscated_conn` has to act as a real eMule
+/// client over a real socket; without these it could only re-test the in-memory
+/// path this module already covers.
+///
+/// These are thin wrappers rather than `pub use` re-exports: the items they wrap
+/// are private, and `pub use` cannot widen the visibility of a private item.
+/// A child module CAN see its parent's private items, so calling through is the
+/// way to expose them without making them `pub` in the production build — which
+/// is the point, since nothing outside tests should reach the raw DH primitives.
 #[cfg(test)]
 pub(crate) mod test_client {
-    pub use super::{
-        derive_rc4, dh_pow_mod, dh_shared, DH_PRIVATE_SIZE, EM_OBFUSCATE, MAGIC_SYNC,
-        MAGIC_VALUE_REQUESTER, MAGIC_VALUE_SERVER,
-    };
+    pub(crate) use super::Rc4;
+
+    pub(crate) const DH_PRIVATE_SIZE: usize = super::DH_PRIVATE_SIZE;
+    pub(crate) const EM_OBFUSCATE: u8 = super::EM_OBFUSCATE;
+    pub(crate) const MAGIC_SYNC: u32 = super::MAGIC_SYNC;
+    pub(crate) const MAGIC_VALUE_REQUESTER: u8 = super::MAGIC_VALUE_REQUESTER;
+    pub(crate) const MAGIC_VALUE_SERVER: u8 = super::MAGIC_VALUE_SERVER;
+
+    pub(crate) fn dh_pow_mod(exp_bytes: &[u8]) -> Vec<u8> {
+        super::dh_pow_mod(exp_bytes)
+    }
+
+    pub(crate) fn dh_shared(a_pub: &[u8], b_priv: &[u8]) -> Vec<u8> {
+        super::dh_shared(a_pub, b_priv)
+    }
+
+    pub(crate) fn derive_rc4(shared_secret: &[u8], magic: u8) -> Rc4 {
+        super::derive_rc4(shared_secret, magic)
+    }
 }
 
 pub struct TcpObfuscation {

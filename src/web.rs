@@ -968,7 +968,7 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
              # to the first. [!] marks a size that contradicts the extension (a\n\
              # 690 MB \"PDF\"). Size is given in exact bytes as well as MB — the\n\
              # rounded figure hides which files came from one generator; see the\n\
-             # size-collision section that follows. Files under 10 MB are not\n\
+             # size-collision section that follows. Files under 2 MB are not\n\
              # tracked.\n\n",
             aliases.len()
         ));
@@ -1682,7 +1682,12 @@ function fmt(n) { return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).
 function fmtDur(s) {
   if (s < 60) return s+'s';
   if (s < 3600) return Math.floor(s/60)+'m '+( s%60)+'s';
-  return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+  // Past a day, hours alone stop being readable — "47h 12m" takes a moment to
+  // turn into "about two days". Days are the last unit: weeks and months are
+  // worse, since nobody counts a 40-day uptime in weeks.
+  if (s < 86400) return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m';
+  const d = Math.floor(s/86400);
+  return d+(d === 1 ? ' day ' : ' days ')+Math.floor((s%86400)/3600)+'h '+Math.floor((s%3600)/60)+'m';
 }
 function countryFlag(code) {
   if (!code || code === '??') return '🌐';
