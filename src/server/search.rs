@@ -54,11 +54,20 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
 
     debug!(?tokens, "search tokens extracted from tree");
 
-    // All tokens lowercase; only skip literal wildcards ("*", "**").
-    // Do NOT filter by length — eMule sends 1-2 char tokens ("HD", "OS", etc.)
-    // and filtering them breaks those searches.
-    let token_lower: Vec<String> = tokens.iter()
-        .map(|t| t.to_lowercase())
+    // Split each term the way the INDEXER splits filenames, then drop literal
+    // wildcards.
+    //
+    // A term is not necessarily one word. Some clients send a whole query as a
+    // single node, so `"linux ubuntu"` arrives here space and all — and looking
+    // that up verbatim can only miss, because the index holds `linux` and
+    // `ubuntu` separately and no key ever contains a space. Searching either
+    // word worked; searching both returned nothing.
+    //
+    // Do NOT filter by length afterwards: eMule sends 1-2 char tokens ("HD",
+    // "OS") and `tokenize_search_term` already preserves those.
+    let token_lower: Vec<String> = tokens
+        .iter()
+        .flat_map(|t| crate::state::keyword_index::tokenize_search_term(t))
         .filter(|t| t != "*" && t != "**")
         .collect();
 

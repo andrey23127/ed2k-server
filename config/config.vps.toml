@@ -73,6 +73,17 @@ hash_banlist = ["/etc/ed2k-server/hash_banlist.txt"]
 hash_filter = ["/etc/ed2k-server/hash_filter.txt"]
 extra_terms_file = "/etc/ed2k-server/csam_terms_extra.txt"
 jargon_terms_file = "/etc/ed2k-server/csam_jargon.txt"
+
+# Layer 2 vocabulary. Layer 2 blocks on the CO-OCCURRENCE of an age claim and a
+# sexual context, and its word lists used to be compiled into the binary — so
+# every addition meant a rebuild and a restart, and a restart drops every
+# connected client.
+#
+# Absent => the built-in lists are used, which is exactly what the server did
+# before this option existed. A file REPLACES the sections it names and leaves
+# the rest at their defaults. Hot-reloaded within 30 s of an mtime change.
+# See config/layer2_terms.txt.example for the format.
+layer2_terms_file = "/etc/ed2k-server/layer2_terms.txt"
 # Verified false positives. Overrides EVERY layer, not just the hash lists — the
 # mistakes that actually happen are term matches (song titles, historical texts).
 whitelist_hashes_file = "/etc/ed2k-server/whitelist_hashes.txt"

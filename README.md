@@ -279,6 +279,7 @@ a watched file) or needs a **restart**.
 | `hash_filter` | L5 filter-only file path(s) — blocked, publisher **not** accused | **live** |
 | `extra_terms_file` | L4 operator extra terms | **live** |
 | `jargon_terms_file` | L1 jargon list | **live** |
+| `layer2_terms_file` | L2 vocabulary (see below) | **live** |
 | `whitelist_hashes_file` | Hash false-positive overrides (wins over every layer) | **live** |
 | `publisher_attempt_disconnect_threshold` | Distinct blocked files tolerated before a publisher is banned (ban fires on the next one) | restart |
 | `publisher_count_window_seconds` | How far back those files are counted. Defaults to `publisher_blacklist_seconds` | restart |
@@ -361,6 +362,14 @@ left the term layers running did nothing for the one class of mistake that
 happens in practice.
 
 ### Layer 2: age plus context
+
+Layer 2's word lists live in `layer2_terms_file` rather than in the binary, and
+hot-reload like the other lists. They change often, and a rebuild-and-restart per
+change costs every connected client. With no file configured the built-in
+vocabulary is used, which is what the server did before the option existed; a
+file replaces the sections it names and leaves the rest alone. An unknown section
+name rejects the whole file and keeps the previous lists, because a typo would
+otherwise silently empty a category.
 
 Layer 2 normally needs BOTH an age claim and a sexual term, so a birthday video
 is not caught. Three refinements to that rule:

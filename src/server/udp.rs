@@ -1554,8 +1554,17 @@ impl UdpServer {
             }
         };
 
-        let tokens: Vec<String> = collect_terms(&tree).iter()
-            .map(|t| t.to_lowercase())
+        // Same splitting as the TCP path — see server/search.rs. The two must
+        // tokenize identically, or a query answered by one channel and not the
+        // other becomes a protocol-dependent result set.
+        let tokens: Vec<String> = collect_terms(&tree)
+            .iter()
+            .flat_map(|t| crate::state::keyword_index::tokenize_search_term(t))
+            // Wildcards are not keywords. The TCP path already dropped them;
+            // here they used to fall through as a literal "*" key, which
+            // matches nothing and turned a wildcard search into an empty
+            // result instead of the intended broad one.
+            .filter(|t| t != "*" && t != "**")
             .collect();
 
         if tokens.is_empty() { return Ok(()); }

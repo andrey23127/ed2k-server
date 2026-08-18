@@ -3,6 +3,8 @@
 //! Catches the pattern that defeated AND-only filters: filenames with a
 //! numeric age (0-17) plus a sexual-context word in any of several languages.
 
+use super::layer2_terms::Layer2Terms;
+
 /// Age regex as a hand-rolled scanner (avoids pulling in the `regex` crate
 /// for one pattern; this is in the OFFERFILES hot path).
 ///
@@ -21,6 +23,24 @@ const MIN_AGE: u32 = 1;
 /// rendered token shows which reading was taken. Both live false positives in
 /// this layer were spotted exactly this way.
 fn contains_minor_age_token(s: &str) -> Option<String> {
+    scan_minor_age_token(s, |_, _, _| true)
+}
+
+/// Scan for a minor-age token, returning the FIRST one that `accept` allows.
+///
+/// The predicate exists because callers disagree about what counts. The pairing
+/// rule takes any age token; the unpaired rule takes only ages at or below its
+/// threshold, written in a compact notation.
+///
+/// Returning only the first match REGARDLESS of the caller was a real bug:
+/// `Prostitutas 11y little baby whore PedoDad 10yo.wmv` was served from the
+/// index because the scan stopped at `11y`, whose suffix is not compact, and
+/// never reached the `10yo` that the unpaired rule would have fired on. A name
+/// was therefore only caught when a qualifying age happened to come FIRST.
+fn scan_minor_age_token<F>(s: &str, accept: F) -> Option<String>
+where
+    F: Fn(u32, &str, usize) -> bool,
+{
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -190,7 +210,12 @@ fn contains_minor_age_token(s: &str) -> Option<String> {
             }
         }
         if let Some(suf) = matched {
-            return Some(format!("age {age} ({suf})"));
+            if accept(age, suf, start) {
+                return Some(format!("age {age} ({suf})"));
+            }
+            // Rejected by the caller — keep scanning. This is the fix: the loop
+            // used to return here unconditionally, so a later qualifying token
+            // was never reached.
         }
         // No match - reset and continue scanning
         i = if after_digits > start { after_digits } else { i + 1 };
@@ -207,47 +232,14 @@ fn is_word_char(b: u8) -> bool {
 ///
 /// Long, unique terms (≥5 chars or non-Latin): always substring match.
 /// These cannot reasonably appear inside innocent English/Russian words.
-const SEX_TERMS_SUBSTRING: &[&str] = &[
-    // English (5+ chars, specific)
-    "porn", "blowjob", "handjob", "dildo", "orgasm", "masturbat",
-    // German
-    "sexuell", "ficken",
-    // Spanish/Portuguese (5+ chars)
-    "porno", "follar", "desnud",
-    // Italian
-    "sesso",
-    // Russian. "секс" and "голая" are broad on purpose — they are how these
-    // files are actually named — and are made safe by SEX_TERM_EXCEPTIONS below
-    // rather than by narrowing them. Dropping them was tried and cost five of
-    // six catches in a sample ("детский секс видео", "голая девочка",
-    // "секс с малолеткой"); the phrase list keeps both.
-    "секс", "порн", "голая", "обнаж",
-    // French
-    "sexe",
-    // CJK / Korean exploitation-specific terms (non-Latin → no Latin-word FP).
-    // These denote sexual exploitation; chosen to be specific rather than broad
-    // (we do NOT add generic adult terms that legal JAV uses).
-    "援助交際",   // enjo-kosai full form (compensated dating w/ minors)
-    "원조교제",   // Korean equivalent
-    "ロリ",       // "loli" (katakana) — paired with minor-age token in L2
-    "幼女",       // "young girl" (prepubescent) — strong CSAM marker
-    "近親相姦",   // incest (full form, specific)
-    "강간",       // rape (Korean)
-    "レイプ",     // rape (katakana)
-];
+// SEX_TERMS_SUBSTRING moved to Layer2Terms (filter/layer2_terms.rs).
 
 /// Short ambiguous terms — require WORD BOUNDARIES on both sides.
 /// Without this, "oral" matches "moral"/"temporal", "anal" matches
 /// "analysis"/"anaconda", "nud" matches anything ending in "nud-",
 /// "sex" matches "Sussex"/"unisex", causing massive false positives when
 /// combined with age tokens like "16 yo behavioral analysis study.pdf".
-const SEX_TERMS_WORD_BOUNDED: &[&str] = &[
-    "sex", "xxx", "anal", "oral", "cum",
-    "nackt",        // German
-    "nud", "scopa", // Italian
-    // Bounded on both sides because each is a prefix of ordinary words:
-    // analysis/analog/Anals, Cumberland/cumbia, Sexton/Sexto, Nudge.
-];
+// SEX_TERMS_WORD_BOUNDED moved to Layer2Terms (filter/layer2_terms.rs).
 
 /// Sex terms that may be FOLLOWED by anything, but must still start at a word
 /// boundary.
@@ -263,13 +255,7 @@ const SEX_TERMS_WORD_BOUNDED: &[&str] = &[
 /// whose continuations are safe belong here — measured against ordinary titles:
 /// `anal` would take Analog/analysis/Anals, `cum` would take Cumberland/cumbia,
 /// `sex` would take Sexton/Sexto, so those stay two-sided above.
-const SEX_TERMS_PREFIX: &[&str] = &[
-    "fuck",  // fucking, fucked, fucks
-    "nude",  // nudes
-    "naked",
-    "molest", // molested, molesting, molestation
-    "rape",   // raped, raping
-];
+// SEX_TERMS_PREFIX moved to Layer2Terms (filter/layer2_terms.rs).
 
 // NOTE on the two above: each does have an innocent host word — "Molestation
 // awareness seminar", "Rapeseed oil" — that the left rule does NOT exclude,
@@ -285,28 +271,19 @@ const SEX_TERMS_PREFIX: &[&str] = &[
 /// Deliberately absent: `dick` (Dick Tracy, Moby Dick), `virgin` (Virginia,
 /// Virgin Media), `pussy` (Pussy Riot, Pussycat Dolls) — each has real
 /// collisions, and `pussy` only just: it needs word bounds, kept below.
-const SEX_TERMS_SUBSTRING_EXTRA: &[&str] = &[
-    "vagina", "penis", "cunt", "boobs", "tits",
-];
+// SEX_TERMS_SUBSTRING_EXTRA moved to Layer2Terms (filter/layer2_terms.rs).
 
 /// Sex terms needing bounds on both sides, added alongside the originals.
-const SEX_TERMS_BOUNDED_EXTRA: &[&str] = &[
-    "pussy",  // Pussy Riot, Pussycat Dolls
-    "incest", // "Incest taboo anthropology" is a real title; bounds do not help
-              // there, but the age gate does — such a paper carries no age token.
-    "cock",   // Cockney, cocktail, peacock
-];
+// SEX_TERMS_BOUNDED_EXTRA moved to Layer2Terms (filter/layer2_terms.rs).
 
 /// Returns true if `lowered` contains a substring sex term OR a word-bounded short term.
-fn contains_sex_term(lowered: &str) -> bool {
-    if SEX_TERMS_SUBSTRING.iter().any(|t| lowered.contains(t))
-        || SEX_TERMS_SUBSTRING_EXTRA.iter().any(|t| lowered.contains(t))
-    {
+fn contains_sex_term(lowered: &str, t: &Layer2Terms) -> bool {
+    if t.sex_substring.iter().any(|w| lowered.contains(w.as_str())) {
         return true;
     }
     let bytes = lowered.as_bytes();
     // Prefix terms: must START at a boundary, may continue into an inflection.
-    for term in SEX_TERMS_PREFIX {
+    for term in &t.sex_prefix {
         let mut start = 0;
         while let Some(pos) = lowered[start..].find(term) {
             let abs = start + pos;
@@ -316,7 +293,7 @@ fn contains_sex_term(lowered: &str) -> bool {
             start = abs + 1;
         }
     }
-    for term in SEX_TERMS_WORD_BOUNDED.iter().chain(SEX_TERMS_BOUNDED_EXTRA) {
+    for term in &t.sex_bounded {
         let tb = term.as_bytes();
         let mut start = 0;
         while let Some(pos) = lowered[start..].find(term) {
@@ -384,20 +361,10 @@ fn count_gender_age_tokens(s: &str) -> usize {
 ///   elementary (小学生, 6-12) carry no such adult-genre usage, which is why only
 ///   those are listed. The same reasoning already governs 高 in
 ///   `contains_school_grade_marker`.
-const CJK_MINOR_WORDS: &[&str] = &[
-    "中学生",   // junior high (12-15)
-    "中學生",   // ditto, traditional
-    "初中生",   // junior high (mainland usage)
-    "小学生",   // elementary (6-12)
-    "小學生",   // ditto, traditional
-    "未成年",   // "minor" (legal term), zh/ja
-    "미성년",   // ditto, Korean
-    "중학생",   // junior high, Korean
-    "초등학생", // elementary, Korean
-];
+// CJK_MINOR_WORDS moved to Layer2Terms (filter/layer2_terms.rs).
 
-fn contains_cjk_minor_word(s: &str) -> bool {
-    CJK_MINOR_WORDS.iter().any(|w| s.contains(w))
+fn contains_cjk_minor_word(s: &str, t: &Layer2Terms) -> bool {
+    t.minor_cjk.iter().any(|w| s.contains(w.as_str()))
 }
 
 /// Latin-script words that name an age range entirely below 18, with no adult
@@ -414,9 +381,7 @@ fn contains_cjk_minor_word(s: &str) -> bool {
 /// here: each has ordinary adult readings ("baby" as an endearment, "young" as a
 /// comparative) and each appears in legal adult titles, so even age-gating them
 /// would not make them safe.
-const LATIN_MINOR_WORDS: &[&str] = &[
-    "kleinkind", // German, 1-3 years
-];
+// LATIN_MINOR_WORDS moved to Layer2Terms (filter/layer2_terms.rs).
 
 // "toddler" was here and MOVED BACK to the operator term list (Layer 4).
 //
@@ -439,9 +404,9 @@ const LATIN_MINOR_WORDS: &[&str] = &[
 /// and the word is rare enough in this material that a narrower rule is not
 /// worth the risk. "toddler" has no such collision — no ordinary English word
 /// continues past it except its own plural.
-fn contains_latin_minor_word(lowered: &str) -> bool {
+fn contains_latin_minor_word(lowered: &str, t: &Layer2Terms) -> bool {
     let bytes = lowered.as_bytes();
-    for w in LATIN_MINOR_WORDS {
+    for w in &t.minor_latin {
         let mut start = 0;
         while let Some(pos) = lowered[start..].find(w) {
             let abs = start + pos;
@@ -459,10 +424,10 @@ fn contains_latin_minor_word(lowered: &str) -> bool {
 /// Returns a description of WHY layer 2 fired ("age 12 (yo)", "CJK minor word",
 /// ...), or None. The description travels with the block so a reviewer can judge
 /// the decision without re-deriving it.
-pub(super) fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
+pub(super) fn matches_layer2(original: &str, lowered: &str, t: &Layer2Terms) -> Option<String> {
     // A fixed innocent phrase overrides everything below — see
     // SEX_TERM_EXCEPTIONS.
-    if has_sex_term_exception(lowered) {
+    if has_sex_term_exception(lowered, t) {
         return None;
     }
     // Both conditions must hold in the same filename: an age claim AND a sexual
@@ -472,21 +437,88 @@ pub(super) fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
         .or_else(|| {
             contains_school_grade_marker(original).then(|| "school grade marker".to_string())
         })
-        .or_else(|| contains_cjk_minor_word(original).then(|| "CJK minor word".to_string()))
+        .or_else(|| contains_cjk_minor_word(original, t).then(|| "CJK minor word".to_string()))
         .or_else(|| {
-            contains_latin_minor_word(lowered).then(|| "minor-age word".to_string())
+            contains_latin_minor_word(lowered, t).then(|| "minor-age word".to_string())
         })
         .or_else(|| {
             (count_gender_age_tokens(original) >= 2)
                 .then(|| "gender-age pair".to_string())
         })
-        .or_else(|| contains_ru_minor_word(lowered).then(|| "RU minor word".to_string()))?;
-    if contains_sex_term(lowered) || contains_ru_sex_term(lowered) {
+        .or_else(|| contains_ru_minor_word(lowered, t).then(|| "RU minor word".to_string()))?;
+    if contains_sex_term(lowered, t) || contains_ru_sex_term(lowered, t) {
         return Some(age_claim);
     }
     // No sexual term — but an age of 12 or under stands on its own. See
     // UNPAIRED_AGE_MAX for why the pairing rule has to be relaxed there.
-    contains_unpaired_minor_age(original, lowered)
+    contains_unpaired_minor_age(original, lowered, t)
+}
+
+/// Animals that appear in bestiality filenames, and nowhere in the vocabulary of
+/// ordinary pornography.
+///
+/// The list is short because most animal words are ALSO porn slang for a
+/// position or a person: "doggy"/"doggystyle" is a position, "bitch" and "beast"
+/// describe people, "bull" is a role, "pig" appears in "pig tails". Measured on
+/// twelve real adult titles, including those words produced ten false positives
+/// out of twelve. What remains are large animals no one is described as.
+// ZOO_ANIMALS moved to Layer2Terms (filter/layer2_terms.rs).
+
+/// Acts that, next to one of the animals above, describe bestiality.
+///
+/// Deliberately EXCLUDES "cock", "dick", "anal" and "sex": each is ordinary porn
+/// vocabulary about humans, and "Horse Cock Dildo" is a toy, not an animal.
+/// Also excludes "semen", "sperm" and "breed", which belong to veterinary and
+/// husbandry texts.
+// ZOO_ACTS moved to Layer2Terms (filter/layer2_terms.rs).
+
+/// Veterinary and agricultural contexts, which legitimately pair an animal with
+/// a reproductive term.
+// ZOO_GUARD moved to Layer2Terms (filter/layer2_terms.rs).
+
+/// Detect bestiality described in plain words rather than by a brand or a slang
+/// compound.
+///
+/// ⚠ NOT WIRED UP. Measured at 8% precision on its first live window — 234
+/// matches, 207 of them gay-porn studios ("Raging Stallion"), size metaphors
+/// ("horse hung", "donkey dick"), animal-shaped toys ("Bad Dragon") and
+/// performer names ("Jesse Pony"). See the disabled call site in filter/mod.rs
+/// for why narrowing the lists cannot fix it. Retained because the handful it
+/// caught correctly is real and a phrase-based successor could work.
+///
+/// The existing zoo terms are fixed strings — a brand name, or a two-word
+/// compound like "horse cum". A live sample defeated all of them with ordinary
+/// English: "Animal Horse Dolly's Farm ... Small Black Pony Cums Inside Dolly's
+/// Pussy Then She Does Her Dog". Nothing there is a term; the animals and the
+/// acts are simply written out and separated by other words.
+///
+/// So this pairs the two independently, the same shape as the age rule. The
+/// safety comes entirely from how narrow both lists are — see the notes on each.
+pub(super) fn matches_zoo_cooccurrence(lowered: &str, t: &Layer2Terms) -> Option<String> {
+    if t.zoo_guard.iter().any(|g| lowered.contains(g.as_str())) {
+        return None;
+    }
+    let animal = t.zoo_animals.iter().find(|a| word_present(lowered, a))?;
+    let act = t.zoo_acts.iter().find(|a| word_present(lowered, a))?;
+    Some(format!("{animal} + {act}"))
+}
+
+/// Whole-word test: "horse" must not fire inside "horseradish", and "k9" needs
+/// its own boundaries.
+fn word_present(lowered: &str, needle: &str) -> bool {
+    let bytes = lowered.as_bytes();
+    let mut start = 0;
+    while let Some(pos) = lowered[start..].find(needle) {
+        let abs = start + pos;
+        let end = abs + needle.len();
+        let before_ok = abs == 0 || !is_word_char(bytes[abs - 1]);
+        let after_ok = end == bytes.len() || !is_word_char(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
 }
 
 /// Phrases that make a broad sexual term innocent.
@@ -503,15 +535,10 @@ pub(super) fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
 /// Кept to fixed expressions. A phrase list is a maintenance burden that grows
 /// with every false positive, so it earns its place only where the single word
 /// cannot be fixed and is worth keeping.
-const SEX_TERM_EXCEPTIONS: &[&str] = &[
-    "голая правда", "голой правды", "голую правду", // the idiom and the film
-    "сексуальное воспитан", "половое воспитан",     // sex education
-    "сексуальная революц",
-    "секс-просвет", "сексолог", "сексопатолог",     // the discipline
-];
+// SEX_TERM_EXCEPTIONS moved to Layer2Terms (filter/layer2_terms.rs).
 
-fn has_sex_term_exception(lowered: &str) -> bool {
-    SEX_TERM_EXCEPTIONS.iter().any(|p| lowered.contains(p))
+fn has_sex_term_exception(lowered: &str, t: &Layer2Terms) -> bool {
+    t.exceptions.iter().any(|p| lowered.contains(p.as_str()))
 }
 
 /// Russian words naming a minor.
@@ -532,28 +559,7 @@ fn has_sex_term_exception(lowered: &str) -> bool {
 /// «Школьница 2», «Дневник школьницы», Dostoevsky's «Подросток», a law lecture
 /// on «Несовершеннолетние», an «Ералаш» episode — a bare term list matched NINE
 /// of the thirteen. Paired with a sexual term: zero.
-const RU_MINOR_WORDS: &[&str] = &[
-    // First set, from the sample that exposed the gap.
-    "школьниц",        // schoolgirl
-    "школьник",        // schoolboy
-    "малолет",         // underage (малолетка, малолетний)
-    "несовершеннолет", // minor, legal register
-    "подростк",        // teenager (подростковый, подростка)
-    // Second set. The first was written from one filename and turned out to
-    // guess the wrong register: a review window with 428 Cyrillic names used
-    // none of those words and all of these — "детское порно", "Русские Дети
-    // 6-14 Лет", "девочка лет 13-14". Publishers write plainly, not in the
-    // legal or scholastic register the first list assumed.
-    "девочк",  // girl
-    "мальчик", // boy
-    "детск",   // child- (детское, детская)
-    "дети",    // children
-    "ребён", "ребен", // child, both spellings
-    "малыш",   // little one
-    "дочк",    // daughter (дочка, дочки)
-    "сынок",   // son, diminutive
-    "юная", "юные", "юной", // young, feminine and plural
-];
+// RU_MINOR_WORDS moved to Layer2Terms (filter/layer2_terms.rs).
 
 /// Russian sexual terms, as they appear in filenames rather than in dictionaries.
 ///
@@ -563,23 +569,7 @@ const RU_MINOR_WORDS: &[&str] = &[
 /// Kept crude and specific. Nothing here has an innocent reading — unlike
 /// "секс" or "голая", which appear in medical, artistic and news titles and are
 /// deliberately absent.
-const RU_SEX_TERMS: &[&str] = &[
-    "ебёт", "ебет", "ебля", "ебут", "ебал",
-    "трахае", "трахну", "трахал",
-    "сосёт", "сосет",
-    "минет", "дрочит", "дрочь",
-    "изнасил", // изнасилование, изнасиловал
-    "порево",
-    // Second set, from the same review window.
-    "сексом",    // "занимаются сексом" — the inflected form only
-                 // ("порн" already lives in SEX_TERMS_SUBSTRING)
-    "мастурбац", // masturbation
-    "развратн",  // depraved
-    "стриптиз",  // striptease
-    "совращ",    // corruption of a minor
-    "инцест",    // incest
-    "голенькая", // naked, diminutive — the diminutive is the tell
-];
+// RU_SEX_TERMS moved to Layer2Terms (filter/layer2_terms.rs).
 
 // NOT added, and worth recording why:
 //
@@ -605,12 +595,12 @@ const RU_SEX_TERMS: &[&str] = &[
 /// Substring match: Cyrillic has no ASCII word characters, so the boundary rules
 /// used for Latin terms would never apply here anyway — and stems are meant to
 /// match inside inflected forms.
-fn contains_ru_minor_word(lowered: &str) -> bool {
-    RU_MINOR_WORDS.iter().any(|w| lowered.contains(w))
+fn contains_ru_minor_word(lowered: &str, t: &Layer2Terms) -> bool {
+    t.minor_ru.iter().any(|w| lowered.contains(w.as_str()))
 }
 
-fn contains_ru_sex_term(lowered: &str) -> bool {
-    RU_SEX_TERMS.iter().any(|w| lowered.contains(w))
+fn contains_ru_sex_term(lowered: &str, t: &Layer2Terms) -> bool {
+    t.sex_ru.iter().any(|w| lowered.contains(w.as_str()))
 }
 
 /// Ages at or below this need no sexual term to be actionable on their own.
@@ -632,7 +622,7 @@ fn contains_ru_sex_term(lowered: &str) -> bool {
 /// 12 rather than higher on purpose. At 13-17 the notation does appear in legal
 /// contexts (a teenager's own upload, a documentary), and the pairing rule still
 /// applies there.
-const UNPAIRED_AGE_MAX: u32 = 12;
+// UNPAIRED_AGE_MAX moved to Layer2Terms::unpaired_age_max.
 
 /// Words that make a small number an age of something OTHER than a person.
 ///
@@ -644,12 +634,7 @@ const UNPAIRED_AGE_MAX: u32 = 12;
 /// review window contains 25 names where a guard word sits far from the age and
 /// the file is plainly CSAM — "(Pthc) Vintage Collection ... 11Yo Girl". A
 /// whole-name check would have lost every one of them.
-const AGE_GUARD_WORDS: &[&str] = &[
-    "whisk", "malt", "scotch", "bourbon", "cognac", "brandy", "tequila",
-    "cask", "barrel", "reserva", "solera", "anejo", "distiller", "tasting",
-    "aged", "vintage",
-    "service manual", "warranty", "guarantee", "mileage",
-];
+// AGE_GUARD_WORDS moved to Layer2Terms (filter/layer2_terms.rs).
 
 // "vintage" and "aged" are in the list despite appearing in CSAM names too
 // ("(Pthc) Vintage Collection ... 11Yo Girl"). The proximity window is what
@@ -660,63 +645,48 @@ const AGE_GUARD_WORDS: &[&str] = &[
 /// How far either side of the number a guard word disqualifies it, in bytes.
 /// Deliberately tight — "12yo single malt" is 15 characters, while the CSAM
 /// names that merely contain "vintage" have it many words away.
-const AGE_GUARD_WINDOW: usize = 24;
+// AGE_GUARD_WINDOW moved to Layer2Terms::age_guard_window.
 
 /// True if a guard word sits close enough to `pos` to explain the number.
-fn age_is_guarded(lowered: &str, pos: usize) -> bool {
-    let lo = pos.saturating_sub(AGE_GUARD_WINDOW);
-    let hi = (pos + AGE_GUARD_WINDOW).min(lowered.len());
+fn age_is_guarded(lowered: &str, pos: usize, t: &Layer2Terms) -> bool {
+    let lo = pos.saturating_sub(t.age_guard_window);
+    let hi = (pos + t.age_guard_window).min(lowered.len());
     // Snap to char boundaries — filenames are full of multi-byte text and
     // slicing mid-character panics.
     let lo = (lo..=pos).find(|i| lowered.is_char_boundary(*i)).unwrap_or(pos);
     let hi = (pos..=hi).rev().find(|i| lowered.is_char_boundary(*i)).unwrap_or(pos);
     let window = &lowered[lo..hi];
-    AGE_GUARD_WORDS.iter().any(|w| window.contains(w))
+    t.age_guard.iter().any(|w| window.contains(w.as_str()))
 }
 
 /// Does this name carry an age of 12 or under, unguarded?
 ///
 /// Returns the same reason string shape as `contains_minor_age_token`, with the
 /// age spelled out, so a reviewer reading the export can see which number fired.
-fn contains_unpaired_minor_age(original: &str, lowered: &str) -> Option<String> {
-    let reason = contains_minor_age_token(original)?;
-    // ONLY the compact notations. "12yo", "11yr" are file-sharing shorthand that
-    // appears in a filename to advertise; "12 years" is ordinary English and
-    // appears in "12 Years a Slave", "12 Years After", "aged 10 years". Spelled-
-    // out units, and every non-English unit, keep the pairing requirement.
-    //
-    // This distinction is the whole reason the rule is safe. It was missed on
-    // the first pass — the sample of legitimate titles used to validate the
-    // threshold contained only "12yo"/"12 yr" forms, so the spelled-out case
-    // never came up, and the test suite caught it instead.
-    let unit = reason
-        .rsplit_once('(')
-        .and_then(|(_, u)| u.strip_suffix(')'))?;
-    if !matches!(unit, "yo" | "y.o" | "yr" | "yrs") {
-        return None;
-    }
-    // The reason reads "age N (unit)"; pull N back out rather than duplicating
-    // the scanner, so the two can never disagree about what counts as an age.
-    let n: u32 = reason
-        .strip_prefix("age ")?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
-    if n > UNPAIRED_AGE_MAX {
-        return None;
-    }
-    // Locate that number to test its surroundings.
-    let needle = n.to_string();
-    let mut from = 0;
-    while let Some(rel) = lowered[from..].find(&needle) {
-        let abs = from + rel;
-        if !age_is_guarded(lowered, abs) {
-            return Some(format!("{reason} unpaired"));
-        }
-        from = abs + needle.len();
-    }
-    None
+fn contains_unpaired_minor_age(original: &str, lowered: &str, t: &Layer2Terms) -> Option<String> {
+    // Ask the scanner for the first token that BOTH is within the threshold and
+    // uses a compact notation, rather than taking whatever came first and then
+    // testing it. Those are different questions, and answering the second cost
+    // us a served file: a name whose first age was "11y" (not compact) never got
+    // as far as its "10yo".
+    // EVERY condition goes in the predicate, including the guard check. Testing
+    // them afterwards was the bug in two ways: a first token with the wrong
+    // suffix hid a later valid one, and a first token sitting next to a guard
+    // word hid a later unguarded one. "Macallan 12yo tasting and 9yo girl" is
+    // the second case — 12yo qualifies on age and notation, is guarded by
+    // "tasting", and the scan has to keep going to reach 9yo.
+    let reason = scan_minor_age_token(original, |age, suffix, pos| {
+        // Compact notations only. "12 years" is ordinary English — without this
+        // "12 Years a Slave" is blocked — so spelled-out units, and every
+        // non-English unit, keep the pairing requirement.
+        age <= t.unpaired_age_max
+            && matches!(suffix, "yo" | "y.o" | "yr" | "yrs")
+            // `pos` indexes `original`; the guard scan wants the lowered copy.
+            // They are byte-identical in length for the ASCII digits this
+            // matches on, and `age_is_guarded` snaps to char boundaries anyway.
+            && !age_is_guarded(lowered, pos, t)
+    })?;
+    Some(format!("{reason} unpaired"))
 }
 
 /// School words paired with the highest grade that level actually has.
@@ -786,6 +756,22 @@ fn contains_school_grade_marker(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The tests call these as they always did; the vocabulary comes from
+    // Layer2Terms::default(), which IS the vocabulary that used to be compiled
+    // in. So every assertion below still pins the same behaviour as before the
+    // lists moved out of the binary — which is the point of keeping them
+    // unchanged.
+    fn matches_layer2(original: &str, lowered: &str) -> Option<String> {
+        super::matches_layer2(original, lowered, &Layer2Terms::default())
+    }
+    fn matches_zoo_cooccurrence(lowered: &str) -> Option<String> {
+        super::matches_zoo_cooccurrence(lowered, &Layer2Terms::default())
+    }
+    fn contains_cjk_minor_word(s: &str) -> bool {
+        super::contains_cjk_minor_word(s, &Layer2Terms::default())
+    }
+
 
     // ── Regression tests from live production data (2026-07) ─────────────
     // Every string below is a REAL filename observed on the server. The blocked
@@ -884,6 +870,111 @@ mod tests {
                 "{name} must be caught"
             );
         }
+    }
+
+    // NOTE: the function these exercise is NOT wired into check() — see the
+    // disabled call site in filter/mod.rs. They are kept so a future
+    // phrase-based successor has a baseline of what it must and must not match.
+    #[test]
+    fn zoo_cooccurrence_catches_plain_english() {
+        // The sample that prompted this: every existing zoo term is a fixed
+        // string, and this name uses none of them — the animal and the act are
+        // ordinary words several words apart.
+        let n = "1 Animal Horse Dolly's Farm (Part 1)Small Black Pony Cums Inside \
+                 Dolly's Pussy Then She Does Her Dog.mp4";
+        assert!(matches_zoo_cooccurrence(&n.to_lowercase()).is_some());
+
+        for name in [
+            "girl fucked by horse.avi",
+            "mare knot pussy.mpg",
+            "pony cums inside her.avi",
+            "k9 fuck compilation.avi",
+        ] {
+            assert!(
+                matches_zoo_cooccurrence(&name.to_lowercase()).is_some(),
+                "{name} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn zoo_lists_avoid_porn_slang_and_veterinary_texts() {
+        // Most animal words are also porn vocabulary for a position or a person.
+        // A wider list was measured first and produced ten false positives in
+        // twelve real adult titles; this test is what keeps the list narrow.
+        for name in [
+            "Doggy Style Anal Compilation HD.mp4",   // a position, not an animal
+            "Doggystyle Fuck Brazzers 2019.mp4",
+            "Riding Cock Doggy Position.avi",
+            "Horse Cock Dildo Toy Play - solo.mp4",  // a toy: "cock" is excluded
+            "Big Dick Bull Riding Cowgirl.mp4",
+            "Bitch Sucks Cock POV.mp4",
+            "Beast Mode Fuck Session.mp4",
+            "Pig Tails Teen Sex Comp.mp4",
+        ] {
+            assert!(
+                matches_zoo_cooccurrence(&name.to_lowercase()).is_none(),
+                "{name} must NOT be caught"
+            );
+        }
+
+        // Veterinary and husbandry texts legitimately pair an animal with a
+        // reproductive term.
+        for name in [
+            "Horse breeding stallion semen collection - veterinary.pdf",
+            "Equine artificial insemination manual.pdf",
+            "Mare pregnancy and breeding guide.pdf",
+        ] {
+            assert!(
+                matches_zoo_cooccurrence(&name.to_lowercase()).is_none(),
+                "{name} must NOT be caught"
+            );
+        }
+
+        // Ordinary films and documentaries.
+        for name in [
+            "Dog Day Afternoon 1975.mkv",
+            "The Horse Whisperer 1998.avi",
+            "War Horse Spielberg 2011.mkv",
+            "My Little Pony The Movie.mkv",
+            "Wild Horses documentary BBC.mkv",
+            "Black Beauty 1994 horse.mkv",
+        ] {
+            assert!(
+                matches_zoo_cooccurrence(&name.to_lowercase()).is_none(),
+                "{name} must NOT be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn zoo_cooccurrence_is_why_the_rule_is_disabled() {
+        // Every one of these matched in the first live window and every one is
+        // legitimate adult material. They are the measurement that took the rule
+        // out of check(): the animal words ARE studio names, performer names and
+        // size metaphors, so no narrowing of the lists reaches them.
+        for name in [
+            "Raging Stallion - Fuck Flik #1 [Blake Harper, Jason Branch].mp4",
+            "Donkey Dick XXL fucks CJ Muscle Jock.mp4",
+            "Lily Lou Is Fucking A Huge Horse Bad Dragon Dildo.mp4",
+            // Full name, not shortened: the act word is what makes it match, and
+            // trimming the title for readability removed it — the first version
+            // of this test asserted a match the shortened string cannot produce.
+            "BrutalSessions - Extreme Bondage And Fucking - Jesse Pony And Johnny Castle.mp4",
+            "Chocolate - LadyBoys Fucked Bareback - Dark Stallion Messy Hole.mp4",
+            "Onlyfans ThatYoungBlonde Fucked After Horse Show Sextape.mp4",
+        ] {
+            assert!(
+                matches_zoo_cooccurrence(&name.to_lowercase()).is_some(),
+                "{name} still matches — this test documents the failure, not a fix"
+            );
+        }
+    }
+
+    #[test]
+    fn zoo_animal_needs_word_boundaries() {
+        // "horse" must not fire inside "horseradish".
+        assert!(matches_zoo_cooccurrence("horseradish sauce fucking good.avi").is_none());
     }
 
     #[test]
@@ -995,6 +1086,47 @@ mod tests {
                 "{name} must be caught on the age alone"
             );
         }
+    }
+
+    #[test]
+    fn a_qualifying_age_is_found_even_when_it_is_not_the_first() {
+        // THE BUG: the scan returned the first age token whatever it was, and
+        // the unpaired rule then tested that one. A name whose first age used a
+        // non-compact suffix therefore never reached a later compact one.
+        //
+        // Live case, served from the index: "11y" comes first and does not
+        // qualify (bare "y"), "10yo" comes later and does.
+        let n = "Prostitutas 11y little baby whore PedoDad 10yo.wmv";
+        assert!(
+            matches_layer2(n, &n.to_lowercase()).is_some(),
+            "the later qualifying age must be found"
+        );
+
+        // Same shape, ages reversed: this one always worked, and must keep
+        // working.
+        let n2 = "some 10yo and 11y thing.avi";
+        assert!(matches_layer2(n2, &n2.to_lowercase()).is_some());
+
+        // And a name whose ONLY ages are non-compact still needs a sexual term,
+        // or "12 Years a Slave" comes back.
+        let n3 = "13 years and 15 years later.mkv";
+        assert!(matches_layer2(n3, &n3.to_lowercase()).is_none());
+    }
+
+    #[test]
+    fn a_guarded_age_does_not_hide_a_later_unguarded_one() {
+        // The scan must get past an age a guard word disqualifies, not stop at
+        // it. The second age here is far enough from "tasting" to be outside the
+        // proximity window.
+        let n = "Macallan 12yo tasting notes, and separately a 9yo girl video.avi";
+        assert!(
+            matches_layer2(n, &n.to_lowercase()).is_some(),
+            "the unguarded age must still be found"
+        );
+
+        // ...but an age inside the window stays disqualified.
+        let n2 = "Macallan 12yo single malt tasting notes.pdf";
+        assert!(matches_layer2(n2, &n2.to_lowercase()).is_none());
     }
 
     #[test]

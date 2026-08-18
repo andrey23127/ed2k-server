@@ -6,6 +6,7 @@
 //! filter.
 
 mod age_pattern;
+pub mod layer2_terms;
 mod jargon;
 pub mod ipfilter;
 pub mod geoip;
@@ -110,6 +111,17 @@ pub struct ContentFilter {
     /// `jargon::matches_terms`; this only holds the (pre-lowercased) list.
     jargon_terms: arc_swap::ArcSwap<Vec<String>>,
 
+    /// Layer 2's vocabulary, hot-swappable like the term files.
+    ///
+    /// It used to be compiled in, which meant every addition — and they arrive
+    /// almost daily from review windows — needed a rebuild and a restart. A
+    /// restart drops every connected client, so the server was never observed at
+    /// a long uptime.
+    ///
+    /// Defaults to exactly what was compiled in, so an installation with no file
+    /// behaves identically. See `layer2_terms::Layer2Terms`.
+    layer2_terms: arc_swap::ArcSwap<layer2_terms::Layer2Terms>,
+
     /// Filter-only hash list (Layer 5, config key `hash_filter`). Blocked, but
     /// never held against the publisher — see `Layer::L5Poison`. Separate from
     /// `hash_blocklist` on purpose: the two lists mean different things and are
@@ -138,6 +150,9 @@ impl ContentFilter {
             hash_blocklist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             extra_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
             jargon_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            layer2_terms: arc_swap::ArcSwap::from_pointee(
+                layer2_terms::Layer2Terms::default(),
+            ),
             hash_filter_set: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             hash_whitelist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
         }
@@ -181,6 +196,26 @@ impl ContentFilter {
         let mut set: HashSet<[u8; 16]> = (*self.hash_filter_set.load_full()).clone();
         set.extend(hashes);
         self.hash_filter_set.store(std::sync::Arc::new(set));
+        self
+    }
+
+    /// Hot-swap Layer 2's vocabulary.
+    ///
+    /// Callers must have PARSED successfully first: a failed read or a malformed
+    /// file must keep the current lists, exactly as the hash lists do. Handing a
+    /// half-parsed value here would silently disable whole categories.
+    pub fn reload_layer2_terms(&self, terms: layer2_terms::Layer2Terms) {
+        self.layer2_terms.store(std::sync::Arc::new(terms));
+    }
+
+    /// Entry count, for the startup log and the web panel.
+    pub fn layer2_terms_size(&self) -> usize {
+        self.layer2_terms.load().len()
+    }
+
+    /// Builder: replace Layer 2's vocabulary before the filter is shared.
+    pub fn with_layer2_terms(self, terms: layer2_terms::Layer2Terms) -> Self {
+        self.layer2_terms.store(std::sync::Arc::new(terms));
         self
     }
 
@@ -422,6 +457,13 @@ impl ContentFilter {
         let lowered = filename.to_lowercase();
 
         // Layer 1: jargon (list loaded at runtime; empty = inactive)
+        // One snapshot of the Layer 2 vocabulary for the whole call. Taking it
+        // once matters: a reload between the mojibake pass and the main pass
+        // would otherwise let a name be tested against two different
+        // vocabularies, and the reason string would name a term that is no
+        // longer there.
+        let l2 = self.layer2_terms.load();
+
         // Mojibake pass: if the name is recoverable text, test the recovered form
         // too. Only the non-ASCII terms can gain anything — the ASCII part of a
         // mangled name is untouched and the scans below already cover it — but
@@ -436,7 +478,7 @@ impl ContentFilter {
             if let Some(term) = jargon::matches_terms(&rec_lower, &ex) {
                 return FilterResult::Block(Layer::L4Extra, format!("{term} (mojibake)"));
             }
-            if let Some(reason) = age_pattern::matches_layer2(&recovered, &rec_lower) {
+            if let Some(reason) = age_pattern::matches_layer2(&recovered, &rec_lower, &l2) {
                 return FilterResult::Block(Layer::L2AgePattern, format!("{reason} (mojibake)"));
             }
         }
@@ -451,8 +493,41 @@ impl ContentFilter {
         }
 
         // Layer 2: age pattern + sexual context
-        if let Some(reason) = age_pattern::matches_layer2(filename, &lowered) {
+        if let Some(reason) = age_pattern::matches_layer2(filename, &lowered, &l2) {
             return FilterResult::Block(Layer::L2AgePattern, reason);
+        }
+
+        // DISABLED: animal + act co-occurrence.
+        //
+        // The idea was to catch bestiality written in plain English, since the
+        // operator zoo terms are fixed strings that a sample defeated by putting
+        // the animal and the act several words apart. It was validated against
+        // 26 hand-written titles with zero false positives and shipped.
+        //
+        // The first live window then produced 234 matches of which **8% were
+        // right**. The hand-written sample simply did not contain what the index
+        // actually holds:
+        //
+        //   * "Raging Stallion" is a large gay porn studio — 48 files;
+        //   * "horse hung", "donkey dick", "hung like a horse" are metaphors for
+        //     size, and every one of them sits beside a sexual term — 30 files;
+        //   * "Bad Dragon" makes animal-shaped dildos — 9 files;
+        //   * "Jesse Pony" and "Dark Stallion" are performer names — 15 files.
+        //
+        // None of these can be excluded by narrowing the lists further: the
+        // animal words ARE the studio names and the metaphors, and the acts are
+        // ordinary porn vocabulary. A guard list would have to enumerate every
+        // studio and performer using an animal name, which is unbounded.
+        //
+        // Kept as dead code rather than deleted, because the ONE case it caught
+        // that nothing else did — "Zoo Party ... A Big White Horse", "Sonia
+        // Fucking With Grey Stallion" — is real, and a future version keyed on
+        // something stronger than word co-occurrence (a phrase like "fucked by a
+        // horse", or animal + act with no human name in the title) could work.
+        // The measurement above is why the naive form does not.
+        #[allow(dead_code)]
+        {
+            let _ = age_pattern::matches_zoo_cooccurrence(&lowered, &l2);
         }
 
         // Layer 4 (operator extras) — snapshot the hot-swappable list.

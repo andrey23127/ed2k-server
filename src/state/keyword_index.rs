@@ -61,6 +61,46 @@ fn is_separator(c: char) -> bool {
 /// Performance: filenames in eD2k traffic are predominantly ASCII (Roman
 /// alphabet + digits + punctuation). For ASCII-only filenames we avoid
 /// Unicode case mapping (saves ~3% CPU at scale per v0.9.37 profile).
+/// Turn one search term from the client's expression tree into index keys.
+///
+/// Clients do not agree on who splits a query. eMule usually builds a tree of
+/// one term per word — `AND(linux, ubuntu)` — but some paths send the whole
+/// string as a single `NODE_STRING`, and then the term arrives here as
+/// `"linux ubuntu"`, space included.
+///
+/// That term was previously lower-cased and looked up verbatim. No such key can
+/// exist: the indexer splits filenames on separators, so the index holds
+/// `linux` and `ubuntu` and never the pair. The symptom is exact — searching
+/// either word works, searching both returns nothing.
+///
+/// Running the term through the SAME tokenizer the indexer uses is the whole
+/// fix, and it must be the same function rather than a second splitter beside
+/// it: two would eventually disagree about a separator or about
+/// `MIN_KEYWORD_LEN`, and produce a fresh class of silent misses.
+///
+/// Wildcards survive untouched. `*` is not a keyword and the caller filters it,
+/// but it must reach the caller to do so — the tokenizer would drop it as
+/// shorter than `MIN_KEYWORD_LEN`.
+pub fn tokenize_search_term(term: &str) -> Vec<String> {
+    let trimmed = term.trim();
+    if trimmed == "*" || trimmed == "**" {
+        return vec![trimmed.to_string()];
+    }
+    let toks = tokenize(trimmed);
+    if toks.is_empty() {
+        // Nothing survived: a term shorter than MIN_KEYWORD_LEN, or one made
+        // entirely of separators. Keep the lower-cased original so a
+        // single-character search still reaches the index rather than silently
+        // becoming a full scan — eMule does send "HD" and "OS".
+        let lc = trimmed.to_lowercase();
+        if lc.is_empty() {
+            return Vec::new();
+        }
+        return vec![lc];
+    }
+    toks
+}
+
 pub fn tokenize(filename: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(8);
     tokenize_into(filename, |t| out.push(t.to_string()));
@@ -536,6 +576,80 @@ impl KeywordIndex {
 mod tests {
     use super::*;
     use crate::state::file_id::FileId;
+
+    #[test]
+    fn a_multi_word_term_is_split_like_a_filename() {
+        // Issue #10: searching "linux ubuntu" returned nothing while either word
+        // alone worked. Some clients send the whole query as ONE term, and it
+        // was looked up verbatim — but no index key contains a space, because
+        // the indexer splits on separators. The lookup could only miss.
+        assert_eq!(
+            tokenize_search_term("linux ubuntu"),
+            vec!["linux", "ubuntu"]
+        );
+        // Whatever the indexer would produce for the same text, the search must
+        // ask for. This is the property that matters, not the exact list.
+        assert_eq!(tokenize_search_term("Linux Ubuntu"), tokenize("Linux Ubuntu"));
+        assert_eq!(
+            tokenize_search_term("Ubuntu-24.04_desktop"),
+            tokenize("Ubuntu-24.04_desktop")
+        );
+    }
+
+    #[test]
+    fn a_single_word_term_is_unchanged() {
+        assert_eq!(tokenize_search_term("linux"), vec!["linux"]);
+        assert_eq!(tokenize_search_term("UBUNTU"), vec!["ubuntu"]);
+    }
+
+    #[test]
+    fn wildcards_reach_the_caller_intact() {
+        // The caller filters these; the tokenizer would drop them as shorter
+        // than MIN_KEYWORD_LEN, turning a "*" search into a term-less one by
+        // accident rather than by decision.
+        assert_eq!(tokenize_search_term("*"), vec!["*"]);
+        assert_eq!(tokenize_search_term("**"), vec!["**"]);
+    }
+
+    #[test]
+    fn short_terms_still_reach_the_index() {
+        // eMule sends these. The indexer skips them, so they will not match, but
+        // they must arrive as a term rather than vanish — a term-less query
+        // triggers the capped full scan, which is a different and much more
+        // expensive answer.
+        assert_eq!(tokenize_search_term("HD"), vec!["hd"]);
+        assert_eq!(tokenize_search_term("x"), vec!["x"]);
+    }
+
+    #[test]
+    fn a_blank_term_yields_nothing() {
+        // An empty result means "no keyword constraint from this term", which
+        // the caller handles; it must not become an empty-string key.
+        assert!(tokenize_search_term("   ").is_empty());
+        assert!(tokenize_search_term("").is_empty());
+    }
+
+    #[test]
+    fn splitting_makes_the_intersection_work() {
+        // End to end: index a file, then search it by two of its words as one
+        // term. This is the user-visible behaviour issue #10 reported.
+        let kw = KeywordIndex::new();
+        kw.add_file(FileId(1), "Linux Ubuntu 24.04 desktop amd64.iso");
+        kw.add_file(FileId(2), "Linux Mint 21 cinnamon.iso");
+
+        let toks = tokenize_search_term("linux ubuntu");
+        assert_eq!(kw.find_intersection(&toks), vec![FileId(1)]);
+
+        // ...and each word alone still behaves as it did.
+        assert_eq!(
+            kw.find_intersection(&tokenize_search_term("linux")).len(),
+            2
+        );
+        assert_eq!(
+            kw.find_intersection(&tokenize_search_term("ubuntu")),
+            vec![FileId(1)]
+        );
+    }
 
     #[test]
     fn compact_returns_unused_table_capacity() {

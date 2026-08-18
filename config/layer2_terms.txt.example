@@ -1,0 +1,295 @@
+# layer2_terms.txt — Layer 2 vocabulary (EXAMPLE; copy to layer2_terms.txt)
+#
+# Enabled via config.toml:
+#   [content_filter]
+#   layer2_terms_file = "/etc/ed2k-server/layer2_terms.txt"
+#
+# HOT-RELOAD: edits apply within ~30 s (mtime watcher), no restart. Copy with
+# `cp` and NOT `cp -p`, or the mtime does not change and nothing reloads.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THIS FILE IS FOR
+#
+# Layer 2 blocks on the CO-OCCURRENCE of an age claim and a sexual context.
+# Neither alone is actionable: a birthday video is not our concern, and adult
+# pornography is not either. That co-occurrence rule is what makes it safe to
+# list ordinary words here — words that would cause mass false positives in the
+# operator term files, where a single substring is enough to block.
+#
+# The RULES stay in the binary: the age scanner, the boundary classes, the guard
+# window, mojibake recovery, school-grade handling. Only the VOCABULARY is here.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# FORMAT
+#
+#   [section]     header; everything after it belongs to that section
+#   one entry per line, taken verbatim except surrounding whitespace
+#   lines starting with '#' or ';' are comments
+#   ' ;' mid-line starts a trailing comment — use it to record WHY an entry
+#     is here, since this file is the only record of that reasoning
+#   entries are lower-cased on load
+#
+# A SECTION YOU DO NOT NAME keeps its built-in default.
+# A SECTION YOU NAME REPLACES the default entirely — that is how an entry gets
+#   REMOVED, which is half the point of this file.
+# A SECTION YOU NAME AND LEAVE EMPTY disables that category. Deliberate.
+#
+# An UNKNOWN section name is a hard error and the whole file is rejected: a typo
+# in a header would otherwise silently empty a category, and the layer would
+# keep running while quietly missing everything in it. On any error the previous
+# vocabulary stays in force.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# BEFORE YOU EDIT
+#
+# Every entry below was added or rejected against a measured review window, and
+# several look wrong until you know why. Some rules learned the hard way:
+#
+#   * A word that is a prefix of an ordinary word belongs in [sex.bounded], not
+#     [sex.substring] — otherwise it fires inside "analysis", "Cumberland",
+#     "Sexton", "Cockney".
+#   * A word that inflects belongs in [sex.prefix], or its "-ing" and "-ed"
+#     forms are missed. That gap let material through for months.
+#   * Broad words that are common in set expressions stay, and the expression
+#     goes in [exceptions]. Narrowing the word instead was measured and cost
+#     five of six real catches.
+#   * Cyrillic entries are STEMS, because the language inflects heavily, and
+#     both ё and е spellings are needed — filenames use them interchangeably.
+#   * Test any addition against a real review window, not against titles you
+#     imagine. Two rules shipped on hand-written samples and failed on live
+#     data within a day: one matched a gay-porn studio 48 times, the other
+#     blocked an Oscar-winning film.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+[sex.substring]
+# Sexual terms matched ANYWHERE, including inside a word.
+# Only for terms with no innocent host word.
+porn
+blowjob
+handjob
+dildo
+orgasm
+masturbat
+sexuell
+ficken
+porno
+follar
+desnud
+sesso
+секс
+голая
+детский секс видео
+голая девочка
+секс с малолеткой
+секс
+порн
+голая
+обнаж
+sexe
+援助交際
+원조교제
+ロリ
+loli
+幼女
+young girl
+近親相姦
+강간
+レイプ
+vagina
+penis
+cunt
+boobs
+tits
+
+[sex.prefix]
+# Must START at a word boundary, may continue into an inflection.
+# "fuck" here catches "fucking" and "fucked"; in [sex.bounded] it would not.
+fuck
+nude
+naked
+molest
+rape
+
+[sex.bounded]
+# Boundaries on BOTH sides. Each of these is a prefix of an ordinary
+# word, so a looser rule takes analysis / Cumberland / Sexton / Cockney.
+sex
+xxx
+anal
+oral
+cum
+nackt
+nud
+scopa
+pussy
+incest
+cock
+
+[exceptions]
+# Fixed phrases that make a broad term innocent. Checked BEFORE every
+# layer: a match here means Layer 2 does not fire at all.
+#
+# Keep to fixed expressions. This list grows with every false positive, so it
+# earns its place only where the single word cannot be fixed and is worth
+# keeping.
+голая правда
+голой правды
+голую правду
+сексуальное воспитан
+половое воспитан
+сексуальная революц
+секс-просвет
+сексолог
+сексопатолог
+
+[minor.cjk]
+# CJK words naming a minor. Matched as plain substrings — that script
+# has no word separators, so boundary rules would never apply.
+中学生
+中學生
+初中生
+小学生
+小學生
+未成年
+minor
+미성년
+중학생
+초등학생
+
+[minor.latin]
+# Latin-script words naming a minor, left-bounded so a plural still
+# matches but an ordinary word containing the term does not.
+kleinkind
+
+[minor.ru]
+# Cyrillic stems naming a minor. STEMS: "школьниц" covers every case
+# ending. These are ORDINARY WORDS and are safe only because of the
+# co-occurrence rule — as a bare term list they matched nine of thirteen
+# legitimate titles in testing.
+школьниц
+школьник
+малолет
+несовершеннолет
+подростк
+девочк
+мальчик
+детск
+дети
+ребён
+ребен
+малыш
+дочк
+сынок
+юная
+юные
+юной
+
+[sex.ru]
+# Cyrillic sexual terms, as filenames write them rather than as a
+# dictionary would. Both ё and е spellings.
+ебёт
+ебет
+ебля
+ебут
+ебал
+трахае
+трахну
+трахал
+сосёт
+сосет
+минет
+дрочит
+дрочь
+изнасил
+порево
+сексом
+занимаются сексом
+порн
+мастурбац
+развратн
+стриптиз
+совращ
+инцест
+голенькая
+
+[age.guard]
+# Words that explain a small number as an age of something other than a
+# person, when they sit NEAR it (within age_guard_window bytes). Whisky and
+# service intervals use exactly the "12yo" / "12 yr" notation.
+#
+# Proximity matters: a review window had 25 names with a guard word many words
+# away from an age, every one of them material. A whole-name check loses those.
+whisk
+malt
+scotch
+bourbon
+cognac
+brandy
+tequila
+cask
+barrel
+reserva
+solera
+anejo
+distiller
+tasting
+aged
+vintage
+service manual
+warranty
+guarantee
+mileage
+
+[zoo.animals]
+# For the animal+act rule, which is currently NOT wired up — it measured
+# 8% precision on live data, because these words are also studio names, performer
+# names and size metaphors. Kept so a future phrase-based version has a baseline.
+horse
+pony
+mare
+stallion
+donkey
+canine
+equine
+k9
+
+[zoo.acts]
+cum
+cums
+fuck
+fucks
+fucking
+fucked
+pussy
+suck
+sucks
+knot
+penetrat
+
+[zoo.guard]
+# Veterinary and husbandry contexts, which legitimately pair an animal
+# with a reproductive term.
+veterinar
+breeding guide
+husbandry
+artificial insemination
+stud farm
+equine reproduction
+livestock
+insemination
+
+[limits]
+# Ages at or below this need no sexual term. Below 13 an age written into a
+# filename is the anomaly by itself — legal material does not label participants
+# that way. Only compact notations (yo, yr) qualify; "12 years" is ordinary
+# English and keeps the co-occurrence rule, or "12 Years a Slave" is blocked.
+#
+# Values above 17 are rejected: that stops being a threshold and becomes a
+# different rule.
+unpaired_age_max = 12
+
+# How far either side of a number a guard word disqualifies it, in bytes.
+# Tight on purpose — see [age.guard].
+age_guard_window = 24

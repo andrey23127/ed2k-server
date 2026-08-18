@@ -63,6 +63,17 @@ extra_terms_file = "config/csam_terms_extra.txt"
 # Layer 1 jargon list. Optional; absent = L1 inactive (L2-L4 still run). Source
 # from INHOPE/IWF/NCMEC; not shipped — copy config/csam_jargon.txt.example and fill.
 jargon_terms_file = "config/csam_jargon.txt"
+
+# Layer 2 vocabulary. Layer 2 blocks on the CO-OCCURRENCE of an age claim and a
+# sexual context, and its word lists used to be compiled into the binary — so
+# every addition meant a rebuild and a restart, and a restart drops every
+# connected client.
+#
+# Absent => the built-in lists are used, which is exactly what the server did
+# before this option existed. A file REPLACES the sections it names and leaves
+# the rest at their defaults. Hot-reloaded within 30 s of an mtime change.
+# See config/layer2_terms.txt.example for the format.
+layer2_terms_file = "/etc/ed2k-server/layer2_terms.txt"
 publisher_attempt_disconnect_threshold = 3
 publisher_blacklist_seconds = 86400
 publisher_count_window_seconds = 86400

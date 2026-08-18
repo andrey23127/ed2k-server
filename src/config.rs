@@ -165,6 +165,19 @@ pub struct ContentFilterConfig {
     #[serde(default)]
     pub jargon_terms_file: Option<String>,
 
+    /// Optional path to the Layer 2 vocabulary file.
+    ///
+    /// Layer 2 blocks on an age claim co-occurring with a sexual context, and
+    /// its word lists change almost daily as review windows surface new
+    /// phrasing. Keeping them in the binary meant a rebuild and a restart for
+    /// every addition, and a restart drops every connected client.
+    ///
+    /// Absent ⇒ the compiled-in vocabulary is used, which is exactly what it was
+    /// before this option existed. A file REPLACES the sections it names and
+    /// leaves the rest at their defaults. See `config/layer2_terms.txt.example`.
+    #[serde(default)]
+    pub layer2_terms_file: Option<String>,
+
     /// Optional path to hash whitelist (verified false-positive overrides).
     #[serde(default)]
     pub whitelist_hashes_file: Option<String>,

@@ -224,6 +224,38 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         }
     }
 
+    // Load the Layer 2 vocabulary, if the operator supplies one.
+    //
+    // On ANY failure — missing, unreadable, malformed — the compiled-in
+    // vocabulary stays. Layer 2 must never come up half-populated: a file with a
+    // typo'd section header would otherwise silently disable a whole category
+    // while the layer kept running and reporting nothing wrong.
+    if let Some(path) = &cfg.content_filter.layer2_terms_file {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => match ed2k_server::filter::layer2_terms::Layer2Terms::parse(&text) {
+                    Ok(terms) => {
+                        info!(
+                            count = terms.len(),
+                            path = %path.display(),
+                            "L2 vocabulary loaded"
+                        );
+                        filter = filter.with_layer2_terms(terms);
+                    }
+                    Err(e) => error!(
+                        error = %e,
+                        path = %path.display(),
+                        "L2 vocabulary rejected — keeping the built-in lists"
+                    ),
+                },
+                Err(e) => error!(error = %e, "failed to read L2 vocabulary file"),
+            }
+        } else {
+            warn!(path = %path.display(), "L2 vocabulary file not found — using built-in lists");
+        }
+    }
+
     // Load hash blocklists
     let mut total_blocked = 0;
     for path in &cfg.content_filter.hash_banlist {
@@ -651,6 +683,71 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // file (e.g. /etc/ed2k-server/csam_terms_extra.txt) and the new terms take
     // effect within the poll interval — NO restart. L1 and L4 reload from their
     // files (see watchers below/above); L2 is compiled-in logic and L3 hashes
+    // Layer 2 vocabulary watcher.
+    //
+    // Same 30 s mtime poll as the term files. The reason this one exists is the
+    // reason the file exists at all: these lists were changing daily, and each
+    // change meant a rebuild plus a restart that dropped every connected client.
+    //
+    // On a failed read or a parse error the CURRENT vocabulary stays in force
+    // and `last_mtime` is NOT advanced, so the next tick retries. That matters
+    // for the common case of an editor writing the file in two steps: the poll
+    // can land on a truncated file, and it must not leave Layer 2 running on
+    // half a list until the next edit.
+    {
+        let state_l2 = Arc::clone(&state);
+        if let Some(path) = state_l2
+            .live_cfg
+            .load()
+            .content_filter
+            .layer2_terms_file
+            .clone()
+        {
+            let path = std::path::PathBuf::from(path);
+            tokio::spawn(async move {
+                let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if Some(mtime) == last_mtime {
+                        continue;
+                    }
+                    let text = match std::fs::read_to_string(&path) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            warn!(error = %e, "L2 vocabulary read failed; keeping current lists");
+                            continue;
+                        }
+                    };
+                    match ed2k_server::filter::layer2_terms::Layer2Terms::parse(&text) {
+                        Ok(terms) => {
+                            let n = terms.len();
+                            state_l2.filter.reload_layer2_terms(terms);
+                            last_mtime = Some(mtime);
+                            info!(count = n, path = %path.display(),
+                                  "L2 vocabulary hot-reloaded");
+                        }
+                        // Advance last_mtime on a parse error too: the file IS
+                        // what the operator wrote, retrying it every 30 s would
+                        // just repeat the same error into the log until they fix
+                        // it. The error names the line.
+                        Err(e) => {
+                            last_mtime = Some(mtime);
+                            error!(error = %e, path = %path.display(),
+                                   "L2 vocabulary rejected; keeping current lists");
+                        }
+                    }
+                }
+            });
+            info!("L2 vocabulary hot-reload watcher started (30s mtime poll)");
+        }
+    }
+
     // load at startup. We watch the file mtime;
     // on change we re-read and atomically swap the term list via ArcSwap.
     {
@@ -1056,6 +1153,30 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         let n = all.len();
                         state_reload.filter.reload_hash_filter(all);
                         info!(count = n, "hash_filter list hot-reloaded (live)");
+                    }
+                }
+
+                // Reload the Layer 2 vocabulary. The mtime watcher already picks
+                // this up within 30 s; this path is for an operator who wants it
+                // NOW, and for the case where the file was rejected earlier and
+                // has since been fixed — the watcher will not retry a file whose
+                // mtime it has already seen.
+                if let Some(path) = &cfg_reload.content_filter.layer2_terms_file {
+                    match std::fs::read_to_string(path) {
+                        Ok(text) => {
+                            match ed2k_server::filter::layer2_terms::Layer2Terms::parse(&text) {
+                                Ok(terms) => {
+                                    let n = terms.len();
+                                    state_reload.filter.reload_layer2_terms(terms);
+                                    info!(count = n, path, "L2 vocabulary hot-reloaded (live)");
+                                }
+                                Err(e) => error!(
+                                    path, error = %e,
+                                    "L2 vocabulary rejected; keeping current lists"
+                                ),
+                            }
+                        }
+                        Err(e) => warn!(path, error = %e, "failed to read L2 vocabulary"),
                     }
                 }
 

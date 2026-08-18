@@ -1178,6 +1178,19 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
     if let Some(p) = &cf.jargon_terms_file {
         push_file("jargon terms (L1)", p, Some(s.server.filter.jargon_terms_count() as u64), &mut files);
     }
+    if let Some(p) = &cf.layer2_terms_file {
+        // Reported like the term files, though it is not one: the count is every
+        // entry across all twelve of its sections. Worth having on this page
+        // precisely because the file can be edited live — if a reload was
+        // rejected, the count here still shows the vocabulary actually in force,
+        // and the log below says why the new one was refused.
+        push_file(
+            "L2 vocabulary",
+            p,
+            Some(s.server.filter.layer2_terms_size() as u64),
+            &mut files,
+        );
+    }
     if let Some(p) = &cf.whitelist_hashes_file {
         push_file("hash whitelist", p, Some(s.server.filter.whitelist_size() as u64), &mut files);
     }
