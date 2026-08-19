@@ -241,6 +241,19 @@ service manual
 warranty
 guarantee
 mileage
+# Product and version contexts. "NNy" written with no space is an unpaired age
+# notation, and that form also names a model, a firmware build or a support
+# window: "Windows 11y build", "iPhone 12y case", "BMW 10y warranty".
+windows
+iphone
+galaxy
+firmware
+build
+version
+episode
+season
+model
+release
 
 [zoo.animals]
 # For the animal+act rule, which is currently NOT wired up — it measured

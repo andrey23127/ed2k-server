@@ -55,6 +55,17 @@ pub struct Layer2Terms {
     pub age_guard_window: usize,
 }
 
+// ⚠ EDITING THESE DEFAULTS HAS NO EFFECT on a deployment whose
+// layer2_terms.txt names the corresponding section: a named section replaces the
+// built-in list outright, which is what makes an entry removable and is the
+// point of the file.
+//
+// So vocabulary changes belong in the FILE. Change these only to alter what a
+// fresh installation starts with — and then regenerate
+// config/layer2_terms.txt.example, or the two drift apart silently.
+//
+// This was learned the hard way: guard words added here after a live miss did
+// nothing, because every running server already had the section in its file.
 impl Default for Layer2Terms {
     /// The vocabulary as it was compiled in before this file existed.
     ///
@@ -99,9 +110,14 @@ impl Default for Layer2Terms {
             "инцест", "голенькая",
             ]),
             age_guard: to_vec(&[
-            "whisk", "malt", "scotch", "bourbon", "cognac", "brandy", "tequila", "cask",
-            "barrel", "reserva", "solera", "anejo", "distiller", "tasting", "aged", "vintage",
-            "service manual", "warranty", "guarantee", "mileage",
+                // Product and version contexts. An age written with no space before
+                // the y is an unpaired notation, and that same form names a model, a
+                // firmware build or a support window.
+                "whisk", "malt", "scotch", "bourbon", "cognac", "brandy", "tequila",
+                "cask", "barrel", "reserva", "solera", "anejo", "distiller", "tasting",
+                "aged", "vintage", "service manual", "warranty", "guarantee", "mileage",
+                "windows", "iphone", "galaxy", "firmware", "build", "version", "episode",
+                "season", "model", "release",
             ]),
             zoo_animals: to_vec(&[
             "horse", "pony", "mare", "stallion", "donkey", "canine", "equine", "k9",
@@ -303,7 +319,7 @@ mod tests {
         // moves, someone edited the defaults, and the operator file on every
         // deployment is now out of step with them.
         let d = Layer2Terms::default();
-        assert_eq!(d.len(), 160, "default vocabulary size changed");
+        assert_eq!(d.len(), 170, "default vocabulary size changed");
         assert_eq!(d.unpaired_age_max, 12);
         assert_eq!(d.age_guard_window, 24);
     }

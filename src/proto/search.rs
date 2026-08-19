@@ -348,7 +348,28 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             if tl == "*" || tl == "**" || tl.is_empty() {
                 return true;
             }
-            name_lower.contains(&tl)
+            // A term is not necessarily one word. Some clients send a whole
+            // query as a single node, and testing it as one substring makes the
+            // WORD ORDER significant: "Ubuntu Linux Bible" contains the phrase
+            // "ubuntu linux" and not "linux ubuntu", so the same two words
+            // returned 12 results one way round and 3 the other. Lugdunum
+            // returns the same count either way, and that is what a user
+            // expects — they are naming words, not a phrase.
+            //
+            // So every word must appear, in any order. This is the second half
+            // of the #10 fix: the candidate lookup was corrected to split terms,
+            // but this predicate still ran on the unsplit string, and it is
+            // applied AFTER the candidates are gathered — so it silently threw
+            // away files the index had correctly found.
+            //
+            // Each word is still matched with `contains`, NOT as a whole token.
+            // That keeps single-word behaviour exactly as it was: "linux" goes
+            // on matching "linuxmint", and a query that worked before cannot
+            // start returning less.
+            if !tl.contains(' ') {
+                return name_lower.contains(&tl);
+            }
+            tl.split_whitespace().all(|w| name_lower.contains(w))
         }
         SearchNode::Meta { tag_name, value } => {
             // tag_name is usually a 1-char string holding a byte ID (eMule sends
@@ -409,6 +430,56 @@ mod tests {
         out.extend_from_slice(&(s.len() as u16).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
         out
+    }
+
+    #[test]
+    fn a_multi_word_term_ignores_word_order() {
+        // Issue #10, second half. The candidate lookup was fixed to split terms,
+        // but this predicate still tested the unsplit string as one substring —
+        // so "Ubuntu Linux Bible" matched "ubuntu linux" and not "linux ubuntu",
+        // and the same two words returned 12 results one way and 3 the other.
+        let name = "ubuntu linux bible, 10ed, clinton, negus, 2021.pdf";
+        for q in ["ubuntu linux", "linux ubuntu", "bible ubuntu", "linux 2021"] {
+            assert!(
+                evaluate(&SearchNode::Term(q.to_string()), name, 0),
+                "{q} must match regardless of order"
+            );
+        }
+        // A word that is absent still fails the whole term.
+        assert!(!evaluate(
+            &SearchNode::Term("ubuntu fedora".to_string()),
+            name,
+            0
+        ));
+    }
+
+    #[test]
+    fn single_word_terms_are_untouched() {
+        // Each word is matched with `contains`, not as a whole token, so a
+        // one-word query behaves exactly as before — including matching inside a
+        // longer word. A query that worked must not start returning less.
+        assert!(evaluate(
+            &SearchNode::Term("linux".to_string()),
+            "linuxmint tutorial.pdf",
+            0
+        ));
+        assert!(evaluate(
+            &SearchNode::Term("mint".to_string()),
+            "linuxmint tutorial.pdf",
+            0
+        ));
+        assert!(!evaluate(
+            &SearchNode::Term("fedora".to_string()),
+            "linuxmint tutorial.pdf",
+            0
+        ));
+    }
+
+    #[test]
+    fn wildcards_still_match_everything() {
+        for w in ["*", "**"] {
+            assert!(evaluate(&SearchNode::Term(w.to_string()), "anything.avi", 0));
+        }
     }
 
     #[test]

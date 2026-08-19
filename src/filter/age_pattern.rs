@@ -77,7 +77,15 @@ where
         if i < bytes.len() && (bytes[i] | 0x20) == b'y' {
             let after_y = i + 1;
             if after_y == bytes.len() || !is_word_char(bytes[after_y]) {
-                return Some(format!("age {age} (bare y)"));
+                // Consult `accept` like every other suffix does. This branch
+                // used to return unconditionally, which meant it ignored the
+                // caller's predicate entirely: the unpaired rule was firing on
+                // bare-"y" tokens it had explicitly excluded, and — worse — a
+                // bare "y" hid any later token, since the scan returned here
+                // before reaching it.
+                if accept(age, "bare y", start) {
+                    return Some(format!("age {age} (bare y)"));
+                }
             }
         }
 
@@ -680,7 +688,12 @@ fn contains_unpaired_minor_age(original: &str, lowered: &str, t: &Layer2Terms) -
         // "12 Years a Slave" is blocked — so spelled-out units, and every
         // non-English unit, keep the pairing requirement.
         age <= t.unpaired_age_max
-            && matches!(suffix, "yo" | "y.o" | "yr" | "yrs")
+            // "bare y" ("12y", attached with no space) is compact and IS
+            // included, on measurement: 569 catches in one review window with
+            // not one false positive among them. The risk it carries — a
+            // Windows build number, a phone model, a car warranty — is covered
+            // by the guard words, which name those contexts.
+            && matches!(suffix, "yo" | "y.o" | "yr" | "yrs" | "bare y")
             // `pos` indexes `original`; the guard scan wants the lowered copy.
             // They are byte-identical in length for the ASCII digits this
             // matches on, and `age_is_guarded` snaps to char boundaries anyway.
@@ -1086,6 +1099,33 @@ mod tests {
                 "{name} must be caught on the age alone"
             );
         }
+    }
+
+    #[test]
+    fn the_bare_y_branch_consults_the_predicate() {
+        // It used to return unconditionally, ignoring the caller entirely. Two
+        // consequences, both live: the unpaired rule fired on a notation it had
+        // excluded, and a bare "y" hid any later token because the scan returned
+        // before reaching it.
+        //
+        // "bare y" is now an accepted unpaired notation on measurement — 569
+        // catches in one window, no false positive — so what this pins is that
+        // the GUARD still applies to it.
+        for name in [
+            "Windows 11y build.iso",
+            "Model 12y specification.pdf",
+            "iPhone 12y case review.mp4",
+            "Macallan 12y single malt.jpg",
+            "BMW 10y warranty.pdf",
+        ] {
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
+                "{name} must NOT be caught — a guard word sits beside the number"
+            );
+        }
+        // ...while an unguarded one is.
+        let n = "some 11y video.avi";
+        assert!(matches_layer2(n, &n.to_lowercase()).is_some());
     }
 
     #[test]
