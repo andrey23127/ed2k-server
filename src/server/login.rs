@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use bytes::{BufMut, BytesMut};
 use std::net::IpAddr;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Decoded LOGINREQUEST payload (SPEC.md §3.1.3).
 #[derive(Debug)]
@@ -253,31 +253,175 @@ pub async fn assign_client_id(
     peer_ip: IpAddr,
     client_port: u16,
 ) -> (u32, bool) {
-    use crate::server::highid_probe::{high_id_from_ip, probe};
+    let (id, high, _ip) = assign_client_id_for(state, peer_ip, client_port, None, 0).await;
+    (id, high)
+}
+
+/// As `assign_client_id`, but able to attempt the hairpin fallback, which needs
+/// the user hash from the login in order to verify who answers the probe.
+///
+/// Returns the address the client should be RECORDED under as well. For every
+/// ordinary login that is the address it connected from; for a verified hairpin
+/// client it is the public address, because that is the one peers must be given
+/// as a source. Recording the private one would undo the whole fallback: the
+/// client would hold a HighID nobody could act on.
+/// CT_SERVER_FLAGS bit meaning "this client can speak obfuscated connections".
+/// eMule sets it whenever the crypt layer is enabled, which is the default.
+const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
+
+pub async fn assign_client_id_for(
+    state: &ServerState,
+    peer_ip: IpAddr,
+    client_port: u16,
+    login_user_hash: Option<&[u8; 16]>,
+    client_flags: u32,
+) -> (u32, bool, IpAddr) {
+    use crate::server::highid_probe::{
+        high_id_from_ip, probe, probe_identity, server_pseudo_user_hash,
+    };
 
     // Hot-reloadable: the probe timeout is read per login, so tuning it via
     // /api/config takes effect immediately.
-    let probe_timeout = state.live_cfg.load().network.login_timeout_ms;
-    let is_high = probe(peer_ip, client_port, probe_timeout).await;
+    let live = state.live_cfg.load();
+    let probe_timeout = live.network.login_timeout_ms;
 
-    if is_high {
+    if probe(peer_ip, client_port, probe_timeout).await {
         let id = high_id_from_ip(peer_ip).unwrap_or_else(|| state.allocate_low_id());
-        (id, true)
-    } else {
-        (state.allocate_low_id(), false)
+        return (id, true, peer_ip);
     }
+
+    // ─── HAIRPIN FALLBACK (opt-in) ──────────────────────────────────────
+    //
+    // ⚠ THE FIRST THING TO TURN OFF if HighID starts being handed out wrongly.
+    //   Set network.hairpin_lan_clients = false and the server is back to the
+    //   behaviour every release before this one had. Nothing else depends on it.
+    //
+    // Reached only when the plain probe already said LowID, so it can add
+    // HighIDs but never take one away.
+    //
+    // The case: a client on the same network as the server reaches it through
+    // the router's hairpin NAT, so the login arrives from an RFC1918 address and
+    // `probe` refuses to even try. In that topology the client's public address
+    // is the server's own, so that is what gets probed.
+    //
+    // Verified, not assumed. Where the router source-NATs hairpin traffic every
+    // local client arrives from the same address, so a forward on that port may
+    // belong to a different machine; the identity probe requires the peer to
+    // answer with the user hash that just logged in.
+    if live.network.hairpin_lan_clients && !peer_ip.is_loopback() {
+        if let (Some(uh), Ok(this_ip)) = (
+            login_user_hash,
+            live.server.this_ip.trim().parse::<std::net::Ipv4Addr>(),
+        ) {
+            let private_peer = matches!(peer_ip, IpAddr::V4(v4) if v4.is_private());
+            if private_peer && !this_ip.is_private() {
+                let our_id = high_id_from_ip(IpAddr::V4(this_ip)).unwrap_or(0);
+                // An identity of our own to present. It must not be the peer's:
+                // a client handed its own user hash concludes it has connected
+                // to itself and closes without answering.
+                // Derived from the same seckey the obfuscated handshake uses,
+                // so it is stable across restarts. Computed only on this path,
+                // which a normal login never reaches.
+                let ours =
+                    server_pseudo_user_hash(&crate::server::udp::resolve_seckey(&live));
+
+                // Obfuscate when the client said at login that it can, which is
+                // what Lugdunum does. A client configured to REQUIRE obfuscation
+                // drops a plain connection without a word, so without this the
+                // probe can never reach it.
+                let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
+
+                let mut outcome = probe_identity(
+                    IpAddr::V4(this_ip),
+                    client_port,
+                    uh,
+                    &ours,
+                    our_id,
+                    live.network.tcp_port,
+                    probe_timeout,
+                    supports_crypt,
+                )
+                .await;
+
+                // FALL BACK TO PLAIN once, and only when the obfuscated attempt
+                // failed at the handshake itself. "Supports" is not "requires",
+                // and a client that advertised the capability may still have it
+                // switched off, or belong to a fork that answers only in the
+                // clear. A retry costs one connection on a path that already
+                // decided LowID; getting it wrong costs the feature entirely.
+                if supports_crypt
+                    && matches!(
+                        outcome,
+                        Err("obfuscated handshake failed")
+                            | Err("peer closed during obfuscated handshake")
+                            | Err("no crypt answer before timeout")
+                    )
+                {
+                    debug!(
+                        public_ip = %this_ip, port = client_port,
+                        "hairpin: obfuscated probe refused, retrying in the clear"
+                    );
+                    outcome = probe_identity(
+                        IpAddr::V4(this_ip),
+                        client_port,
+                        uh,
+                        &ours,
+                        our_id,
+                        live.network.tcp_port,
+                        probe_timeout,
+                        false,
+                    )
+                    .await;
+                }
+
+                match outcome
+                {
+                    Ok(true) => {
+                        info!(
+                            lan_ip = %peer_ip, public_ip = %this_ip, port = client_port,
+                            "hairpin: client verified behind our own NAT → HighID"
+                        );
+                        let id = high_id_from_ip(IpAddr::V4(this_ip))
+                            .unwrap_or_else(|| state.allocate_low_id());
+                        return (id, true, IpAddr::V4(this_ip));
+                    }
+                    Ok(false) => {
+                        // A different host holds that forward. Handing out the
+                        // public address here would point peers at a machine
+                        // that never published the file.
+                        warn!(
+                            lan_ip = %peer_ip, public_ip = %this_ip, port = client_port,
+                            "hairpin: port answers but with a different user hash → LowID"
+                        );
+                    }
+                    Err(reason) => {
+                        debug!(
+                            lan_ip = %peer_ip, public_ip = %this_ip, port = client_port,
+                            reason, "hairpin: no verified answer → LowID"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    (state.allocate_low_id(), false, peer_ip)
 }
 
 /// Process a LOGINREQUEST and register the client.
 pub async fn handle_login(
-    cfg: &Config,
+    // Unused since the ID assignment moved to live_cfg, but kept so callers do
+    // not have to change.
+    _cfg: &Config,
     state: &ServerState,
     peer_ip: IpAddr,
     req: LoginRequest,
 ) -> ClientHandle {
-    let (assigned_id, is_high_id) = assign_client_id(state, cfg, peer_ip, req.port).await;
+    let client_flags = req.server_flags();
+    let (assigned_id, is_high_id, source_ip) =
+        assign_client_id_for(state, peer_ip, req.port, Some(&req.user_hash), client_flags).await;
     let nick = req.nick().unwrap_or("(no name)").to_string();
-    let server_flags = req.server_flags();
+    let server_flags = client_flags;
 
     // Debug: log every parsed tag to diagnose field extraction
     debug!(
@@ -411,7 +555,9 @@ pub async fn handle_login(
     let handle = ClientHandle {
         user_hash: req.user_hash,
         assigned_id,
-        ip: peer_ip,
+        // Usually the login address; the public one for a verified hairpin
+        // client, since this is what gets published as a source.
+        ip: source_ip,
         port: req.port,
         udp_port,
         natt_capable: udp_port != 0,

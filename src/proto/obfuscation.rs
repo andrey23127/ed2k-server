@@ -36,15 +36,15 @@ pub const DH_PRIME_SIZE: usize = 96;
 /// Private exponent size: 16 bytes = 128 bits (eNode-go: CryptDhaSize = 16)
 const DH_PRIVATE_SIZE: usize = 16;
 
-const MAGIC_VALUE_SERVER: u8    = 203;  // 0xCB
-const MAGIC_VALUE_REQUESTER: u8 = 34;   // 0x22
-const MAGIC_SYNC: u32 = 0x835E_6FC4;
+pub(crate) const MAGIC_VALUE_SERVER: u8    = 203;  // 0xCB
+pub(crate) const MAGIC_VALUE_REQUESTER: u8 = 34;   // 0x22
+pub(crate) const MAGIC_SYNC: u32 = 0x835E_6FC4;
 
 const EM_OBFUSCATE: u8 = 0;
 
 /// eD2k protocol markers that must NOT appear as the SemiRandomMarker byte
 /// (would make the stream look like a plain eD2k frame to the server).
-const FORBIDDEN_MARKERS: [u8; 3] = [0xE3, 0xC5, 0xD4];
+pub(crate) const FORBIDDEN_MARKERS: [u8; 3] = [0xE3, 0xC5, 0xD4];
 
 // ─── RC4 ─────────────────────────────────────────────────────────────────────
 
@@ -179,11 +179,14 @@ pub enum CryptState {
 pub(crate) mod test_client {
     pub(crate) use super::Rc4;
 
+    // Re-exported so `use ...::test_client::*` brings in everything a client
+    // simulation needs from one import. These three are now also public at
+    // module level for the HighID probe; kept here so the glob import in
+    // server/obfuscated_conn.rs keeps working.
+    pub(crate) use super::{MAGIC_SYNC, MAGIC_VALUE_REQUESTER, MAGIC_VALUE_SERVER};
+
     pub(crate) const DH_PRIVATE_SIZE: usize = super::DH_PRIVATE_SIZE;
     pub(crate) const EM_OBFUSCATE: u8 = super::EM_OBFUSCATE;
-    pub(crate) const MAGIC_SYNC: u32 = super::MAGIC_SYNC;
-    pub(crate) const MAGIC_VALUE_REQUESTER: u8 = super::MAGIC_VALUE_REQUESTER;
-    pub(crate) const MAGIC_VALUE_SERVER: u8 = super::MAGIC_VALUE_SERVER;
 
     pub(crate) fn dh_pow_mod(exp_bytes: &[u8]) -> Vec<u8> {
         super::dh_pow_mod(exp_bytes)
@@ -325,16 +328,25 @@ impl TcpObfuscation {
 
 // ─── Platform PRNG helpers ────────────────────────────────────────────────────
 
-fn random_bytes(n: usize) -> Vec<u8> {
+pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
-    // For a production build, replace with `rand::thread_rng()`.
-    // This simple version is fine for test/MVP.
+    // Obfuscation, not encryption: this only has to be unpredictable enough that
+    // two streams do not look alike. It is NOT suitable for anything where
+    // guessing the output matters.
+    //
+    // The clock alone was not enough. Seeded from `subsec_nanos` only, two calls
+    // landing in the same nanosecond bucket — which happens when several logins
+    // arrive together — produce the identical keystream. The counter makes every
+    // call distinct regardless of clock resolution.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seed = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
-        .subsec_nanos();
+        .subsec_nanos() as u64
+        ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
     let mut h = DefaultHasher::new();
     seed.hash(&mut h);
     let mut out = Vec::with_capacity(n);

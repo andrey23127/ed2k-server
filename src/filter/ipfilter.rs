@@ -166,17 +166,47 @@ impl IpFilter {
 }
 
 /// Parse one line. Returns None on malformed input (silently skipped).
-fn parse_line(line: &str) -> Option<(u32, u32)> {
-    // "001.000.000.000 - 001.000.000.255 , 000 , description"
-    let dash = line.find(" - ")?;
-    let start_raw = line[..dash].trim();
-    let rest      = &line[dash + 3..];
-    let end_raw   = rest.find(" , ")
-        .map(|c| &rest[..c])
-        .unwrap_or(rest)
-        .trim();
+/// Parse one range line. Both formats these lists ship in are accepted.
+///
+/// ⚠ TWO FORMATS, and the file name tells you nothing about which one you have.
+///   The option is called `guarding.p2p`, but the file behind it is just as often
+///   in `ipfilter.dat` layout — and until 0.9.77 only the latter was read, so a
+///   genuine `.p2p` file loaded as zero ranges and the filter silently did
+///   nothing.
+///
+/// ```text
+/// ipfilter.dat:  001.000.000.000 - 001.000.000.255 , 000 , description
+/// .p2p:          description:1.0.0.0-1.0.0.255
+/// ```
+///
+/// The `.p2p` description may itself contain colons and dashes, so the split is
+/// on the LAST colon and then on the last dash of what follows — the addresses
+/// are at the end of the line, and that is the only part with a fixed shape.
+pub(crate) fn parse_line(line: &str) -> Option<(u32, u32)> {
+    // ipfilter.dat first: " - " with spaces is unambiguous.
+    if let Some(dash) = line.find(" - ") {
+        let start_raw = line[..dash].trim();
+        let rest = &line[dash + 3..];
+        let end_raw = rest
+            .find(" , ")
+            .map(|c| &rest[..c])
+            .unwrap_or(rest)
+            .trim();
+        if let (Some(a), Some(b)) = (ip_to_u32(start_raw), ip_to_u32(end_raw)) {
+            return Some((a, b));
+        }
+    }
 
-    Some((ip_to_u32(start_raw)?, ip_to_u32(end_raw)?))
+    // .p2p: everything after the last colon is "start-end".
+    let range = match line.rfind(':') {
+        Some(c) => &line[c + 1..],
+        None => line,
+    }
+    .trim();
+    let dash = range.rfind('-')?;
+    let a = ip_to_u32(range[..dash].trim())?;
+    let b = ip_to_u32(range[dash + 1..].trim())?;
+    Some((a, b))
 }
 
 /// Parse a possibly zero-padded IPv4 string into a u32.
@@ -215,6 +245,31 @@ fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn both_list_formats_parse() {
+        // The option is named after one format and the file is as often in the
+        // other. Reading only one of them made a valid list load as zero ranges,
+        // which disables the filter without saying so.
+        let dat = "001.000.000.000 - 001.000.000.255 , 000 , Some Org";
+        assert_eq!(parse_line(dat), Some((0x01000000, 0x010000FF)));
+
+        let p2p = "Some Org:1.0.0.0-1.0.0.255";
+        assert_eq!(parse_line(p2p), Some((0x01000000, 0x010000FF)));
+
+        // A .p2p description containing its own colons and dashes: the split has
+        // to be on the LAST colon, because only the tail has a fixed shape.
+        let messy = "Bad-Corp: range 5 - see http://example.org:1.2.3.4-1.2.3.9";
+        assert_eq!(parse_line(messy), Some((0x01020304, 0x01020309)));
+
+        // Zero-padded octets, either format.
+        assert_eq!(parse_line("X:001.002.003.004-001.002.003.009"), parse_line(messy));
+
+        // Nonsense stays nonsense.
+        assert_eq!(parse_line("this is not a range"), None);
+        assert_eq!(parse_line("Org:1.2.3.4"), None);
+        assert_eq!(parse_line("Org:999.1.1.1-999.1.1.2"), None);
+    }
     use super::*;
 
     #[test]

@@ -139,6 +139,11 @@ Put your runtime data files here too and point the config at them:
 
 - **Content filter lists** (optional but recommended — see *Content filter*).
 
+Keeping those files current by hand is tedious, and the term and hash lists are
+not published in this repository. See **[UPDATE-SERVICE.md](UPDATE-SERVICE.md)**
+for pulling them from an update service — or running one — including the
+signature checks that make an automatic update safe.
+
 ### 3. Run as a systemd service
 
 A ready unit is in `contrib/ed2k-server.service`. Install it:
@@ -246,6 +251,7 @@ a watched file) or needs a **restart**.
 | `listen_backlog`, `max_frame_size` | Socket / frame tuning | restart |
 | `login_timeout_ms` | Login handshake timeout | restart |
 | `support_crypt` | Advertise protocol obfuscation support | restart |
+| `hairpin_lan_clients` | Let a client on the server's own network reach HighID (see below). Off by default | live |
 
 > **UDP ports are derived from `tcp_port`, not configured.** The eD2k protocol
 > fixes the whole UDP block relative to the TCP port, and seed servers compute a
@@ -262,6 +268,25 @@ a watched file) or needs a **restart**.
 > `tcp_port + 4` by hand; a wrong value silently broke discovery. It has been
 > removed. A stale `udp_port = ...` left in an old `config.toml` is ignored, so
 > existing configs keep working without edits.
+
+> **`hairpin_lan_clients` — for running a client on the same network as the
+> server.** In that topology the client reaches the server through the router's
+> hairpin NAT, so the login arrives from an RFC1918 address and the ordinary
+> HighID probe refuses to even try: there is nothing useful to connect to at a
+> private address. With this on, the server falls back to probing
+> `server.this_ip` on the client's port — in that topology the client's public
+> address is by definition the server's own.
+>
+> It runs only after the ordinary probe has already decided LowID, so it can add
+> a HighID but never take one away, and it requires the peer to answer a
+> client-to-client handshake with **the user hash that just logged in**. That
+> check is what makes it safe: where a router source-NATs hairpin traffic, every
+> local client arrives from the same address and cannot be told apart, so a port
+> forward may well lead to a different machine. Without the identity check the
+> server would hand the public address out as a source for the wrong host.
+>
+> Off by default because a server in a datacentre may see private addresses from
+> a management network that has nothing to do with its public address.
 
 ### `[limits]`
 | Key | Meaning | Apply |
@@ -287,6 +312,40 @@ a watched file) or needs a **restart**.
 
 > `hash_banlist` was `hash_blocklists` and `hash_filter` was `poison_hashes`
 > before 0.9.71; the shipped filenames changed to match. See *Content filter*.
+
+### `[updates]`
+
+Optional; disabled by default. Fetches the filter data files from an update
+service, verifies an Ed25519 signature over them, validates them with the same
+parser that loads them at runtime, keeps rotating backups and installs
+atomically. Full description, including how to run a service:
+**[UPDATE-SERVICE.md](UPDATE-SERVICE.md)**.
+
+| Key | Meaning | Apply |
+|---|---|---|
+| `enabled` | Master switch | live |
+| `dest_dir` | Where files are installed; must match the paths above | live |
+| `public_key` | Ed25519 public key (32 bytes, hex) files must be signed with | live |
+| `require_signature` | Refuse anything unsigned. Leave on | live |
+| `key_reference_ip` | The server whose exported peer table the service loaded | live |
+| `backups` | Generations kept as `<name>.1` … `<name>.N` | live |
+| `min_keep_ratio` | Refuse a replacement that shrinks the list below this fraction | live |
+| `export_url`, `export_token`, `export_interval_secs` | Peer table export | restart |
+| `[updates.urls]` | Per-file URLs | live |
+
+> **`public_key` is public and `export_token` is not.** The key verifies a
+> signature and cannot create one, so it is safe to ship and to commit. The token
+> lets its holder push a peer table to the service and is issued per server —
+> never copy one out of a repository, and never commit yours.
+
+Updates are triggered from the **Health** tab, which lists every data file with
+what is on disk and an **Update** button. The three hash lists additionally offer
+**Update & merge**, which unions the download with the file already installed,
+comparing hashes only and keeping whichever side carries the comment.
+
+Nothing is written unless the signature verifies, the file parses and it would
+not collapse the list — a failed update leaves the current file in place and says
+why.
 
 ### `[storage]`
 | Key | Meaning | Apply |

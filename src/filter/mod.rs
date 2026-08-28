@@ -464,19 +464,43 @@ impl ContentFilter {
         // longer there.
         let l2 = self.layer2_terms.load();
 
+        // Term-layer exceptions. A fixed phrase here exempts the name from
+        // Layers 1 and 4 — NOT from Layer 2, which has its own `exceptions`
+        // list, and NOT from the hash layers, which are the operator's own
+        // rulings and already ran above.
+        //
+        // This exists because the term layers had no remedy short of the hash
+        // whitelist, and a hash is the wrong unit for the mistake they make. The
+        // recurring case is a legitimate TITLE that contains a marker — a
+        // Law & Order episode named after the crime it depicts, a cartoon
+        // episode whose guest character is a toddler, a 2014 feature film whose
+        // one-word title is a community marker. Each is republished constantly
+        // under a new hash, so whitelisting hashes never finishes.
+        //
+        // Computed once, lazily: an empty list is the normal case and costs
+        // nothing.
+        let term_exempt = !l2.term_exceptions.is_empty() && {
+            let normalized = layer2_terms::normalize_separators(filename);
+            l2.term_exceptions
+                .iter()
+                .any(|p| normalized.contains(p.as_str()))
+        };
+
         // Mojibake pass: if the name is recoverable text, test the recovered form
         // too. Only the non-ASCII terms can gain anything — the ASCII part of a
         // mangled name is untouched and the scans below already cover it — but
         // those are exactly the terms this damage hides.
         if let Some(recovered) = Self::undo_mojibake(filename) {
             let rec_lower = recovered.to_lowercase();
-            let jt = self.jargon_terms.load();
-            if let Some(term) = jargon::matches_terms(&rec_lower, &jt) {
-                return FilterResult::Block(Layer::L1Jargon, format!("{term} (mojibake)"));
-            }
-            let ex = self.extra_terms.load();
-            if let Some(term) = jargon::matches_terms(&rec_lower, &ex) {
-                return FilterResult::Block(Layer::L4Extra, format!("{term} (mojibake)"));
+            if !term_exempt {
+                let jt = self.jargon_terms.load();
+                if let Some(term) = jargon::matches_terms(&rec_lower, &jt) {
+                    return FilterResult::Block(Layer::L1Jargon, format!("{term} (mojibake)"));
+                }
+                let ex = self.extra_terms.load();
+                if let Some(term) = jargon::matches_terms(&rec_lower, &ex) {
+                    return FilterResult::Block(Layer::L4Extra, format!("{term} (mojibake)"));
+                }
             }
             if let Some(reason) = age_pattern::matches_layer2(&recovered, &rec_lower, &l2) {
                 return FilterResult::Block(Layer::L2AgePattern, format!("{reason} (mojibake)"));
@@ -488,8 +512,10 @@ impl ContentFilter {
         // lifetime rules changed between editions. An explicit binding is correct
         // under every edition.
         let jargon_terms = self.jargon_terms.load();
-        if let Some(term) = jargon::matches_terms(&lowered, &jargon_terms) {
-            return FilterResult::Block(Layer::L1Jargon, term.to_string());
+        if !term_exempt {
+            if let Some(term) = jargon::matches_terms(&lowered, &jargon_terms) {
+                return FilterResult::Block(Layer::L1Jargon, term.to_string());
+            }
         }
 
         // Layer 2: age pattern + sexual context
@@ -538,8 +564,10 @@ impl ContentFilter {
         // block medical papers. Sharing the matcher is what keeps the two lists
         // from drifting apart again.
         let extra = self.extra_terms.load();
-        if let Some(term) = jargon::matches_terms(&lowered, &extra) {
-            return FilterResult::Block(Layer::L4Extra, term.to_string());
+        if !term_exempt {
+            if let Some(term) = jargon::matches_terms(&lowered, &extra) {
+                return FilterResult::Block(Layer::L4Extra, term.to_string());
+            }
         }
 
         FilterResult::Allow
@@ -757,6 +785,46 @@ mod tests {
                 "{name} must pass"
             );
         }
+    }
+
+    #[test]
+    fn a_term_exception_exempts_only_the_term_layers() {
+        // The recurring shape: a legitimate TITLE that contains a marker,
+        // republished endlessly under a new hash, so whitelisting hashes never
+        // finishes. Separator-normalised, because scene releases write titles
+        // with dots.
+        let mut l2 = layer2_terms::Layer2Terms::default();
+        l2.term_exceptions = vec!["in plain sight".to_string()];
+        let f = ContentFilter::new().with_extra_terms(["jailbait".to_string()]);
+        f.reload_layer2_terms(l2.clone());
+        assert!(matches!(
+            f.check(&zh(), "In.Plain.Sight.2x11.Jailbait.mp4"),
+            FilterResult::Allow
+        ));
+        assert!(matches!(
+            f.check(&zh(), "In Plain Sight 2x11 Jailbait.mp4"),
+            FilterResult::Allow
+        ));
+        // The term still fires on everything else.
+        assert!(matches!(
+            f.check(&zh(), "jailbaits_jfraction0202.mp4"),
+            FilterResult::Block(Layer::L4Extra, _)
+        ));
+    }
+
+    #[test]
+    fn a_term_exception_does_not_reach_the_hash_layers() {
+        // An operator ruling by hash outranks a phrase. Layer 3 runs before the
+        // exception is even consulted.
+        let h: [u8; 16] = [0x44; 16];
+        let mut l2 = layer2_terms::Layer2Terms::default();
+        l2.term_exceptions = vec!["in plain sight".to_string()];
+        let f = ContentFilter::new().with_hash_blocklist([h]);
+        f.reload_layer2_terms(l2);
+        assert!(matches!(
+            f.check(&h, "In.Plain.Sight.2x11.Jailbait.mp4"),
+            FilterResult::Block(Layer::L3HashBlock, _)
+        ));
     }
 
     #[test]

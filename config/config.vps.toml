@@ -36,12 +36,13 @@ seed_servers = [
 "31.40.212.254:9197",
 "185.237.185.226:31031",
 "57.131.35.107:4232",
-"45.87.41.16:6262",
 "91.119.202.44:4321",
 "193.187.90.12:4661",
 "213.141.198.207:4232",
 "85.17.116.222:6082",
 "212.95.35.240:4232",
+"193.187.90.12:4661",
+"91.126.170.253:5687",
 ]
 version_major = 18
 version_minor = 1
@@ -53,6 +54,22 @@ listen_backlog = 1024
 max_frame_size = 1_000_000
 login_timeout_ms = 3000         # Slightly longer for VPS latency
 support_crypt = true
+
+# Give clients that reach this server from a PRIVATE address a chance at HighID,
+# by probing server.this_ip on their port instead of the unroutable one.
+#
+# For the case where an operator runs a client on the same network as the server:
+# the client reaches it through the router's hairpin NAT, so the login arrives
+# from an RFC1918 address and would otherwise always be LowID.
+#
+# ⚠ OFF BY DEFAULT and the default is the cautious one. A server in a datacentre
+#   may see private addresses from a management network unrelated to its public
+#   address, and where a router source-NATs hairpin traffic every local client
+#   arrives from the SAME address, so a port forward may lead to a different
+#   machine than the one that logged in. The probe therefore requires the peer to
+#   answer with the user hash that just logged in; if that check is ever
+#   weakened, this option must go with it.
+hairpin_lan_clients = false
 
 [limits]
 max_clients = 5000
@@ -113,3 +130,64 @@ country_db_path = "/etc/ed2k-server/ip-to-country.csv"
 [admin]
 enabled = true
 port = 8080
+
+[updates]
+# Update service for the filter data files. See UPDATE-SERVICE.md.
+#
+# Without the term and hash lists the content filter has very little to work
+# with, and those lists cannot be published in a public repository. This section
+# is how a server gets them.
+enabled = true
+
+# Where files are installed. Must match the paths in [content_filter] and
+# [storage] above, or an update lands where nothing is watching.
+dest_dir = "/etc/ed2k-server"
+
+# Ed25519 public key (32 bytes, hex) that data files must be signed with.
+#
+# READ THIS BEFORE LEAVING IT EMPTY. A hijacked domain or a compromised update
+# host can push an EMPTY vocabulary — every layer using it then silently matches
+# nothing, on every server that pulled — or one hash of a popular legal release
+# into the ban list, which bans its publishers for thirty days everywhere at
+# once. The signature is checked before anything is written, and it is the only
+# defence that does not depend on who controls the domain.
+#
+# The value below belongs to the emule-security.org update service. It is a
+# PUBLIC key: it can verify a signature and cannot create one. Replace it if you
+# run your own service.
+public_key = "102f8ec039fb6fcfe75dfd00cfc5cfed76d1f006aa03f0825e69f30e8c2d836d"
+require_signature = true
+
+# Credential for the access-controlled files. Derived, not stored: it is
+# IPObfuscate(our seckey, this address) — the same number this server already
+# sends that peer during the obfuscated server-to-server handshake, so the
+# service can be given the table without any registration step. Set it to the
+# server whose exported peer table the service loaded.
+key_reference_ip = ""
+
+backups = 3
+min_keep_ratio = 0.5
+
+# Peer table export: the (IP, key) pairs of servers that completed gossip with
+# us, so the service can recognise them.
+#
+# ⚠ export_token is a SECRET and is deliberately empty here. Anyone holding it
+#   can push a peer table to the service. Ask the service operator for one; do
+#   not copy a token out of a public repository, and do not commit yours.
+export_url = ""
+export_token = ""
+export_interval_secs = 3600
+
+[updates.urls]
+# The two public files carry no access control and have compiled-in defaults;
+# they are spelled out here only so the paths are visible.
+guarding_p2p     = "https://ed2k.emule-security.org/pub/guarding.p2p"
+ip_to_country    = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# The rest identify material and are fetched with the access key above. Empty
+# until an update service has granted this server access.
+csam_jargon = "https://ed2k.emule-security.org/files/csam_jargon.txt"
+csam_terms_extra = "https://ed2k.emule-security.org/files/csam_terms_extra.txt"
+layer2_terms = "https://ed2k.emule-security.org/files/layer2_terms.txt"
+hash_banlist = "https://ed2k.emule-security.org/files/hash_banlist.txt"
+hash_filter = "https://ed2k.emule-security.org/files/hash_filter.txt"
+whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"

@@ -13,10 +13,11 @@
 //!
 //! Matching rules
 //! --------------
-//! ONE left rule, for every term: the match must not begin immediately after an
-//! ASCII letter. The right side depends on the term:
+//! ONE left rule, for every term: the match must not begin immediately after a
+//! LATIN letter (accents included — see `is_letter_char`). The right side
+//! depends on the term:
 //!   * length >= 6 chars: anything may follow;
-//!   * length <= 5 chars: no ASCII letter may follow;
+//!   * length <= 5 chars: no Latin letter may follow;
 //!   * a trailing `$` on any term: no ASCII word character may follow.
 //! All three apply only at an edge where the TERM itself is ASCII (see
 //! `edge_is_ascii_word`).
@@ -81,8 +82,52 @@ fn is_word_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-fn is_letter(b: u8) -> bool {
-    b.is_ascii_alphabetic()
+/// Does this character BIND to a neighbouring term, i.e. is it part of the same
+/// word?
+///
+/// Latin script, not ASCII. The rule used to test `is_ascii_alphabetic`, which
+/// made an accented letter a separator: a five-character term sat inside the
+/// French word for "elephant" with `é` on its left, the left rule saw a
+/// non-ASCII byte, called it a boundary and fired. On one review window that
+/// blocked 21 files — Dumbo, a 1976 comedy and its soundtrack, a Conan album, a
+/// popular-science ebook — and every one of them ended up in the hash ban list,
+/// which also counted against the people sharing them. A Spanish word for
+/// "quadruped" produced the same failure against a four-character term.
+///
+/// Cyrillic, Greek and CJK deliberately do NOT bind. Measured on the same
+/// window: binding on every Unicode letter additionally dropped three CORRECT
+/// blocks, where a Latin marker was glued straight onto Chinese text with no
+/// separator ("...最新最牛逼<brand>+兽皇...", "正太shota么么哒<term>+boy-10Yo").
+/// Those scripts are written without word separators, so an adjacent character
+/// there says nothing about word membership — the same reasoning that already
+/// exempts CJK terms from the boundary rules entirely.
+///
+/// Restricting it to Latin costs zero true positives on that window and removes
+/// all 22 false ones.
+fn is_letter_char(c: char) -> bool {
+    if c.is_ascii() {
+        return c.is_ascii_alphabetic();
+    }
+    // Latin-1 Supplement letters, Latin Extended-A/-B, IPA extensions, and
+    // Latin Extended Additional (Vietnamese, and the precomposed forms these
+    // filenames are full of).
+    matches!(c as u32, 0x00C0..=0x024F | 0x1E00..=0x1EFF) && c.is_alphabetic()
+}
+
+/// Word character for the opt-in `$` anchor: a binding letter, an ASCII digit
+/// or `_`.
+fn is_word_char_at(c: char) -> bool {
+    is_letter_char(c) || c.is_ascii_digit() || c == '_'
+}
+
+/// The character immediately before byte offset `at`, if any.
+fn char_before(s: &str, at: usize) -> Option<char> {
+    s[..at].chars().next_back()
+}
+
+/// The character starting at byte offset `at`, if any.
+fn char_at(s: &str, at: usize) -> Option<char> {
+    s[at..].chars().next()
 }
 
 /// What the character after a match must not be.
@@ -129,27 +174,106 @@ fn split_anchor(term: &str) -> (&str, bool) {
 /// The left rule is always the same — the match must not begin immediately
 /// after an ASCII letter — and applies only when the term itself starts with an
 /// ASCII word character. The right rule is the caller's choice.
+/// Characters that count as a separator between the words of a term.
+const SEPARATORS: [char; 4] = [' ', '-', '_', '.'];
+
+/// Byte offset of the character after the one at `at`.
+///
+/// Slicing a `str` at a byte that is not a character boundary panics, and these
+/// filenames are full of multi-byte characters, so the scan advances by
+/// characters and never by one byte.
+fn next_char_boundary(s: &str, at: usize) -> usize {
+    let mut n = at + 1;
+    while n < s.len() && !s.is_char_boundary(n) {
+        n += 1;
+    }
+    n
+}
+
+/// Find `term` in `hay` at or after `from`, treating a SPACE in the term as
+/// "one or more separator characters".
+///
+/// A multi-word brand is written every possible way in filenames — with spaces,
+/// hyphens, underscores or dots — and each spelling used to need its own entry.
+/// Missing one is silent: a term list carrying the spaced form of a brand let 25
+/// files of the hyphenated form through, and three of them were sitting in live
+/// search results.
+///
+/// ⚠ THE ASYMMETRY IS DELIBERATE. Only a SPACE in the term is flexible. A term
+///   written with a hyphen matches ONLY a hyphen. That is what keeps a
+///   hyphenated brand from matching the same two words written with a space —
+///   which for at least one term in the L1 list is the difference between the
+///   brand and an ordinary vehicle name. Write the separator you mean: space
+///   for "any", hyphen for "exactly this".
+///
+/// Concatenation is NOT a separator: "one or more" means at least one character.
+/// A concatenated spelling stays a separate entry.
+fn find_flexible(hay: &str, term: &str, from: usize) -> Option<(usize, usize)> {
+    // The byte walk below assumes ASCII. Terms in other scripts (CJK) never
+    // carry a separator anyway, so they take the plain path.
+    if !term.contains(' ') || !term.is_ascii() {
+        return hay[from..].find(term).map(|p| (from + p, from + p + term.len()));
+    }
+    let hb = hay.as_bytes();
+    let mut start = from;
+    'outer: while start < hb.len() {
+        // Anchor on the first character to keep this linear enough.
+        let first = term.as_bytes()[0];
+        match hay[start..].find(first as char) {
+            Some(p) => start += p,
+            None => return None,
+        }
+        let mut h = start;
+        let mut t = 0;
+        let tb = term.as_bytes();
+        while t < tb.len() {
+            if tb[t] == b' ' {
+                // One or more separators.
+                let mut n = 0;
+                while h < hb.len() && SEPARATORS.contains(&(hb[h] as char)) {
+                    h += 1;
+                    n += 1;
+                }
+                if n == 0 {
+                    start = next_char_boundary(hay, start);
+                    continue 'outer;
+                }
+                t += 1;
+                continue;
+            }
+            if h >= hb.len() || hb[h] != tb[t] {
+                start = next_char_boundary(hay, start);
+                continue 'outer;
+            }
+            h += 1;
+            t += 1;
+        }
+        return Some((start, h));
+    }
+    None
+}
+
 fn contains_bounded(lowered: &str, term: &str, right: RightRule) -> bool {
-    let bytes = lowered.as_bytes();
     let tb = term.as_bytes();
     let check_left = edge_is_ascii_word(tb.first());
     let check_right = right != RightRule::Free && edge_is_ascii_word(tb.last());
     let mut start = 0;
-    while let Some(pos) = lowered[start..].find(term) {
-        let abs = start + pos;
-        let before_ok = !check_left || abs == 0 || !is_letter(bytes[abs - 1]);
-        let end = abs + tb.len();
+    while let Some((abs, end)) = find_flexible(lowered, term, start) {
+        // Neighbour tests are on CHARACTERS, not bytes: an accented letter is
+        // several bytes and its trailing byte is not alphabetic, which used to
+        // read as a word boundary. See `is_letter_char`.
+        let before_ok = !check_left || !char_before(lowered, abs).is_some_and(is_letter_char);
         let after_ok = !check_right
-            || end == bytes.len()
-            || match right {
-                RightRule::Free => true,
-                RightRule::NotLetter => !is_letter(bytes[end]),
-                RightRule::NotWordChar => !is_word_char(bytes[end]),
+            || match (right, char_at(lowered, end)) {
+                (_, None) => true,
+                (RightRule::Free, _) => true,
+                (RightRule::NotLetter, Some(c)) => !is_letter_char(c),
+                (RightRule::NotWordChar, Some(c)) => !is_word_char_at(c),
             };
         if before_ok && after_ok {
             return true;
         }
-        start = abs + 1;
+        start = next_char_boundary(lowered, abs);
     }
     false
 }
@@ -244,6 +368,90 @@ mod tests {
         assert!(matches_terms("2shrt clip.mp4", &t).is_some());
         assert!(matches_terms("shrt_virgin.avi", &t).is_some());
         assert!(matches_terms("shrt2011.mpg", &t).is_some());
+    }
+
+    // ⚠ `matches_terms` takes an ALREADY-LOWERCASED name — the fold happens in
+    // the caller. Every fixture below is written in lower case for that reason.
+    // Getting this wrong is quiet: an upper-case fixture makes a NEGATIVE
+    // assertion pass for the wrong reason, so the test guards nothing.
+
+    #[test]
+    fn a_space_in_a_term_matches_any_separator() {
+        // A multi-word brand is written every way there is. Carrying only the
+        // spaced form let 25 files of the hyphenated form through on one
+        // measurement, three of them live in search results.
+        let t = vec!["shrt marker".to_string()];
+        for name in [
+            "shrt marker - ann 015.mp4",
+            "shrt-marker_ann-015_1080p.mp4",
+            "shrt_marker ann 015.mp4",
+            "shrt.marker.ann.015.mp4",
+            "shrt - marker ann.mp4",
+        ] {
+            assert!(matches_terms(name, &t).is_some(), "missed {name}");
+        }
+        // Concatenation is NOT a separator — "one or more" means at least one.
+        assert!(matches_terms("shrtmarker ann.mp4", &t).is_none());
+    }
+
+    #[test]
+    fn a_hyphen_in_a_term_matches_only_a_hyphen() {
+        // THE ASYMMETRY, and the reason for it. Written with a hyphen, the term
+        // must not reach the same two words separated by a space — for one term
+        // in the live L1 list that is the difference between a brand and an
+        // ordinary vehicle name.
+        let t = vec!["shrt-marker".to_string()];
+        assert!(matches_terms("shrt-marker issue 15.rar", &t).is_some());
+        assert!(matches_terms("shrt marker rover 2004 review.avi", &t).is_none());
+        assert!(matches_terms("shrt_marker.avi", &t).is_none());
+        assert!(matches_terms("shrt.marker.avi", &t).is_none());
+    }
+
+    #[test]
+    fn flexible_matching_keeps_the_boundary_rules() {
+        // The separator is flexible; the edges are not.
+        let t = vec!["shrt marker".to_string()];
+        assert!(matches_terms("ashrt-marker.mp4", &t).is_none());
+        assert!(matches_terms("shrt-markerish.mp4", &t).is_some()); // long term: tail free
+        // And a right anchor still applies to the end of the whole term.
+        let anchored = vec!["shrt marker$".to_string()];
+        assert!(matches_terms("shrt-markers of the world.pdf", &anchored).is_none());
+        assert!(matches_terms("shrt-marker - vixen.mp4", &anchored).is_some());
+        assert!(matches_terms("shrt.marker_01.mp4", &anchored).is_none());
+    }
+
+    #[test]
+    fn accented_letters_bind_like_ascii_ones() {
+        // THE REGRESSION this rule was changed for. A five-character term sits
+        // inside the French word for "elephant"; before the fix its left
+        // neighbour `é` was not an ASCII letter, so the boundary check passed
+        // and 21 legitimate files were blocked and then hash-banned.
+        let t = vec!["shrt".to_string()];
+        assert!(matches_terms("le grand éshrt blanc.mp4", &t).is_none());
+        assert!(matches_terms("l'éshrt aveugle.mp3", &t).is_none());
+        // A long term is protected on the left by the same rule.
+        let long = vec!["marker".to_string()];
+        assert!(matches_terms("télémarker sur la piste.avi", &long).is_none());
+        // Right side too: no Latin letter may follow a short term.
+        assert!(matches_terms("shrté.mp4", &t).is_none());
+        // ...and the term still fires at a real boundary in the same language.
+        assert!(matches_terms("le shrt à paris.mp4", &t).is_some());
+        assert!(matches_terms("écoute - shrt.mp4", &t).is_some());
+    }
+
+    #[test]
+    fn non_latin_scripts_do_not_bind() {
+        // Measured cost of the alternative: binding on EVERY Unicode letter
+        // dropped three correct blocks on the review window, where a Latin
+        // marker was glued straight onto Chinese text. CJK and Cyrillic are
+        // written without word separators, so an adjacent character there says
+        // nothing about word membership.
+        let t = vec!["shrt".to_string()];
+        assert!(matches_terms("最新最牛逼shrt+兽皇合集.torrent", &t).is_some());
+        assert!(matches_terms("shrt么么哒.mp4", &t).is_some());
+        let long = vec!["marker".to_string()];
+        assert!(matches_terms("正太shota么么哒marker+boy.mp4", &long).is_some());
+        assert!(matches_terms("порноmarker.avi", &long).is_some());
     }
 
     #[test]

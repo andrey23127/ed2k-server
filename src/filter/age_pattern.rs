@@ -97,8 +97,47 @@ where
         // Look for age suffix
         let rest = &s[i..];
         let suffixes = [
-            "yo", "y.o", "y.o.", "yr", "yrs", "year", "years",
-            "años", "ano", "anos",
+            "yo",
+            "y.o",
+            "y.o.",
+            "yr",
+            "yrs",
+            "year",
+            "years",
+            "años",
+            "ano",
+            "anos",
+            // Spanish/Portuguese year units as they actually ARRIVE. Three
+            // separate ways the same word reaches us broken, measured on one
+            // review window (504 occurrences of "N años", 41 of them invisible
+            // to the list above):
+            //
+            //   NFD — "n" + U+0303 instead of the precomposed "ñ". Looks
+            //   identical, compares unequal. 13 occurrences.
+            //
+            //   Lower-cased mojibake — the name was damaged first ("aÃ±os") and
+            //   THEN title-cased by the publisher, turning "Ã" into "ã". That is
+            //   lossy: `undo_mojibake` cannot round-trip it, because the bytes
+            //   of the original character are gone. Matching the damaged form
+            //   literally is the only way left. 28 occurrences, all of them on
+            //   material with an explicit age of a small child.
+            //
+            //   Double-encoded — two Latin-1 rounds, of which our recovery pass
+            //   undoes at most what is still valid UTF-8.
+            //
+            // These spellings occur in no ordinary title. Verified: adding them
+            // produced 94 new age tokens on the window and lost none.
+            "an\u{303}os",
+            "an\u{303}o",
+            "aã±os",
+            "aã±o",
+            "aãâ±os",
+            "aã£â±os",
+            "aã\u{83}â±os",
+            // Portuguese diminutive, and the Spanish one. Both are explicit age
+            // claims ("13 aninhos"), both were passing through.
+            "aninhos",
+            "añitos",
             // NOTE: bare "let" was REMOVED. Czech/Slovak "15 let" (= years) is a
             // real age form, but "let" is also an extremely common English verb,
             // and the scanner only requires a word boundary after it. Live FP:
@@ -106,13 +145,24 @@ where
             // adult performers — parsed "3 Let" as "3 years" and, combined with
             // the "xxx" sex term, was wrongly blocked. The inflected Slavic forms
             // below are unambiguous and keep most of the coverage.
-            "letnia", "letni", "letech", "letý", "leta",
-            "jahr", "jährig", "jahrige",
-            "лет", "года", "год",
+            "letnia",
+            "letni",
+            "letech",
+            "letý",
+            "leta",
+            "jahr",
+            "jährig",
+            "jahrige",
+            "лет",
+            "года",
+            "год",
             // CJK / Korean age suffixes (e.g. "13歳", "13才", "13세").
             // Non-Latin — no FP risk inside Latin words. A digit 0-17 directly
             // followed by one of these is an explicit minor-age claim.
-            "歳", "才", "세", "歲",
+            "歳",
+            "才",
+            "세",
+            "歲",
             // NOTE: the school-grade suffixes "年生"/"学年"/"학년" are NOT here.
             // They were, and it was wrong: the digit in front of them is a GRADE,
             // not an age. "中学2年生" is a 14-year-old in the second year of
@@ -139,6 +189,12 @@ where
                         *suffix,
                         "year" | "years" | "año" | "años" | "ano" | "anos"
                             | "jahr" | "лет" | "года" | "год"
+                            // The recovered spellings above are the same word
+                            // and need the same duration and anniversary guards.
+                            | "an\u{303}os" | "an\u{303}o"
+                            | "aã±os" | "aã±o" | "aãâ±os" | "aã£â±os"
+                            | "aã\u{83}â±os"
+                            | "aninhos" | "añitos"
                     );
 
                     // A spelled-out year unit in a DURATION is not an age. The
@@ -151,8 +207,23 @@ where
                     // "9 years old" is the single most common way a real age is
                     // written, so "old" after a year unit is an AGE, not a span.
                     const AFTER: &[&str] = &[
-                        "ago", "назад", "temu", "前", "dry spell", "later",
-                        "apart", "anniversary",
+                        "ago",
+                        "назад",
+                        "temu",
+                        "前",
+                        "dry spell",
+                        "later",
+                        "apart",
+                        "anniversary",
+                        // "5 Year Reunion" is an occasion, not an age. Live
+                        // false positive: a 2003 adult party release
+                        // ("Party Hardcore ... 5 Year Reunion Blowjob ...")
+                        // paired the reading with its own "xxx" term and was
+                        // blocked. Note this cannot be fixed by requiring "old"
+                        // after the unit — that would lose "Emy 12 Years Thai"
+                        // and "6Years Sweetmini", both real.
+                        "reunion",
+                        "reunión",
                     ];
                     // Reference word right before the number. Kept deliberately
                     // small; "after" covers "Back After 10 Years".
@@ -171,12 +242,34 @@ where
                     // arrives as "rio". Prefixes also survive the mojibake these
                     // filenames are full of ("AniversÃ¡rio" still contains
                     // "anivers").
-                    const ANNIVERSARY: &[&str] =
-                        &["annivers", "anivers", "jubil", "jahrestag", "годовщин", "юбиле"];
+                    const ANNIVERSARY: &[&str] = &[
+                        "annivers",
+                        "anivers",
+                        "jubil",
+                        "jahrestag",
+                        "годовщин",
+                        "юбиле",
+                    ];
                     // How far back to look. Short on purpose: the marker has to be
                     // next to the number, so "Anniversary Edition ... 12 years old
                     // girl" is still an age.
                     const ANNIVERSARY_LOOKBACK: usize = 32;
+                    // Romance-language ELAPSED-TIME markers, which sit before
+                    // the number with quantifiers in between: "hace ya casi 2
+                    // años" is "almost 2 years ago". The exact-previous-word
+                    // test above cannot see it (the previous word is "casi"),
+                    // and AFTER cannot either (the marker precedes).
+                    //
+                    // ⚠ SHORT LOOKBACK, and the reason is measured. "hace" is
+                    //   also the ordinary verb "does/makes", and this corpus is
+                    //   full of it — "Chica desnuda le hace facesitting a niña
+                    //   de 9 años" is real material where the verb sits 27
+                    //   characters before a genuine age. At 20 the review window
+                    //   yields exactly one match, the Spanish adult studio
+                    //   release this guard is for; at 28 it starts exempting
+                    //   real files. Do not widen it.
+                    const ELAPSED_BEFORE: &[&str] = &["hace", "faz", "há"];
+                    const ELAPSED_LOOKBACK: usize = 20;
                     if spelled {
                         let tail_hit = AFTER.iter().any(|w| tail.starts_with(w));
                         // Word immediately before the digit run.
@@ -198,9 +291,22 @@ where
                             .rev()
                             .collect::<String>()
                             .to_lowercase();
-                        let anniversary_hit =
-                            ANNIVERSARY.iter().any(|w| lookback.contains(w));
-                        if tail_hit || before_hit || anniversary_hit {
+                        let anniversary_hit = ANNIVERSARY.iter().any(|w| lookback.contains(w));
+                        // Whole-word, inside a much shorter window than the
+                        // anniversary one.
+                        let elapsed_window: String = prefix
+                            .chars()
+                            .rev()
+                            .take(ELAPSED_LOOKBACK)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect::<String>()
+                            .to_lowercase();
+                        let elapsed_hit = elapsed_window
+                            .split(|c: char| !c.is_alphabetic())
+                            .any(|w| ELAPSED_BEFORE.contains(&w));
+                        if tail_hit || before_hit || anniversary_hit || elapsed_hit {
                             continue;
                         }
                     }
@@ -218,6 +324,16 @@ where
             }
         }
         if let Some(suf) = matched {
+            // Spanish "yo" is the pronoun "I", and a track number in front of a
+            // song title puts it exactly where an age suffix would be.
+            if suf == "yo" && spanish_pronoun_yo(s, start, i + suf.len()) {
+                i = if after_digits > start {
+                    after_digits
+                } else {
+                    i + 1
+                };
+                continue;
+            }
             if accept(age, suf, start) {
                 return Some(format!("age {age} ({suf})"));
             }
@@ -226,9 +342,80 @@ where
             // was never reached.
         }
         // No match - reset and continue scanning
-        i = if after_digits > start { after_digits } else { i + 1 };
+        i = if after_digits > start {
+            after_digits
+        } else {
+            i + 1
+        };
     }
     None
+}
+
+/// Spanish words that follow the PRONOUN "yo" ("I"), not the age suffix.
+///
+/// First-person verb forms and the clitics that precede them. Deliberately NOT
+/// a general Spanish word list, and in particular NOT "solo": it appears in real
+/// material — `!PTHC - Arina Dreams - 13yo Solo Nude` lost its age token when a
+/// looser list was measured against the review window.
+///
+/// "se" and "que" were held back for the same reason and admitted on 25.08.2026,
+/// once the position test below was tightened. Measured over 49 716 names: they
+/// remove four more Spanish songs ("13 Yo se lo pedí a una moza",
+/// "09 Yo Que No Vivo Sin Tí", "06 Yo Que Un Dia Te Quise Siempre",
+/// "12 Yo Ya Fui A Cangas Del Morrazo") and cost nothing.
+const SPANISH_YO_FOLLOWERS: &[&str] = &[
+    "soy", "no", "me", "te", "quiero", "quería", "queria", "qriero", "prefiero", "tengo", "voy",
+    "vivo", "sali", "salí", "canto", "estoy", "puedo", "pienso", "creo", "nací", "naci", "amo",
+    "sigo", "vengo", "bajo", "pierdo", "enamoré", "enamore", "pido", "también", "tambien",
+    "quisiera", "diré", "dire", "seré", "sere", "quise", "se", "que", "ya", "sé", "sin",
+];
+
+/// Is this "yo" the Spanish pronoun rather than an age suffix?
+///
+/// TWO conditions, and both are needed. The number must sit where a TRACK
+/// NUMBER sits — at the very start of the name, or straight after the
+/// "Artist - " dash — and the next word must be one of the forms above.
+///
+/// Measured on a 28 593-name review window: 26 names change, every one of them
+/// Spanish-language music ("Joaquín Sabina - 01 Yo me bajo en Atocha.mp3",
+/// "Franco Battiato - 03 Yo quiero verte danzar.mp3"), and not one piece of real
+/// material. Fourteen of them were live Layer 2 blocks — 2.2% of everything the
+/// layer caught that day, all of it songs.
+///
+/// The position test is what makes the word list safe to widen later: an age
+/// written mid-name is never in track-number position.
+fn spanish_pronoun_yo(s: &str, num_start: usize, after_suffix: usize) -> bool {
+    let prefix = &s[..num_start];
+    // Start of the name, or straight after an "Artist - " dash.
+    //
+    // ⚠ THE DASH MUST HAVE WHITESPACE BEFORE IT. Without that, this corpus
+    //   supplies plenty of "track numbers" that are nothing of the sort:
+    //   `CAROL-5YO No Limits Fun`, `Asian Lolita - 3Yo-5Yo-11Yo No Hair Girls`,
+    //   `Russian-Flowers-Compil-Boys-12yo-13yo`. A hyphen with no space is how
+    //   these filenames join words, and treating it as an artist separator hands
+    //   the guard a way to exempt real material — 1261 age tokens across 49 716
+    //   names sit behind a bare hyphen like that.
+    //
+    //   Requiring the space costs nothing measurable: on that corpus the change
+    //   returns zero blocks, because every affected name carried a second age
+    //   token that fired anyway. It is a hole closed before it was fallen into,
+    //   not a bug fixed after.
+    let after_artist_dash = {
+        let t = prefix.trim_end_matches([' ', '\t']);
+        t.ends_with(['-', '\u{2013}', '\u{2014}'])
+            && t[..t.len() - t.chars().next_back().map_or(0, char::len_utf8)].ends_with([' ', '\t'])
+    };
+    let is_track_number = prefix.chars().all(|c| !c.is_alphanumeric()) || after_artist_dash;
+    if !is_track_number {
+        return false;
+    }
+    let next: String = s[after_suffix..]
+        .trim_start_matches([' ', '.', '-', '_'])
+        .chars()
+        .take_while(|c| c.is_alphabetic())
+        .collect();
+    let next = next.to_lowercase();
+    SPANISH_YO_FOLLOWERS.contains(&next.as_str())
 }
 
 fn is_word_char(b: u8) -> bool {
@@ -318,7 +505,6 @@ fn contains_sex_term(lowered: &str, t: &Layer2Terms) -> bool {
     false
 }
 
-
 /// Gender-tagged age pairs: "G12 B15", "g13 b15", "B08 G16".
 ///
 /// A single "B12" is far too weak to act on — it is a vitamin, a bomber, a bus
@@ -371,8 +557,19 @@ fn count_gender_age_tokens(s: &str) -> usize {
 ///   `contains_school_grade_marker`.
 // CJK_MINOR_WORDS moved to Layer2Terms (filter/layer2_terms.rs).
 
-fn contains_cjk_minor_word(s: &str, t: &Layer2Terms) -> bool {
-    t.minor_cjk.iter().any(|w| s.contains(w.as_str()))
+/// Returns the matching word, not just whether one matched.
+///
+/// The reason string is the only audit trail a category has. `RU minor word`
+/// covers seventeen stems, and a review export that names none of them cannot
+/// answer "which stem is producing these?" — a live window had 22 hits under
+/// that one label, six of which turned out to rest on a single stem that reads
+/// as an adult genre label. Deciding that stem's fate required reading all 22 by
+/// hand. Naming the term makes the same question a `sort | uniq -c`.
+fn contains_cjk_minor_word<'a>(s: &str, t: &'a Layer2Terms) -> Option<&'a str> {
+    t.minor_cjk
+        .iter()
+        .find(|w| s.contains(w.as_str()))
+        .map(|w| w.as_str())
 }
 
 /// Latin-script words that name an age range entirely below 18, with no adult
@@ -412,7 +609,7 @@ fn contains_cjk_minor_word(s: &str, t: &Layer2Terms) -> bool {
 /// and the word is rare enough in this material that a narrower rule is not
 /// worth the risk. "toddler" has no such collision — no ordinary English word
 /// continues past it except its own plural.
-fn contains_latin_minor_word(lowered: &str, t: &Layer2Terms) -> bool {
+fn contains_latin_minor_word<'a>(lowered: &str, t: &'a Layer2Terms) -> Option<&'a str> {
     let bytes = lowered.as_bytes();
     for w in &t.minor_latin {
         let mut start = 0;
@@ -421,12 +618,12 @@ fn contains_latin_minor_word(lowered: &str, t: &Layer2Terms) -> bool {
             let before_ok = abs == 0 || !is_word_char(bytes[abs - 1]);
             // Trailing letters are allowed ("toddlers"), a leading one is not.
             if before_ok {
-                return true;
+                return Some(w.as_str());
             }
             start = abs + 1;
         }
     }
-    false
+    None
 }
 
 /// Returns a description of WHY layer 2 fired ("age 12 (yo)", "CJK minor word",
@@ -445,15 +642,10 @@ pub(super) fn matches_layer2(original: &str, lowered: &str, t: &Layer2Terms) -> 
         .or_else(|| {
             contains_school_grade_marker(original).then(|| "school grade marker".to_string())
         })
-        .or_else(|| contains_cjk_minor_word(original, t).then(|| "CJK minor word".to_string()))
-        .or_else(|| {
-            contains_latin_minor_word(lowered, t).then(|| "minor-age word".to_string())
-        })
-        .or_else(|| {
-            (count_gender_age_tokens(original) >= 2)
-                .then(|| "gender-age pair".to_string())
-        })
-        .or_else(|| contains_ru_minor_word(lowered, t).then(|| "RU minor word".to_string()))?;
+        .or_else(|| contains_cjk_minor_word(original, t).map(|w| format!("CJK minor word ({w})")))
+        .or_else(|| contains_latin_minor_word(lowered, t).map(|w| format!("minor-age word ({w})")))
+        .or_else(|| (count_gender_age_tokens(original) >= 2).then(|| "gender-age pair".to_string()))
+        .or_else(|| contains_ru_minor_word(lowered, t).map(|w| format!("RU minor word ({w})")))?;
     if contains_sex_term(lowered, t) || contains_ru_sex_term(lowered, t) {
         return Some(age_claim);
     }
@@ -603,8 +795,11 @@ fn has_sex_term_exception(lowered: &str, t: &Layer2Terms) -> bool {
 /// Substring match: Cyrillic has no ASCII word characters, so the boundary rules
 /// used for Latin terms would never apply here anyway — and stems are meant to
 /// match inside inflected forms.
-fn contains_ru_minor_word(lowered: &str, t: &Layer2Terms) -> bool {
-    t.minor_ru.iter().any(|w| lowered.contains(w.as_str()))
+fn contains_ru_minor_word<'a>(lowered: &str, t: &'a Layer2Terms) -> Option<&'a str> {
+    t.minor_ru
+        .iter()
+        .find(|w| lowered.contains(w.as_str()))
+        .map(|w| w.as_str())
 }
 
 fn contains_ru_sex_term(lowered: &str, t: &Layer2Terms) -> bool {
@@ -661,8 +856,13 @@ fn age_is_guarded(lowered: &str, pos: usize, t: &Layer2Terms) -> bool {
     let hi = (pos + t.age_guard_window).min(lowered.len());
     // Snap to char boundaries — filenames are full of multi-byte text and
     // slicing mid-character panics.
-    let lo = (lo..=pos).find(|i| lowered.is_char_boundary(*i)).unwrap_or(pos);
-    let hi = (pos..=hi).rev().find(|i| lowered.is_char_boundary(*i)).unwrap_or(pos);
+    let lo = (lo..=pos)
+        .find(|i| lowered.is_char_boundary(*i))
+        .unwrap_or(pos);
+    let hi = (pos..=hi)
+        .rev()
+        .find(|i| lowered.is_char_boundary(*i))
+        .unwrap_or(pos);
     let window = &lowered[lo..hi];
     t.age_guard.iter().any(|w| window.contains(w.as_str()))
 }
@@ -782,9 +982,104 @@ mod tests {
         super::matches_zoo_cooccurrence(lowered, &Layer2Terms::default())
     }
     fn contains_cjk_minor_word(s: &str) -> bool {
-        super::contains_cjk_minor_word(s, &Layer2Terms::default())
+        super::contains_cjk_minor_word(s, &Layer2Terms::default()).is_some()
     }
 
+    #[test]
+    fn spanish_track_number_and_pronoun_is_not_an_age() {
+        // 14 live Layer 2 blocks in one window — 2.2% of everything the layer
+        // caught that day — were Spanish-language songs where a track number
+        // runs into the pronoun "yo" ("I").
+        for name in [
+            "Joaquín Sabina - 01 Yo me bajo en Atocha.mp3",
+            "Franco Battiato - 03 Yo quiero verte danzar.mp3",
+            "Ismael Serrano - 05 Yo quiero ser muy promiscuo.mp3",
+            "10 Yo no soy esa mujer.mp3",
+            "05Yo te diré.mp3",
+            "Gran Jefe - 9 Yo no he sido.mp3",
+            "08 Yo Sali.mp3",
+        ] {
+            assert!(
+                contains_minor_age_token(name).is_none(),
+                "Spanish pronoun read as an age: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_yo_guard_needs_both_halves() {
+        // POSITION. The same words mid-name are not a track number, and this is
+        // what keeps the guard from reaching real material.
+        assert!(contains_minor_age_token("niña rusa 12 yo no llores.wmv").is_some());
+        // A hyphen with no space in front of it is how these filenames join
+        // words, not an artist separator. Both of these are real names.
+        assert!(contains_minor_age_token("carol-5yo no limits fun.mp4").is_some());
+        assert!(
+            contains_minor_age_token("asian lolita - 3yo-5yo-11yo no hair girls.avi").is_some()
+        );
+        // ...and the real thing still works.
+        assert!(contains_minor_age_token("gran jefe - 9 yo no he sido.mp3").is_none());
+        // WORD. A track number followed by anything else stays an age.
+        assert!(contains_minor_age_token("03 Yo Girl Nude.mp4").is_some());
+        // The word list deliberately excludes "solo": measured against the
+        // window, including it cost `!PTHC - Arina Dreams - 13yo Solo Nude`.
+        assert!(contains_minor_age_token("Arina Dreams - 13yo Solo Nude (8).avi").is_some());
+    }
+
+    #[test]
+    fn broken_spanish_year_units_are_still_ages() {
+        // Three ways "años" arrives damaged. 41 of 504 occurrences in one
+        // window were invisible to the precomposed spelling alone.
+        // NFD: "n" + combining tilde.
+        assert!(contains_minor_age_token("nin\u{303}a de 8 an\u{303}os.mp4").is_some());
+        // Mojibake that was then title-cased — lossy, so `undo_mojibake` cannot
+        // help and the damaged form has to be matched literally.
+        assert!(contains_minor_age_token("Andrea Mexico Girl 10 Aã±Os And Dad.mp4").is_some());
+        // Portuguese diminutive.
+        assert!(contains_minor_age_token("Flavinha 14 Aninhos Minha.wmv").is_some());
+    }
+
+    #[test]
+    fn elapsed_time_in_romance_languages_is_not_an_age() {
+        // "hace ya casi 2 años" = "almost 2 years ago". Live false positive on a
+        // Spanish adult studio release; the marker precedes the number with
+        // quantifiers in between, so neither AFTER nor the previous-word test
+        // sees it.
+        assert!(contains_minor_age_token(
+            "Fakings En Familia - Nuestros Comienzos Hace Ya Casi 2 Años.avi"
+        )
+        .is_none());
+        // ...but "hace" is also the ordinary verb, and at any real distance the
+        // age still stands. This one is real material.
+        assert!(
+            contains_minor_age_token("Chica desnuda le hace facesitting a niña de 9 años.avi")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_reunion_is_an_occasion_not_an_age() {
+        assert!(
+            contains_minor_age_token("Party Hardcore 2003.12.01 5 Year Reunion Blowjob.avi")
+                .is_none()
+        );
+        // The fix must not be "require the word old" — these have no "old".
+        assert!(contains_minor_age_token("Emy 12 Years Thai.avi").is_some());
+    }
+
+    #[test]
+    fn a_minor_word_block_names_the_word_that_fired() {
+        // The reason string is the category's only audit trail. Seventeen
+        // Russian stems used to share one undifferentiated label, which made
+        // per-stem review impossible without reading every hit by hand.
+        let r = matches_layer2(
+            "Малолетку ебут в первый раз.avi",
+            "малолетку ебут в первый раз.avi",
+        )
+        .expect("should block");
+        assert!(r.starts_with("RU minor word ("), "reason was {r}");
+        assert!(r.contains("малолет"), "reason should name the stem: {r}");
+    }
 
     // ── Regression tests from live production data (2026-07) ─────────────
     // Every string below is a REAL filename observed on the server. The blocked
@@ -916,10 +1211,10 @@ mod tests {
         // A wider list was measured first and produced ten false positives in
         // twelve real adult titles; this test is what keeps the list narrow.
         for name in [
-            "Doggy Style Anal Compilation HD.mp4",   // a position, not an animal
+            "Doggy Style Anal Compilation HD.mp4", // a position, not an animal
             "Doggystyle Fuck Brazzers 2019.mp4",
             "Riding Cock Doggy Position.avi",
-            "Horse Cock Dildo Toy Play - solo.mp4",  // a toy: "cock" is excluded
+            "Horse Cock Dildo Toy Play - solo.mp4", // a toy: "cock" is excluded
             "Big Dick Bull Riding Cowgirl.mp4",
             "Bitch Sucks Cock POV.mp4",
             "Beast Mode Fuck Session.mp4",
@@ -1013,10 +1308,10 @@ mod tests {
         // named. What keeps these titles safe is SEX_TERM_EXCEPTIONS, and this
         // test is what stops someone from deleting that list as redundant.
         for name in [
-            "Голая правда 2009 комедия.mkv",             // fixed idiom, and a film
-            "Голая правда о детском питании.pdf",        // same idiom + a minor marker
-            "Сексуальное воспитание детей - Спок.pdf",   // sex education
-            "Эротика 70-х европейское кино.avi",         // "эротик" not listed
+            "Голая правда 2009 комедия.mkv",           // fixed idiom, and a film
+            "Голая правда о детском питании.pdf",      // same idiom + a minor marker
+            "Сексуальное воспитание детей - Спок.pdf", // sex education
+            "Эротика 70-х европейское кино.avi",       // "эротик" not listed
             "Детский психолог о половом воспитании.pdf",
             "Защита детей от совращения - методичка МВД.pdf",
         ] {
@@ -1074,8 +1369,12 @@ mod tests {
     fn russian_yo_and_ye_spellings_both_match() {
         // ебёт / ебет, сосёт / сосет — the same word to a reader, different
         // bytes to a comparison, and filenames use both.
-        for name in ["школьница ебёт.avi", "школьница ебет.avi",
-                     "малолетка сосёт.avi", "малолетка сосет.avi"] {
+        for name in [
+            "школьница ебёт.avi",
+            "школьница ебет.avi",
+            "малолетка сосёт.avi",
+            "малолетка сосет.avi",
+        ] {
             assert!(
                 matches_layer2(name, &name.to_lowercase()).is_some(),
                 "{name} must be caught"
@@ -1243,20 +1542,26 @@ mod tests {
         // Episode/volume numbering read as an age of 0:
         assert!(contains_minor_age_token(
             "[Lust Cinema] Erika Lust XConfessions Vol. 26 Ep 0Y - Asmr - The Sound Of Sex"
-        ).is_none());
+        )
+        .is_none());
         // A duration read as an age of 1:
         assert!(contains_minor_age_token(
             "Onlyfans - Cumpilation 2019, 1 Year 83 Cumshots! (Bareback)"
-        ).is_none());
+        )
+        .is_none());
         // A point in the past read as an age of 3:
         assert!(contains_minor_age_token(
             "FC2-PPV-3238169 An Innocent Wife ... From About 3 Years Ago, My Wife"
-        ).is_none());
+        )
+        .is_none());
         // Durations that read forward or as a gap, not an age (live FPs):
         assert!(contains_minor_age_token(
-            "Bang - Phoebe Kalib - Gets Into Porn After 3 Year Dry Spell").is_none());
-        assert!(contains_minor_age_token(
-            "AnalMom - Amirah Adara ... Back After 10 Years").is_none());
+            "Bang - Phoebe Kalib - Gets Into Porn After 3 Year Dry Spell"
+        )
+        .is_none());
+        assert!(
+            contains_minor_age_token("AnalMom - Amirah Adara ... Back After 10 Years").is_none()
+        );
         // CRITICAL: "N years old" is the commonest way a real age is written and
         // must ALWAYS count — the duration guard must never swallow it:
         assert!(contains_minor_age_token("9 years old girl").is_some());
@@ -1290,8 +1595,14 @@ mod tests {
 
     #[test]
     fn regression_gender_age_pairs() {
-        assert_eq!(count_gender_age_tokens("mov family BroSis G12 B15 - 12y Sis"), 2);
-        assert_eq!(count_gender_age_tokens("mov family BroSis B08 G16 - 16y girl"), 2);
+        assert_eq!(
+            count_gender_age_tokens("mov family BroSis G12 B15 - 12y Sis"),
+            2
+        );
+        assert_eq!(
+            count_gender_age_tokens("mov family BroSis B08 G16 - 16y girl"),
+            2
+        );
         // A lone token is ambiguous (vitamin B12, chess G4) and must not qualify.
         assert!(count_gender_age_tokens("Vitamin B12 supplement guide") < 2);
         assert!(count_gender_age_tokens("Nikon B12 review") < 2);
@@ -1343,7 +1654,8 @@ mod tests {
             "ssni-216 快感！初 体 験8 河北彩花",
             "JUC-705 息子の嫁が巨乳過ぎて… 青木りん",
         ] {
-            assert!(matches_layer2(name, &name.to_lowercase()).is_none(),
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_none(),
                 "legal JAV wrongly blocked: {name:?}"
             );
         }
@@ -1358,7 +1670,8 @@ mod tests {
             "9 Yo Girl Sex With 10 Yo Brother",
             "中学生 レイプ",
         ] {
-            assert!(matches_layer2(name, &name.to_lowercase()).is_some(),
+            assert!(
+                matches_layer2(name, &name.to_lowercase()).is_some(),
                 "should be blocked: {name:?}"
             );
         }
@@ -1425,8 +1738,10 @@ mod tests {
     fn layer2_fp_analysis_with_age() {
         let s = "16 yo behavioral analysis study.pdf";
         let l = s.to_lowercase();
-        assert!(matches_layer2(s, &l).is_none(),
-                "FALSE POSITIVE: 'analysis' contains 'anal' substring");
+        assert!(
+            matches_layer2(s, &l).is_none(),
+            "FALSE POSITIVE: 'analysis' contains 'anal' substring"
+        );
     }
 
     #[test]
@@ -1440,8 +1755,10 @@ mod tests {
     fn layer2_fp_moral_with_age() {
         let s = "10 year old corporate moral handbook.pdf";
         let l = s.to_lowercase();
-        assert!(matches_layer2(s, &l).is_none(),
-                "FALSE POSITIVE: 'moral' contains 'oral' substring");
+        assert!(
+            matches_layer2(s, &l).is_none(),
+            "FALSE POSITIVE: 'moral' contains 'oral' substring"
+        );
     }
 
     #[test]
@@ -1467,10 +1784,10 @@ mod tests {
 
     #[test]
     fn school_grade_markers_detected() {
-        assert!(contains_school_grade_marker("中1 something"));   // JHS yr1
-        assert!(contains_school_grade_marker("小6 video"));        // elem yr6
-        assert!(contains_school_grade_marker("중1 clip"));         // KR JHS yr1
-        assert!(contains_school_grade_marker("초6 file"));         // KR elem yr6
+        assert!(contains_school_grade_marker("中1 something")); // JHS yr1
+        assert!(contains_school_grade_marker("小6 video")); // elem yr6
+        assert!(contains_school_grade_marker("중1 clip")); // KR JHS yr1
+        assert!(contains_school_grade_marker("초6 file")); // KR elem yr6
 
         // Long forms — these used to be reached only via the "年生" age suffix,
         // which read the grade digit as an age.
@@ -1483,7 +1800,7 @@ mod tests {
 
         // Grades that do not exist at that level are not grades.
         assert!(!contains_school_grade_marker("中学9年生"));
-        assert!(!contains_school_grade_marker("田中4"));  // surname + number
+        assert!(!contains_school_grade_marker("田中4")); // surname + number
         assert!(!contains_school_grade_marker("田中5号"));
 
         // ⚠ THE REGRESSION the suffix list caused: post-compulsory school years
@@ -1526,8 +1843,10 @@ mod tests {
     fn cjk_fp_legit_jav_with_adult_age() {
         // Legal adult JAV with adult age + generic content — must NOT match.
         let s = "Kokoro Wato FC2 PPV 18歳 debut.mp4";
-        assert!(matches_layer2(s, &s.to_lowercase()).is_none(),
-                "FP: adult age 18 must not trigger");
+        assert!(
+            matches_layer2(s, &s.to_lowercase()).is_none(),
+            "FP: adult age 18 must not trigger"
+        );
         // Chinese film with episode/year numbers, no minor-age, no sex term.
         let s2 = "陈壮壮 第13集 高清.mp4";
         assert!(matches_layer2(s2, &s2.to_lowercase()).is_none());

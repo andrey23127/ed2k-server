@@ -22,6 +22,182 @@ pub struct Config {
     pub storage: StorageConfig,
     #[serde(default)]
     pub admin: AdminConfig,
+    #[serde(default)]
+    pub updates: UpdatesConfig,
+}
+
+/// Update service for the filter data files.
+///
+/// The whole section is optional and disabled by default: a server that does not
+/// want to pull anything should not have to say so.
+#[derive(Debug, Deserialize, Clone)]
+pub struct UpdatesConfig {
+    /// Master switch. Off means the buttons in the admin UI report that updates
+    /// are disabled and nothing is ever fetched.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Where downloaded files are installed. This is the directory the running
+    /// server already reads its lists from, so an update lands where the mtime
+    /// watchers are looking.
+    #[serde(default = "default_dest_dir")]
+    pub dest_dir: String,
+
+    /// Ed25519 public key, 32 bytes as hex, that data files must be signed with.
+    ///
+    /// This is the single most important line in the section. It is what stops a
+    /// hijacked domain or a compromised update host from pushing an empty
+    /// vocabulary (silencing a layer everywhere) or a ban-list entry for a
+    /// popular legal release (banning its publishers everywhere, for thirty
+    /// days). Verified before anything is written.
+    #[serde(default)]
+    pub public_key: String,
+
+    /// Require a valid signature. Leaving this on is strongly recommended; it
+    /// exists as a switch only because third-party mirrors may not sign, and
+    /// turning it off should be a visible, deliberate line in the config rather
+    /// than a silent fallback in the code.
+    #[serde(default = "default_true")]
+    pub require_signature: bool,
+
+    /// The server whose exported peer table the update service loaded. Our
+    /// access key is derived against THIS address — it is the number this server
+    /// already sent that peer during the obfuscated handshake, so no
+    /// registration step is needed. Empty disables credentials.
+    #[serde(default)]
+    pub key_reference_ip: String,
+
+    /// Header the access key is sent in.
+    #[serde(default = "default_key_header")]
+    pub key_header: String,
+
+    /// Backup generations kept next to each file as `<name>.1` … `<name>.N`.
+    /// Three by default: a bad list is often noticed a day later, by which time
+    /// a single slot has already been overwritten by the next update.
+    #[serde(default = "default_backups")]
+    pub backups: u8,
+
+    /// Per-request timeout, seconds.
+    #[serde(default = "default_update_timeout")]
+    pub timeout_secs: u64,
+
+    /// Hard ceiling on a single download. The country database is the largest
+    /// of these at a few megabytes compressed.
+    #[serde(default = "default_max_bytes")]
+    pub max_bytes: u64,
+
+    /// Refuse a REPLACE whose entry count falls below this fraction of the file
+    /// it would overwrite. Catches the truncated download that parses cleanly
+    /// and is simply much shorter. 0 disables.
+    #[serde(default = "default_min_keep_ratio")]
+    pub min_keep_ratio: f64,
+
+    /// Where to POST the (IP, key) table of peers that completed gossip.
+    /// Empty disables the export.
+    #[serde(default)]
+    pub export_url: String,
+
+    /// Bearer token for the export endpoint.
+    #[serde(default)]
+    pub export_token: String,
+
+    /// How often to push the peer table, seconds.
+    #[serde(default = "default_export_interval")]
+    pub export_interval_secs: u64,
+
+    /// Per-file URLs. Two have compiled-in defaults because they carry no access
+    /// control; the rest are empty until an update service is running.
+    #[serde(default)]
+    pub urls: UpdateUrls,
+}
+
+/// URL per data file. Field names match `updates::Target::id()`.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct UpdateUrls {
+    #[serde(default)]
+    pub csam_jargon: String,
+    #[serde(default)]
+    pub csam_terms_extra: String,
+    #[serde(default)]
+    pub layer2_terms: String,
+    #[serde(default)]
+    pub guarding_p2p: String,
+    #[serde(default)]
+    pub ip_to_country: String,
+    #[serde(default)]
+    pub hash_banlist: String,
+    #[serde(default)]
+    pub hash_filter: String,
+    #[serde(default)]
+    pub whitelist_hashes: String,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dest_dir: default_dest_dir(),
+            public_key: String::new(),
+            require_signature: true,
+            key_reference_ip: String::new(),
+            key_header: default_key_header(),
+            backups: default_backups(),
+            timeout_secs: default_update_timeout(),
+            max_bytes: default_max_bytes(),
+            min_keep_ratio: default_min_keep_ratio(),
+            export_url: String::new(),
+            export_token: String::new(),
+            export_interval_secs: default_export_interval(),
+            urls: UpdateUrls::default(),
+        }
+    }
+}
+
+fn default_dest_dir() -> String {
+    "/etc/ed2k-server".to_string()
+}
+fn default_key_header() -> String {
+    "X-Server-Key".to_string()
+}
+// `default_true` already exists above in this module — reused here rather than
+// redefined.
+fn default_backups() -> u8 {
+    3
+}
+fn default_update_timeout() -> u64 {
+    120
+}
+fn default_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_min_keep_ratio() -> f64 {
+    0.5
+}
+fn default_export_interval() -> u64 {
+    3600
+}
+
+impl UpdatesConfig {
+    /// URL for one target: the configured value, or the compiled-in default for
+    /// the two public files when config leaves it empty.
+    pub fn url_for(&self, t: crate::updates::Target) -> String {
+        use crate::updates::Target as T;
+        let configured = match t {
+            T::CsamJargon => &self.urls.csam_jargon,
+            T::CsamTermsExtra => &self.urls.csam_terms_extra,
+            T::Layer2Terms => &self.urls.layer2_terms,
+            T::GuardingP2p => &self.urls.guarding_p2p,
+            T::IpToCountry => &self.urls.ip_to_country,
+            T::HashBanlist => &self.urls.hash_banlist,
+            T::HashFilter => &self.urls.hash_filter,
+            T::WhitelistHashes => &self.urls.whitelist_hashes,
+        };
+        if configured.trim().is_empty() {
+            t.default_url().to_string()
+        } else {
+            configured.trim().to_string()
+        }
+    }
 }
 
 /// Localhost-only admin web UI. Disabled by default for safety.
@@ -130,6 +306,28 @@ pub struct NetworkConfig {
     /// Enable/accept obfuscated connections from clients
     #[serde(default = "default_true")]
     pub support_crypt: bool,
+
+    /// Give clients that reach the server from a PRIVATE address a chance at
+    /// HighID, by probing `server.this_ip` on their port instead.
+    ///
+    /// For the topology where an operator runs a client on the same network as
+    /// the server: the client reaches it through the router's hairpin NAT, the
+    /// login socket therefore carries an RFC1918 address, and the server assigns
+    /// LowID without probing anything. In that topology the client's real
+    /// public address is by definition the server's own.
+    ///
+    /// ⚠ OFF BY DEFAULT, AND THE DEFAULT IS THE CAUTIOUS ONE. Two things can go
+    ///   wrong. A server in a datacentre may see private addresses from a
+    ///   management network that has nothing to do with its public address. And
+    ///   where the router source-NATs hairpin traffic, ALL local clients arrive
+    ///   from the same address and cannot be told apart, so a port-forward may
+    ///   lead to a different machine than the one that logged in.
+    ///
+    ///   The second risk is why this path uses the IDENTITY probe rather than
+    ///   the plain one: the peer must answer with the user hash that logged in.
+    ///   If that check is ever weakened, this option has to go with it.
+    #[serde(default)]
+    pub hairpin_lan_clients: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -366,6 +564,57 @@ ping_delay_seconds = 600
 hash_banlist = []
 hash_filter = []
 publisher_count_window_seconds = 86400
+
+[updates]
+# Update service for the filter data files. Off by default.
+#
+# WITHOUT csam_jargon.txt, csam_terms_extra.txt, layer2_terms.txt,
+# hash_banlist.txt and hash_filter.txt the content filter has almost nothing to
+# work with, and those lists cannot be published in a public repository. This
+# section is how a server gets them.
+enabled = false
+
+# Where files are installed. Must be the directory the paths above point into,
+# or an update will land somewhere nothing is watching.
+dest_dir = "/etc/ed2k-server"
+
+# Ed25519 public key (32 bytes, hex) that data files must be signed with.
+#
+# Read this before leaving it empty. A hijacked domain or a compromised update
+# host can push an EMPTY vocabulary — every layer that uses it silently matches
+# nothing, on every server that pulled — or one hash of a popular legal release
+# into the ban list, which bans its publishers for thirty days everywhere at
+# once. The signature is checked before anything is written; it is the only
+# defence that does not depend on who controls the domain.
+public_key = ""
+require_signature = true
+
+# Credential for the access-controlled files. The key is DERIVED, not stored:
+# it is IPObfuscate(our seckey, this address) — the same number this server
+# already sends that peer during the obfuscated server-to-server handshake, so
+# the update service can be given the table without any registration step.
+# Set this to the server whose exported peer table the service loaded.
+key_reference_ip = ""
+
+backups = 3
+min_keep_ratio = 0.5
+
+# Peer table export: (IP, key) of servers that completed gossip with us.
+export_url = ""
+export_token = ""
+export_interval_secs = 3600
+
+[updates.urls]
+# The two public files have compiled-in defaults and need no credentials.
+guarding_p2p = "https://ed2k.emule-security.org/pub/guarding.p2p"
+ip_to_country = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# The rest identify material and are fetched with the access key above.
+csam_jargon = ""
+csam_terms_extra = ""
+layer2_terms = ""
+hash_banlist = ""
+hash_filter = ""
+whitelist_hashes = ""
 "#;
         toml::from_str(toml_str).expect("minimal_test_config TOML must parse")
     }
@@ -423,6 +672,57 @@ ping_delay_seconds = 1
 hash_banlist = []
 hash_filter = []
 publisher_count_window_seconds = 86400
+
+[updates]
+# Update service for the filter data files. Off by default.
+#
+# WITHOUT csam_jargon.txt, csam_terms_extra.txt, layer2_terms.txt,
+# hash_banlist.txt and hash_filter.txt the content filter has almost nothing to
+# work with, and those lists cannot be published in a public repository. This
+# section is how a server gets them.
+enabled = false
+
+# Where files are installed. Must be the directory the paths above point into,
+# or an update will land somewhere nothing is watching.
+dest_dir = "/etc/ed2k-server"
+
+# Ed25519 public key (32 bytes, hex) that data files must be signed with.
+#
+# Read this before leaving it empty. A hijacked domain or a compromised update
+# host can push an EMPTY vocabulary — every layer that uses it silently matches
+# nothing, on every server that pulled — or one hash of a popular legal release
+# into the ban list, which bans its publishers for thirty days everywhere at
+# once. The signature is checked before anything is written; it is the only
+# defence that does not depend on who controls the domain.
+public_key = ""
+require_signature = true
+
+# Credential for the access-controlled files. The key is DERIVED, not stored:
+# it is IPObfuscate(our seckey, this address) — the same number this server
+# already sends that peer during the obfuscated server-to-server handshake, so
+# the update service can be given the table without any registration step.
+# Set this to the server whose exported peer table the service loaded.
+key_reference_ip = ""
+
+backups = 3
+min_keep_ratio = 0.5
+
+# Peer table export: (IP, key) of servers that completed gossip with us.
+export_url = ""
+export_token = ""
+export_interval_secs = 3600
+
+[updates.urls]
+# The two public files have compiled-in defaults and need no credentials.
+guarding_p2p = "https://ed2k.emule-security.org/pub/guarding.p2p"
+ip_to_country = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# The rest identify material and are fetched with the access key above.
+csam_jargon = ""
+csam_terms_extra = ""
+layer2_terms = ""
+hash_banlist = ""
+hash_filter = ""
+whitelist_hashes = ""
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("stale key must not break parsing");
         assert_eq!(cfg.network.udp_port(), 6266, "must derive, not use the stale 9999");

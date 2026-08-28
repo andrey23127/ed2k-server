@@ -1239,8 +1239,111 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     *state_reload.ip_filter.write().await = new_filter;
                     info!(ranges, path = &cfg_reload.storage.ipfilter_path, "IP filter reloaded");
                 }
+
+                // Hot-reload the country database.
+                //
+                // This was the ONE data file that loaded at startup and never
+                // again — every other list was already reachable from this
+                // handler. It did not matter while the file was updated by hand
+                // during a maintenance window; with an update button in the UI
+                // it does, because the operator would see "installed" and the
+                // process would keep serving country stats from the old table
+                // until the next restart.
+                //
+                // A failed load returns an empty database, which would silently
+                // wipe the stats, so the swap only happens when the new table
+                // actually has ranges.
+                if !cfg_reload.storage.country_db_path.is_empty() {
+                    use ed2k_server::filter::geoip::CountryDb;
+                    let path = std::path::Path::new(&cfg_reload.storage.country_db_path);
+                    let new_db = CountryDb::load(path);
+                    let ranges = new_db.range_count();
+                    if ranges > 0 {
+                        *state_reload.country_db.write().await = new_db;
+                        info!(ranges, path = &cfg_reload.storage.country_db_path,
+                              "GeoIP database reloaded");
+                    } else {
+                        warn!(path = &cfg_reload.storage.country_db_path,
+                              "GeoIP reload produced no ranges; keeping current table");
+                    }
+                }
             }
         });
+    }
+
+    // ─── Peer table export for the update service ───────────────────────────
+    //
+    // Periodically hands the update service the (IP, key) pairs of servers that
+    // completed the obfuscated server-to-server handshake with us. Those peers
+    // can then authenticate to it with a credential they ALREADY hold: the key
+    // in this table is the number each of them derived from its own seckey and
+    // OUR address, and sent us during that handshake. No registration step, no
+    // new secret, nothing for the operator to copy.
+    //
+    // ⚠ WHAT THIS TABLE PROVES, AND WHAT IT DOES NOT. An entry means "this
+    //   address runs eD2k server software and talked to us". That is all. The
+    //   software is public and the handshake is automatic, so an entry appears
+    //   without anybody deciding anything — including for a server somebody
+    //   stood up an hour ago for the purpose. Treat the export as a list of
+    //   CANDIDATES and keep an approval step on the service side; the ban list
+    //   in particular is a working catalogue of material and must not be handed
+    //   out to whoever can rent a VPS.
+    {
+        let ucfg = cfg.updates.clone();
+        if ucfg.enabled && !ucfg.export_url.trim().is_empty() {
+            let state_exp = Arc::clone(&state);
+            let this_ip = cfg.server.this_ip.clone();
+            let interval = std::time::Duration::from_secs(ucfg.export_interval_secs.max(60));
+            tokio::spawn(async move {
+                // A short delay first: at startup no peer has completed a
+                // handshake yet, and pushing an empty table would look to the
+                // service like every peer had gone away.
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                loop {
+                    let pairs: Vec<ed2k_server::updates::PeerPair> = state_exp
+                        .seed_server_keys
+                        .iter()
+                        .map(|e| ed2k_server::updates::PeerPair {
+                            ip: e.key().to_string(),
+                            key: format!("{:08x}", *e.value()),
+                            verified_plain: state_exp.verified_servers.contains_key(e.key()),
+                        })
+                        .collect();
+
+                    if pairs.is_empty() {
+                        // Never push an empty table: the service cannot tell
+                        // "we know nobody" from "our gossip is broken", and the
+                        // safe reading of an empty push is to revoke everyone.
+                        tokio::time::sleep(interval).await;
+                        continue;
+                    }
+
+                    let export = ed2k_server::updates::PeerExport {
+                        reference_ip: this_ip.clone(),
+                        generated_at: chrono::Utc::now().to_rfc3339(),
+                        pairs,
+                    };
+                    let url = ucfg.export_url.clone();
+                    let token = ucfg.export_token.clone();
+                    let timeout = std::time::Duration::from_secs(ucfg.timeout_secs);
+                    let res = tokio::task::spawn_blocking(move || {
+                        ed2k_server::updates::push_peer_export(&url, &token, &export, timeout)
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(n)) => info!(pairs = n, "peer table exported to update service"),
+                        Ok(Err(e)) => warn!(error = %e, "peer table export failed"),
+                        Err(e) => warn!(error = %e, "peer table export task failed"),
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+            });
+            info!(
+                url = %cfg.updates.export_url,
+                every_secs = ucfg.export_interval_secs,
+                "peer table export enabled"
+            );
+        }
     }
 
     // Server-to-server gossip using the main UDP socket (TCP+4).

@@ -6,4 +6,5 @@ pub mod health;
 pub mod proto;
 pub mod server;
 pub mod state;
+pub mod updates;
 pub mod web;

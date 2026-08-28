@@ -1,6 +1,6 @@
 [package]
 name = "ed2k-server"
-version = "0.9.74"
+version = "0.9.75"
 edition = "2021"
 description = "Modern eDonkey2000 / eMule index server (test/MVP build)"
 license = "MIT"
@@ -53,6 +53,21 @@ toml = "=0.7.8"
 
 # Time
 chrono = { version = "=0.4.38", features = ["serde"] }
+
+# ── Update client ────────────────────────────────────────────────────────────
+# HTTP client for the filter data update service. `ureq` rather than `reqwest`:
+# it is blocking (these fetches run in spawn_blocking anyway, so an async client
+# buys nothing) and it pulls roughly a tenth of the dependency tree. Pinned like
+# everything else, and to a version whose MSRV is below the 1.75 this crate
+# targets.
+ureq = { version = "=2.9.7", default-features = false, features = ["tls", "json"] }
+
+# Signature verification for downloaded data files. The public key is compiled
+# in; see src/updates.rs for why the signature matters more than the transport.
+ed25519-dalek = "=2.1.1"
+
+# NOTE: no zip crate. The one archive we consume is unpacked by a ~60-line
+# reader in src/updates.rs on top of `flate2`, which is already in the tree.
 
 # CLI args
 clap = { version = "=4.4.18", features = ["derive"] }

@@ -784,6 +784,48 @@ impl ServerState {
         rx
     }
 
+    /// Is this address usable as a source by anybody outside our own network?
+    ///
+    /// A source list is handed to peers across the internet, so an address that
+    /// only means something on one LAN is worse than no address at all: every
+    /// peer that receives it spends a connection attempt and a timeout on it,
+    /// and then passes it on when it exchanges sources with others. One
+    /// misconfigured client seeds junk into the whole swarm.
+    ///
+    /// ⚠ USED ON EMISSION, NOT ON PUBLICATION, and the difference is not a
+    ///   detail. Refusing to record the source at all looks tidier, but a record
+    ///   with no live source is skipped by search on purpose — nothing can be
+    ///   downloaded from it — so dropping the address would delete the client's
+    ///   files from the index instead of merely hiding a useless address. Two
+    ///   integration tests caught exactly that.
+    ///
+    /// The source is therefore kept, and it stays useful: while the client is
+    /// connected, both emission points already replace a firewalled client's
+    /// address with its server-assigned low id, and the peer reaches it by
+    /// callback, which needs no routable address at all. This check covers the
+    /// remaining case — a STALE source whose client has gone, where the stored
+    /// address is emitted verbatim.
+    ///
+    /// The server-list path has filtered these since the mldonkey work
+    /// (`server/udp.rs`); the source path never did.
+    pub fn is_publishable_source_ip(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                !v4.is_private()
+                    && !v4.is_loopback()
+                    && !v4.is_link_local()
+                    && !v4.is_unspecified()
+                    && !v4.is_broadcast()
+                    && !v4.is_multicast()
+                    // 100.64.0.0/10, carrier-grade NAT. Not routable on the
+                    // public internet either, and a client behind it is exactly
+                    // as unreachable as one behind RFC1918.
+                    && !(v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+            }
+            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
+        }
+    }
+
     pub fn add_file_with_source(
         &self,
         hash: FileHash,
@@ -792,6 +834,7 @@ impl ServerState {
         source: (UserHash, IpAddr, u16, bool),
     ) {
         let publisher_hash = source.0;
+
         let src = Source::new(source.0, source.1, source.2, source.3);
         // Intern the name once: identical names across files share this Arc.
         let name_arc = self.name_interner.intern(&name);
@@ -1568,4 +1611,65 @@ mod user_files_index_tests {
         // Removing a user that never published anything must not panic.
         s.remove_sources_of(&uhash(99));
     }
+    #[test]
+    fn private_addresses_are_never_published_as_sources() {
+        // A source list crosses the internet. An address that only means
+        // something on one LAN costs every peer a connection attempt and then
+        // spreads further through source exchange.
+        let bad = [
+            Ipv4Addr::new(192, 168, 30, 254), // the reported hairpin case
+            Ipv4Addr::new(10, 1, 2, 3),
+            Ipv4Addr::new(172, 23, 20, 152),
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+            Ipv4Addr::new(100, 100, 0, 1), // carrier-grade NAT
+        ];
+        for ip in bad {
+            assert!(
+                !ServerState::is_publishable_source_ip(IpAddr::V4(ip)),
+                "{ip} must not be published"
+            );
+        }
+        for ip in [Ipv4Addr::new(85, 17, 116, 222), Ipv4Addr::new(1, 2, 3, 4)] {
+            assert!(ServerState::is_publishable_source_ip(IpAddr::V4(ip)), "{ip}");
+        }
+        // 100.64.0.0/10 only — the rest of 100/8 is ordinary public space.
+        assert!(ServerState::is_publishable_source_ip(IpAddr::V4(
+            Ipv4Addr::new(100, 5, 0, 1)
+        )));
+        assert!(ServerState::is_publishable_source_ip(IpAddr::V4(
+            Ipv4Addr::new(100, 200, 0, 1)
+        )));
+    }
+
+    #[test]
+    fn a_file_from_a_private_address_stays_indexed_with_its_source() {
+        // The source is RECORDED even though the address is unroutable. A record
+        // with no live source is skipped by search — clients cannot download
+        // from it — so dropping the address here would remove the file from the
+        // index entirely, which is not the same problem as leaking an address.
+        let state = build_state();
+        let hash = fhash(9);
+        state.add_file_with_source(
+            hash,
+            1234,
+            "ubuntu server iso".to_string(),
+            (
+                uhash(1),
+                IpAddr::V4(Ipv4Addr::new(192, 168, 30, 254)),
+                4662,
+                true,
+            ),
+        );
+        let rec = state.file_slab.get_by_hash(&hash).expect("file registered");
+        assert_eq!(rec.sources.len(), 1, "source must be kept for searchability");
+        assert!(
+            !state
+                .keyword_index
+                .find_intersection(&["ubuntu".to_string()])
+                .is_empty(),
+            "file must be findable"
+        );
+    }
+
 }

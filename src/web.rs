@@ -213,6 +213,8 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/publishers", get(api_publishers))
             .route("/api/health", get(api_health))
             .route("/api/review", get(api_review))
+            .route("/api/updates", get(api_updates_status))
+            .route("/api/update", post(api_update_run))
             .with_state(state);
 
         let bind = format!("127.0.0.1:{port}");
@@ -427,6 +429,176 @@ async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
         })
         .collect();
     Json(rows)
+}
+
+/// What the Updates panel needs to draw itself: per-file URL, whether it can be
+/// merged, and what is on disk right now.
+async fn api_updates_status(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use crate::updates::Target;
+    let u = &s.config.updates;
+
+    let mut files = Vec::new();
+    for t in Target::ALL {
+        let url = u.url_for(t);
+        let path = std::path::Path::new(&u.dest_dir).join(t.filename());
+        let meta = std::fs::metadata(&path).ok();
+        files.push(serde_json::json!({
+            "id": t.id(),
+            "label": t.label(),
+            "filename": t.filename(),
+            "path": path.display().to_string(),
+            "url": url,
+            "configured": !url.is_empty(),
+            "supports_merge": t.supports_merge(),
+            "needs_credentials": t.needs_credentials(),
+            "exists": meta.is_some(),
+            "size_bytes": meta.as_ref().map(|m| m.len()),
+        }));
+    }
+
+    // The access key is derived, not stored, so it can be shown: it is the same
+    // number this server already hands the reference peer during the obfuscated
+    // handshake. Seeing it is what makes a 403 diagnosable from this page.
+    let key = access_key_hex(&s);
+
+    Json(serde_json::json!({
+        "enabled": u.enabled,
+        "dest_dir": u.dest_dir,
+        "require_signature": u.require_signature,
+        "has_public_key": !u.public_key.trim().is_empty(),
+        "key_reference_ip": u.key_reference_ip,
+        "access_key": key,
+        "backups": u.backups,
+        "min_keep_ratio": u.min_keep_ratio,
+        "export_url": u.export_url,
+        "export_interval_secs": u.export_interval_secs,
+        "files": files,
+    }))
+}
+
+/// Derive the credential this server presents to the update service.
+///
+/// Returns `None` when no reference IP is configured — the key is meaningless
+/// without one, since it is derived against that address.
+fn access_key_hex(s: &WebState) -> Option<String> {
+    let ip: std::net::Ipv4Addr = s.config.updates.key_reference_ip.trim().parse().ok()?;
+    let raw = hex::decode(&s.seckey_hex).ok()?;
+    if raw.len() != 16 {
+        return None;
+    }
+    let mut seckey = [0u8; 16];
+    seckey.copy_from_slice(&raw);
+    Some(format!(
+        "{:08x}",
+        crate::updates::derive_access_key(&seckey, ip)
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateReq {
+    target: String,
+    /// "replace" or "merge"; absent means replace.
+    #[serde(default)]
+    mode: String,
+}
+
+/// Run one update, then trip the existing reload flag.
+///
+/// The reload is the part that makes this useful: the same flag the SIGHUP
+/// handler and /api/reload set is picked up by the watcher in main.rs within two
+/// seconds, and it re-reads EVERY list — blocklist, poison list, whitelist, both
+/// term files, the vocabulary, the IP filter and the country database. So a file
+/// installed here is in force before the operator can click the next button. The
+/// per-file mtime watchers would also catch it, but on a 30 s poll.
+async fn api_update_run(
+    State(s): State<WebState>,
+    Json(req): Json<UpdateReq>,
+) -> impl IntoResponse {
+    use crate::updates::{self, Mode, Target};
+
+    let u = s.config.updates.clone();
+    if !u.enabled {
+        return Json(serde_json::json!({
+            "ok": false,
+            "message": "updates are disabled — set updates.enabled = true"
+        }));
+    }
+
+    let Some(target) = Target::ALL.into_iter().find(|t| t.id() == req.target) else {
+        return Json(serde_json::json!({
+            "ok": false,
+            "message": format!("unknown target {:?}", req.target)
+        }));
+    };
+    let mode = if req.mode == "merge" { Mode::Merge } else { Mode::Replace };
+
+    let credential = if target.needs_credentials() {
+        match access_key_hex(&s) {
+            Some(k) => Some((u.key_header.clone(), k)),
+            None => {
+                return Json(serde_json::json!({
+                    "ok": false,
+                    "message": "this file needs credentials but updates.key_reference_ip is unset                                 or the seckey is unreadable"
+                }));
+            }
+        }
+    } else {
+        None
+    };
+
+    let request = updates::UpdateRequest {
+        target,
+        mode,
+        url: u.url_for(target),
+        dest_dir: u.dest_dir.clone(),
+        public_key_hex: u.public_key.clone(),
+        require_signature: u.require_signature,
+        credential,
+        backups: u.backups,
+        timeout: std::time::Duration::from_secs(u.timeout_secs),
+        max_bytes: u.max_bytes,
+        min_keep_ratio: u.min_keep_ratio,
+    };
+
+    // Blocking HTTP and blocking file IO — off the runtime, or a large download
+    // stalls every client on this worker.
+    let outcome = tokio::task::spawn_blocking(move || updates::run(&request)).await;
+
+    match outcome {
+        Ok(Ok(report)) => {
+            tracing::info!(
+                target = %report.target,
+                entries = report.entries_after.unwrap_or(0),
+                signed = report.signature_verified,
+                "data file updated — requesting live reload"
+            );
+            s.reload_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Json(serde_json::json!({
+                "ok": true,
+                "message": report.message,
+                "downloaded": report.downloaded,
+                "entries_before": report.entries_before,
+                "entries_after": report.entries_after,
+                "signature_verified": report.signature_verified,
+                "path": report.path,
+            }))
+        }
+        Ok(Err(e)) => {
+            // Every failure path leaves the file on disk untouched, which is
+            // worth saying in the message: the operator needs to know the server
+            // is still filtering with the old list, not with nothing.
+            tracing::warn!(target = %req.target, error = %e, "data file update refused");
+            Json(serde_json::json!({
+                "ok": false,
+                "message": format!("{e} (existing file left in place)")
+            }))
+        }
+        Err(e) => Json(serde_json::json!({
+            "ok": false,
+            "message": format!("update task panicked: {e}")
+        })),
+    }
 }
 
 async fn api_reload(State(s): State<WebState>) -> impl IntoResponse {
@@ -1164,7 +1336,7 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
         // The loader merges every blocklist into one set, so the count is
         // reported once (on the first file) rather than duplicated per file.
         let n = if i == 0 { Some(blocklist_total) } else { None };
-        push_file("hash blocklist (L3)", p, n, &mut files);
+        push_file("hash banlist (L3)", p, n, &mut files);
     }
     let filter_total = s.server.filter.hash_filter_size() as u64;
     for (i, p) in cf.hash_filter.iter().enumerate() {
@@ -1647,6 +1819,21 @@ tr:hover td{background:#1e2035}
     <div id="health-files"></div>
   </div>
   <div class="section">
+    <h3>Data file updates</h3>
+    <div style="opacity:.7;font-size:12px;margin-bottom:8px" id="updates-meta"></div>
+    <div id="updates-files"></div>
+    <div id="updates-result" style="margin-top:10px;font-size:13px"></div>
+    <div style="opacity:.6;font-size:11px;margin-top:10px;line-height:1.5">
+      Every download is checked for a valid signature, parsed with the same code that loads it at
+      runtime, and refused if it would collapse the list. Nothing is written unless all of that
+      passes &mdash; a failed update leaves the current file in place. The previous versions are kept
+      alongside as <code>.1</code>&hellip;<code>.N</code>.
+      <br>
+      <b>Update &amp; rewrite</b> replaces the file. <b>Update &amp; merge</b> unions it with the file
+      on disk, comparing hashes only and keeping whichever side carries the comment.
+    </div>
+  </div>
+  <div class="section">
     <h3>Recent warnings &amp; errors</h3>
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
       <span style="opacity:.7;font-size:12px" id="health-log-meta"></span>
@@ -1931,7 +2118,7 @@ async function refreshBlocks() {
           'csam':                    { label: 'CSAM filter (total)',       desc: 'unique blocked files (sum of all layers). "Unique IPs" = distinct publishers' },
           'csam_L1_jargon':          { label: '  └ Layer 1 — jargon',      desc: 'sealed CSAM-marker term list (long substrings)' },
           'csam_L2_age':             { label: '  └ Layer 2 — age + sex',   desc: 'filename contains both a minor-age token AND a sexual-context term' },
-          'csam_L3_hash':            { label: '  └ Layer 3 — hash list',   desc: 'MD4 file hash matches operator-loaded CSAM hash blocklist' },
+          'csam_L3_hash':            { label: '  └ Layer 3 — hash list',   desc: 'MD4 file hash matches the operator-loaded hash banlist' },
           'csam_L4_extra':           { label: '  └ Layer 4 — operator',    desc: 'custom term list from [content_filter].extra_terms_file' },
           'bot':                     { label: 'Bot detection (flagged)',   desc: 'detection events (cooldown 30s/IP)' },
           'bot_ban':                 { label: '  └ Bots banned (24h)',     desc: 'distinct flood-bot IPs auto-banned; UDP dropped for 24h' },
@@ -1946,10 +2133,81 @@ async function refreshBlocks() {
     + '</tbody></table>';
 }
 
+let updatesBusy = false;
+
+async function refreshUpdates() {
+  let u;
+  try { u = await fetch('/api/updates').then(r=>r.json()); } catch { return; }
+
+  let meta = u.enabled
+    ? 'Installing into <code>' + u.dest_dir + '</code>. Backups kept: ' + u.backups + '.'
+    : '<b>Updates are disabled.</b> Set <code>updates.enabled = true</code> in the config.';
+  if (u.enabled && !u.has_public_key && u.require_signature)
+    meta += ' <span style="color:#e57373">No public key configured &mdash; signed files cannot be verified and every update will be refused.</span>';
+  if (u.enabled && !u.require_signature)
+    meta += ' <span style="color:#e5a23c">Signature checking is OFF.</span>';
+  if (u.enabled && u.access_key)
+    meta += '<br>Access key <code>' + u.access_key + '</code>, derived against ' + u.key_reference_ip + '.';
+  else if (u.enabled)
+    meta += '<br><span style="opacity:.8">No <code>updates.key_reference_ip</code> &mdash; access-controlled files cannot be fetched.</span>';
+  document.getElementById('updates-meta').innerHTML = meta;
+
+  const rows = u.files.map(function(f) {
+    const size = f.exists ? (f.size_bytes/1024).toFixed(0) + ' KB' : '<span style="opacity:.5">absent</span>';
+    let buttons;
+    if (!u.enabled) {
+      buttons = '<span style="opacity:.5">disabled</span>';
+    } else if (!f.configured) {
+      buttons = '<span style="opacity:.5">no URL configured</span>';
+    } else if (f.supports_merge) {
+      buttons =
+        '<button onclick="runUpdate(&quot;' + f.id + '&quot;,&quot;replace&quot;)">Update &amp; rewrite</button> ' +
+        '<button onclick="runUpdate(&quot;' + f.id + '&quot;,&quot;merge&quot;)">Update &amp; merge</button>';
+    } else {
+      buttons = '<button onclick="runUpdate(&quot;' + f.id + '&quot;,&quot;replace&quot;)">Update</button>';
+    }
+    return '<tr><td>' + healthDot(f.exists) + '</td><td>' + f.label +
+           '</td><td><code style="font-size:11px">' + f.filename + '</code></td><td>' + size +
+           '</td><td>' + (f.needs_credentials ? 'key' : '<span style="opacity:.6">public</span>') +
+           '</td><td>' + buttons + '</td></tr>';
+  }).join('');
+  document.getElementById('updates-files').innerHTML =
+    '<table><tr><th></th><th>List</th><th>File</th><th>On disk</th><th>Access</th><th></th></tr>' +
+    rows + '</table>';
+}
+
+async function runUpdate(id, mode) {
+  if (updatesBusy) return;
+  updatesBusy = true;
+  const out = document.getElementById('updates-result');
+  out.innerHTML = '<span style="opacity:.7">' + id + ': downloading&hellip;</span>';
+  try {
+    const r = await fetch('/api/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({target: id, mode: mode})
+    }).then(x=>x.json());
+    if (r.ok) {
+      out.innerHTML = '<span style="color:#7fbf7f">' + id + ': ' + r.message +
+        (r.signature_verified ? ' &middot; signature verified' : ' &middot; <b>unsigned</b>') +
+        '</span><div style="opacity:.6;font-size:11px">' + r.path +
+        ' &middot; reload requested, live within ~2s</div>';
+    } else {
+      out.innerHTML = '<span style="color:#e57373">' + id + ': ' + r.message + '</span>';
+    }
+  } catch (e) {
+    out.innerHTML = '<span style="color:#e57373">' + id + ': request failed &mdash; ' + e + '</span>';
+  }
+  updatesBusy = false;
+  refreshUpdates();
+  refreshHealth();
+}
+
 function healthDot(ok) {
   return '<span style="color:' + (ok ? '#4ade80' : '#f87171') + '">' + (ok ? '●' : '●') + '</span>';
 }
 async function refreshHealth() {
+  refreshUpdates();
   let h;
   try { h = await fetch('/api/health').then(r=>r.json()); } catch { return; }
 

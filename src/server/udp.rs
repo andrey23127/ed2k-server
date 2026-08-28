@@ -863,11 +863,12 @@ impl UdpServer {
             .unwrap_or_default();
 
         // Build GLOBFOUNDSOURCES: E3 0x9B hash(16) count(1) sources…
-        let mut out = BytesMut::new();
-        out.put_u8(PROTO_EDONKEY);
-        out.put_u8(OP_GLOB_FOUNDSOURCES);
-        out.put_slice(hash);
-        out.put_u8(sources.len() as u8);
+        //
+        // Entries first, count afterwards: the loop can skip a source, and a
+        // count that promises more than the payload holds makes the client read
+        // past the end.
+        let mut entries = BytesMut::new();
+        let mut emitted: u8 = 0;
         for (user_hash, ip, port) in &sources {
             // Encode the source ID the way eD2k clients expect — identical to
             // the TCP path in server/get_sources.rs:
@@ -883,18 +884,38 @@ impl UdpServer {
             // looked like a HighID peer that nobody could ever reach.
             let id = match self.state.clients.get(user_hash) {
                 Some(handle) if !handle.is_high_id => handle.assigned_id,
-                _ => match ip {
-                    std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
-                    _ => 0,
-                },
+                _ => {
+                    // STALE SOURCE — the client has gone, so there is no low id
+                    // to substitute and the stored address goes out as it is. A
+                    // private one means nothing outside a single LAN and only
+                    // costs every recipient a connect attempt, so drop it.
+                    // Mirrors server/get_sources.rs; the two paths must agree or
+                    // the same client is anonymised on one channel and exposed
+                    // on the other.
+                    if !crate::state::ServerState::is_publishable_source_ip(*ip) {
+                        continue;
+                    }
+                    match ip {
+                        std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
+                        _ => 0,
+                    }
+                }
             };
-            out.put_u32_le(id);
-            out.put_u16_le(*port);
+            entries.put_u32_le(id);
+            entries.put_u16_le(*port);
+            emitted += 1;
         }
+
+        let mut out = BytesMut::new();
+        out.put_u8(PROTO_EDONKEY);
+        out.put_u8(OP_GLOB_FOUNDSOURCES);
+        out.put_slice(hash);
+        out.put_u8(emitted);
+        out.put_slice(&entries);
 
         self.reply(&out, peer, obf).await?;
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(ip = %peer.ip(), hash = hex::encode(hash), sources = sources.len(), "glob_getsources");
+            debug!(ip = %peer.ip(), hash = hex::encode(hash), sources = emitted, "glob_getsources");
         }
         Ok(())
     }

@@ -144,9 +144,12 @@ pub fn handle_get_sources(
         "getsources answered (rebuilt)"
     );
 
-    let mut payload = BytesMut::new();
-    payload.put_slice(&req.file_hash);
-    payload.put_u8(sources.len() as u8);
+    // The count byte has to match what actually gets written, and the loop below
+    // can skip a source, so the entries are built first and the real count is
+    // prefixed afterwards. Writing sources.len() and then emitting fewer would
+    // leave the client parsing past the end of the payload.
+    let mut entries = BytesMut::new();
+    let mut emitted: u8 = 0;
     for s in &sources {
         // Encode the source ID the way eD2k clients expect:
         //   * HighID source  -> its real IPv4 (client connects directly)
@@ -160,11 +163,30 @@ pub fn handle_get_sources(
         // same behavior as before this change.
         let id = match state.clients.get(&s.user_hash) {
             Some(handle) if !handle.is_high_id => handle.assigned_id,
-            _ => s.ipv4,
+            _ => {
+                // STALE SOURCE. The client is gone, so there is no low id to
+                // substitute and the stored address goes out verbatim. If that
+                // address is private it means nothing outside one LAN: every
+                // peer that receives it burns a connect attempt on it and then
+                // passes it on when it exchanges sources. Drop it instead.
+                //
+                // Only reachable for a departed client — a connected firewalled
+                // one takes the branch above and is reached by callback.
+                if !ServerState::is_publishable_source_ip(s.ip()) {
+                    continue;
+                }
+                s.ipv4
+            }
         };
-        payload.put_u32_le(id);
-        payload.put_u16_le(s.port());
+        entries.put_u32_le(id);
+        entries.put_u16_le(s.port());
+        emitted += 1;
     }
+
+    let mut payload = BytesMut::new();
+    payload.put_slice(&req.file_hash);
+    payload.put_u8(emitted);
+    payload.put_slice(&entries);
 
     let payload_vec = payload.to_vec();
     // Cache the built payload. Note: the requester-self filter above means
@@ -255,6 +277,26 @@ mod tests {
     // source is encoded as its real IPv4. Regression test for the bug where
     // every source (LowID included) was encoded as its real IP, making LowID
     // peers look like HighID and breaking LowID<->LowID NAT traversal.
+    #[test]
+    fn a_stale_private_source_is_not_emitted() {
+        // The address of a client that has gone. There is no low id left to
+        // substitute, so it would go out verbatim — and outside its own LAN it
+        // means nothing except a wasted connect attempt for every peer that
+        // receives it, and for every peer they hand it on to.
+        use std::net::{IpAddr, Ipv4Addr};
+        for ip in [
+            Ipv4Addr::new(192, 168, 30, 254),
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(172, 20, 1, 1),
+            Ipv4Addr::new(100, 90, 0, 1),
+        ] {
+            assert!(!ServerState::is_publishable_source_ip(IpAddr::V4(ip)), "{ip}");
+        }
+        assert!(ServerState::is_publishable_source_ip(IpAddr::V4(
+            Ipv4Addr::new(85, 17, 116, 222)
+        )));
+    }
+
     #[test]
     fn lowid_source_encoded_as_assigned_id() {
         use std::net::{IpAddr, Ipv4Addr};

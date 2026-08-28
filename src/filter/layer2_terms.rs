@@ -31,6 +31,19 @@ pub struct Layer2Terms {
     /// Fixed phrases that make a broad term innocent; checked before every
     /// layer, and a match here means Layer 2 does not fire at all.
     pub exceptions: Vec<String>,
+    /// Fixed phrases that exempt a name from the TERM layers (1 and 4).
+    ///
+    /// Layer 2 has had `exceptions` from the start, and the term layers had
+    /// nothing equivalent — the only remedy for a term false positive was the
+    /// hash whitelist, one hash at a time, per re-encode. That does not scale
+    /// for a title that keeps coming back: a TV episode whose name contains a
+    /// marker is republished endlessly, each time with a new hash.
+    ///
+    /// Matched against a SEPARATOR-NORMALISED copy of the name, so
+    /// "In.Plain.Sight.2x11.Jailbait.mp4" and "In Plain Sight 2x11 Jailbait.mp4"
+    /// are the same string to this list. Scene releases write titles with dots
+    /// and this list would otherwise miss every one of them.
+    pub term_exceptions: Vec<String>,
     /// CJK words naming a minor. Matched as plain substrings — that script has
     /// no word separators.
     pub minor_cjk: Vec<String>,
@@ -92,6 +105,10 @@ impl Default for Layer2Terms {
             "половое воспитан", "сексуальная революц", "секс-просвет", "сексолог",
             "сексопатолог",
             ]),
+            // Empty by default. A phrase belongs here only after it has been
+            // measured against a review window, and the operator file is where
+            // that reasoning gets written down.
+            term_exceptions: Vec::new(),
             minor_cjk: to_vec(&[
             "中学生", "中學生", "初中生", "小学生", "小學生", "未成年", "minor", "미성년", "중학생", "초등학생",
             ]),
@@ -136,6 +153,31 @@ impl Default for Layer2Terms {
     }
 }
 
+/// Collapse the separators scene releases use into single spaces, lowercased.
+///
+/// `.`, `_` and `-` become a space and runs of whitespace collapse, so one entry
+/// covers every way a title is written. Nothing else changes — accents and
+/// non-Latin script are left alone, because an entry may legitimately contain
+/// them.
+pub fn normalize_separators(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut pending_space = false;
+    for c in name.chars() {
+        if c == '.' || c == '_' || c == '-' || c.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        for lc in c.to_lowercase() {
+            out.push(lc);
+        }
+    }
+    out
+}
+
 fn to_vec(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
@@ -164,6 +206,7 @@ impl Layer2Terms {
             sex_prefix: Vec::new(),
             sex_bounded: Vec::new(),
             exceptions: Vec::new(),
+            term_exceptions: Vec::new(),
             minor_cjk: Vec::new(),
             minor_latin: Vec::new(),
             minor_ru: Vec::new(),
@@ -255,6 +298,7 @@ impl Layer2Terms {
         if !seen.contains("sex.prefix") { t.sex_prefix = d.sex_prefix; }
         if !seen.contains("sex.bounded") { t.sex_bounded = d.sex_bounded; }
         if !seen.contains("exceptions") { t.exceptions = d.exceptions; }
+        if !seen.contains("term.exceptions") { t.term_exceptions = d.term_exceptions; }
         if !seen.contains("minor.cjk") { t.minor_cjk = d.minor_cjk; }
         if !seen.contains("minor.latin") { t.minor_latin = d.minor_latin; }
         if !seen.contains("minor.ru") { t.minor_ru = d.minor_ru; }
@@ -270,6 +314,7 @@ impl Layer2Terms {
         matches!(
             name,
             "sex.substring" | "sex.prefix" | "sex.bounded" | "exceptions"
+                | "term.exceptions"
                 | "minor.cjk" | "minor.latin" | "minor.ru" | "sex.ru"
                 | "age.guard" | "zoo.animals" | "zoo.acts" | "zoo.guard"
                 | "limits"
@@ -282,6 +327,7 @@ impl Layer2Terms {
             "sex.prefix" => &mut self.sex_prefix,
             "sex.bounded" => &mut self.sex_bounded,
             "exceptions" => &mut self.exceptions,
+            "term.exceptions" => &mut self.term_exceptions,
             "minor.cjk" => &mut self.minor_cjk,
             "minor.latin" => &mut self.minor_latin,
             "minor.ru" => &mut self.minor_ru,
@@ -299,7 +345,8 @@ impl Layer2Terms {
     /// Total entries, for the startup log and the web panel.
     pub fn len(&self) -> usize {
         self.sex_substring.len() + self.sex_prefix.len() + self.sex_bounded.len()
-            + self.exceptions.len() + self.minor_cjk.len() + self.minor_latin.len()
+            + self.exceptions.len() + self.term_exceptions.len()
+            + self.minor_cjk.len() + self.minor_latin.len()
             + self.minor_ru.len() + self.sex_ru.len() + self.age_guard.len()
             + self.zoo_animals.len() + self.zoo_acts.len() + self.zoo_guard.len()
     }
