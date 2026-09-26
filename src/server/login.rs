@@ -2,9 +2,7 @@
 
 use crate::config::Config;
 use crate::proto::tags::read_tag_list;
-use crate::proto::{
-    opcodes::*, write_tag_list, Frame, Tag, TagName, TagValue,
-};
+use crate::proto::{opcodes::*, write_tag_list, Frame, Tag, TagName, TagValue};
 use crate::state::{ClientHandle, ServerState, UserHash};
 use anyhow::{anyhow, Result};
 use bytes::{BufMut, BytesMut};
@@ -24,7 +22,10 @@ pub struct LoginRequest {
 impl LoginRequest {
     pub fn parse(payload: &[u8]) -> Result<Self> {
         if payload.len() < 22 {
-            return Err(anyhow!("LOGINREQUEST payload too short ({})", payload.len()));
+            return Err(anyhow!(
+                "LOGINREQUEST payload too short ({})",
+                payload.len()
+            ));
         }
         let mut user_hash = [0u8; 16];
         user_hash.copy_from_slice(&payload[0..16]);
@@ -73,6 +74,28 @@ impl LoginRequest {
         })
     }
 
+    /// The client's own public IPv6, from `CT_MOD_IP_V6`.
+    ///
+    /// The tag is 16 raw bytes in network order — never text, never an integer,
+    /// never byte-swapped. Only a HASH-typed tag is accepted: taking any type
+    /// would let a client with a string there be read as v6-reachable, and the
+    /// presence of this tag is itself a capability signal.
+    pub fn client_ipv6(&self) -> Option<std::net::Ipv6Addr> {
+        self.tags.iter().find_map(|t| {
+            if t.name != TagName::Byte(CT_MOD_IP_V6) {
+                return None;
+            }
+            match &t.value {
+                TagValue::Blob(b) if b.len() == 16 => {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(b);
+                    Some(std::net::Ipv6Addr::from(a))
+                }
+                _ => None,
+            }
+        })
+    }
+
     pub fn server_flags(&self) -> u32 {
         self.tags
             .iter()
@@ -90,11 +113,7 @@ impl LoginRequest {
 /// Build the canonical post-login welcome batch (SPEC.md §3.1.2):
 /// IDCHANGE, SERVERSTATUS, SERVERMESSAGE, SERVERIDENT, plus optional
 /// extra welcome lines.
-pub fn build_welcome_batch(
-    cfg: &Config,
-    state: &ServerState,
-    client: &ClientHandle,
-) -> Vec<Frame> {
+pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHandle) -> Vec<Frame> {
     // Hot-reloadable view of the configuration. /api/config swaps `live_cfg`
     // atomically, so everything read through `live` below takes effect for the
     // NEXT client that logs in — no restart needed for the server name,
@@ -132,31 +151,46 @@ pub fn build_welcome_batch(
         let server_ip: u32 = if live.server.this_ip.is_empty() {
             0
         } else {
-            live.server.this_ip.parse::<std::net::Ipv4Addr>()
+            live.server
+                .this_ip
+                .parse::<std::net::Ipv4Addr>()
                 .map(|ip| u32::from_le_bytes(ip.octets()))
                 .unwrap_or(0)
         };
-        let tcp_flags: u32 = 0x0000_05DD;
+        //   0x4000 IPV6           — added only when the server actually speaks it
+        let mut tcp_flags: u32 = 0x0000_05DD;
+        if live.network.ipv6_publish_sources {
+            // ⚠ 0x4000 server→client. The client→server capability bit is
+            //   0x1000 in CT_SERVER_FLAGS — a different word in a different
+            //   packet. The asymmetry is deliberate in the published spec and is
+            //   the single easiest thing to get backwards here.
+            //
+            // Announced from `ipv6_publish_sources` rather than from
+            // `ipv6_enabled`: the bit tells a client it may receive inline IPv6
+            // sources, and a server that accepts IPv6 logins but publishes no v6
+            // sources would be claiming something it does not do.
+            tcp_flags |= SRV_TCPFLG_IPV6;
+        }
 
         let mut payload = BytesMut::with_capacity(20);
-        payload.put_u32_le(client.assigned_id);            // [0-3]   client_id
-        payload.put_u32_le(tcp_flags);                      // [4-7]   tcp_flags
-        // [8-11] AUX PORT — the server's "standard" TCP port.
-        //
-        // This is NOT a filler. eMule skips these bytes (it reads the reported IP
-        // straight from packet+12), but aMule reads them as the aux-port field and
-        // does `cur_server->SetPort(ConnPort)` — and CServer::realport is a uint16,
-        // so whatever we put here gets truncated to 16 bits and BECOMES the server's
-        // port in the client's list. We used to put client_id here, so every aMule
-        // session rewrote our port to `assigned_id & 0xFFFF`: client id 1968999842
-        // showed up as port 36258, the next session as 34750, and so on — the
-        // "phantom clones of our server on random ports" that only ever appeared in
-        // aMule. The field means "if the client logged in on an auxiliary port, here
-        // is the standard port to advertise", so send our real TCP port. aMule then
-        // sets the port to what it already is (no-op) and eMule is unaffected.
-        payload.put_u32_le(cfg.network.tcp_port as u32);   // [8-11]  aux/standard port
-        payload.put_u32_le(server_ip);                      // [12-15] server_reported_ip
-        payload.put_u32_le(cfg.network.tcp_port as u32);   // [16-19] obfuscation_tcp_port
+        payload.put_u32_le(client.assigned_id); // [0-3]   client_id
+        payload.put_u32_le(tcp_flags); // [4-7]   tcp_flags
+                                       // [8-11] AUX PORT — the server's "standard" TCP port.
+                                       //
+                                       // This is NOT a filler. eMule skips these bytes (it reads the reported IP
+                                       // straight from packet+12), but aMule reads them as the aux-port field and
+                                       // does `cur_server->SetPort(ConnPort)` — and CServer::realport is a uint16,
+                                       // so whatever we put here gets truncated to 16 bits and BECOMES the server's
+                                       // port in the client's list. We used to put client_id here, so every aMule
+                                       // session rewrote our port to `assigned_id & 0xFFFF`: client id 1968999842
+                                       // showed up as port 36258, the next session as 34750, and so on — the
+                                       // "phantom clones of our server on random ports" that only ever appeared in
+                                       // aMule. The field means "if the client logged in on an auxiliary port, here
+                                       // is the standard port to advertise", so send our real TCP port. aMule then
+                                       // sets the port to what it already is (no-op) and eMule is unaffected.
+        payload.put_u32_le(cfg.network.tcp_port as u32); // [8-11]  aux/standard port
+        payload.put_u32_le(server_ip); // [12-15] server_reported_ip
+        payload.put_u32_le(cfg.network.tcp_port as u32); // [16-19] obfuscation_tcp_port
         frames.push(Frame::new(OP_IDCHANGE, payload.to_vec()));
     }
     // 2. SERVERSTATUS — current users, files
@@ -186,45 +220,97 @@ pub fn build_welcome_batch(
         let mut payload = BytesMut::new();
         // Server hash (a stable random 16-byte ID; in production this lives
         // in config.toml; for MVP we use a fixed value.)
-        let server_hash: [u8; 16] = *b"\xDE\xAD\xBE\xEF\xCA\xFE\xBA\xBE\x12\x34\x56\x78\x9A\xBC\xDE\xF0";
+        let server_hash: [u8; 16] =
+            *b"\xDE\xAD\xBE\xEF\xCA\xFE\xBA\xBE\x12\x34\x56\x78\x9A\xBC\xDE\xF0";
         payload.put_slice(&server_hash);
 
         // Server IP: use configured this_ip if set, otherwise 0 (client uses TCP source)
         let server_ip: u32 = if live.server.this_ip.is_empty() {
             0
         } else {
-            live.server.this_ip.parse::<std::net::Ipv4Addr>()
+            live.server
+                .this_ip
+                .parse::<std::net::Ipv4Addr>()
                 .map(|ip| u32::from_le_bytes(ip.octets()))
                 .unwrap_or(0)
         };
         payload.put_u32_le(server_ip);
         payload.put_u16_le(cfg.network.tcp_port);
 
-        let tags = vec![
-            Tag::byte(ST_SERVERNAME,  TagValue::String(live.server.name.clone())),
+        let mut tags = vec![
+            Tag::byte(ST_SERVERNAME, TagValue::String(live.server.name.clone())),
             Tag::byte(ST_DESCRIPTION, TagValue::String(live.server.desc.clone())),
             // ST_VERSION as STRING "major.minor" — same format as our 0xA3 reply.
             // Some eMule builds don't display UINT32-encoded version in the server
             // list, so we use the explicit "17.15" string that eMule parses reliably.
-            Tag::byte(ST_VERSION, TagValue::String(
-                format!("{}.{}", live.server.version_major, live.server.version_minor)
-            )),
-            Tag::byte(ST_MAXUSERS,    TagValue::U32(live.limits.max_clients)),
-            Tag::byte(ST_SOFTFILES,   TagValue::U32(live.limits.soft_limit_files)),
-            Tag::byte(ST_HARDFILES,   TagValue::U32(live.limits.hard_limit_files)),
+            Tag::byte(
+                ST_VERSION,
+                TagValue::String(format!(
+                    "{}.{}",
+                    live.server.version_major, live.server.version_minor
+                )),
+            ),
+            Tag::byte(ST_MAXUSERS, TagValue::U32(live.limits.max_clients)),
+            Tag::byte(ST_SOFTFILES, TagValue::U32(live.limits.soft_limit_files)),
+            Tag::byte(ST_HARDFILES, TagValue::U32(live.limits.hard_limit_files)),
             // ST_UDPFLAGS — eMule's SupportsObfuscationTCP() requires either this OR
             // ST_TCPFLAGS to have bit 0x400 (SRV_UDPFLG_TCPOBFUSCATION) set.
             // From eMule's server.h: SupportsObfuscationTCP() =
             //   GetObfuscationPortTCP() != 0 && ((UDPFlags & 0x400) || (TCPFlags & 0x400))
             // Single source of truth, shared with GLOBSERVSTATRES — see the
             // per-bit table on SERVER_UDP_FLAGS.
-            Tag::byte(ST_UDPFLAGS,    TagValue::U32(SERVER_UDP_FLAGS)),
+            Tag::byte(ST_UDPFLAGS, TagValue::U32(SERVER_UDP_FLAGS)),
             // ST_TCPPORTOBFUSCATION / ST_UDPPORTOBFUSCATION — eMule casts to uint16,
             // but values are stored in tags as u32 (eMule code: m_nObfuscationPortTCP = (uint16)tag->GetInt()).
             // Non-zero TCP obf port is required for SupportsObfuscationTCP() to return true.
-            Tag::byte(ST_TCPPORTOBFUSCATION, TagValue::U32(cfg.network.tcp_port as u32)),
-            Tag::byte(ST_UDPPORTOBFUSCATION, TagValue::U32((cfg.network.tcp_port + 14) as u32)),
+            Tag::byte(
+                ST_TCPPORTOBFUSCATION,
+                TagValue::U32(cfg.network.tcp_port as u32),
+            ),
+            Tag::byte(
+                ST_UDPPORTOBFUSCATION,
+                TagValue::U32((cfg.network.tcp_port + 14) as u32),
+            ),
         ];
+
+        // ST_IPV6 — this server's own public IPv6, so a client that reached us
+        // over IPv4 learns there is a v6 address to come back on.
+        //
+        // Appended rather than placed in the list above, because it is
+        // conditional: a server with no IPv6 must send a byte-identical
+        // SERVERIDENT to the one it sent before this release. An unknown tag is
+        // skipped by every client, but an EMPTY or zero-filled one would be read
+        // as an address.
+        if live.network.ipv6_publish_sources {
+            if let Ok(a) = live.network.this_ip6.trim().parse::<std::net::Ipv6Addr>() {
+                if is_publishable_ipv6(a) {
+                    tags.push(Tag::byte(ST_IPV6, TagValue::Hash16(a.octets())));
+                }
+            }
+
+            // ST_IPV6_STATUS — our verdict on the client's own address.
+            //
+            // Worth sending because the client cannot work it out for itself. A
+            // session connected over IPv4 that advertised CT_MOD_IP_V6 has no
+            // other way to learn whether that address was accepted and whether
+            // it is now being published as a v6 source; without this it would
+            // have to guess, and a client that guesses "yes" wrongly stops
+            // advertising its LowID as well.
+            //
+            // Bits are only ever set to "yes". The tag is omitted entirely when
+            // there is no verdict, so a client that sees it can trust every bit
+            // — an unset bit means no, never unknown.
+            let mut status: u8 = 0;
+            if client.ipv6.is_some() {
+                status |= IPV6ST_HAVE | IPV6ST_REACHABLE;
+            }
+            // IPV6ST_PROBED stays unset: we accept the address on trust (from
+            // the socket, or from the login tag) and never dial it back. Setting
+            // it would claim a check we do not perform.
+            if status != 0 {
+                tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
+            }
+        }
         write_tag_list(&mut payload, &tags);
 
         frames.push(Frame::new(OP_SERVERIDENT, payload.to_vec()));
@@ -265,9 +351,56 @@ pub async fn assign_client_id(
 /// client it is the public address, because that is the one peers must be given
 /// as a source. Recording the private one would undo the whole fallback: the
 /// client would hold a HighID nobody could act on.
+/// `ST_IPV6` — the server's own public IPv6 in `OP_SERVERIDENT`, 16 raw bytes.
+///
+/// Same tag id and encoding a client uses for `CT_MOD_IP_V6`; the two directions
+/// share the number, unlike the capability bits.
+const ST_IPV6: u8 = 0xAE;
+
+/// `ST_IPV6_STATUS` — the server's verdict on the client's advertised IPv6.
+const ST_IPV6_STATUS: u8 = 0xAB;
+/// The server holds a public IPv6 for this session.
+const IPV6ST_HAVE: u8 = 0x01;
+/// That address is treated as reachable and the client is published as a v6
+/// source.
+const IPV6ST_REACHABLE: u8 = 0x02;
+
+/// `OP_IDCHANGE` / `OP_GLOBSERVSTATRES` flag bit: this server speaks the IPv6
+/// extension. See the warning at `SRVCAP_IPV6` about the direction asymmetry.
+pub use crate::proto::opcodes::SRVFLG_IPV6 as SRV_TCPFLG_IPV6;
+
+/// Is this IPv6 usable as a source address for other peers?
+///
+/// The same question `is_publishable_source_ip` answers for IPv4, and for the
+/// same reason: an address that only means something on one link costs every
+/// recipient a connection attempt and then spreads through source exchange.
+/// Link-local is the one that would actually happen — a client behind a router
+/// with no global prefix advertises `fe80::…` and it is useless to everyone.
+pub fn is_publishable_ipv6(a: std::net::Ipv6Addr) -> bool {
+    !a.is_loopback()
+        && !a.is_unspecified()
+        && !a.is_multicast()
+        // fe80::/10 link-local
+        && !(a.segments()[0] & 0xffc0 == 0xfe80)
+        // fc00::/7 unique local
+        && !(a.octets()[0] & 0xfe == 0xfc)
+        // ::ffff:0:0/96 — an IPv4 address in disguise, never a v6 source
+        && a.to_ipv4_mapped().is_none()
+}
+
+/// `CT_MOD_IP_V6` — the client's public IPv6, 16 raw bytes.
+///
+/// Value agreed with the two implementations that already speak this: eMuleQt
+/// (`docs/protocol/ipv6-spec.md` §1.3) and eNode-go. Do not renumber.
+const CT_MOD_IP_V6: u8 = 0xAE;
+
 /// CT_SERVER_FLAGS bit meaning "this client can speak obfuscated connections".
 /// eMule sets it whenever the crypt layer is enabled, which is the default.
-const SRVCAP_SUPPORTCRYPT: u32 = 0x0200;
+///
+/// Re-exported from the shared table rather than declared again: the private
+/// copy that used to live here was correct while `opcodes::CAPABLE_SUPPORTCRYPT`
+/// was not, and two constants for one wire bit is how that survives unnoticed.
+pub(crate) use crate::proto::opcodes::CAPABLE_SUPPORTCRYPT as SRVCAP_SUPPORTCRYPT;
 
 pub async fn assign_client_id_for(
     state: &ServerState,
@@ -285,8 +418,69 @@ pub async fn assign_client_id_for(
     let live = state.live_cfg.load();
     let probe_timeout = live.network.login_timeout_ms;
 
+    // An IPv6 session is LowID on v4 by construction: the id is an IPv4 address
+    // and this peer has none we know of. No probe, no HighID — its reachability
+    // is published through the inline v6 source record instead.
+    if peer_ip.is_ipv6() {
+        return (state.allocate_low_id(), false, peer_ip);
+    }
+
     if probe(peer_ip, client_port, probe_timeout).await {
+        // VERDICT, opt-in, remembered: a port that answered the hello with
+        // ANOTHER client's hash belongs to someone else behind the same NAT.
+        // Decided from a mark left by an earlier background check, so the
+        // login never waits; the check itself runs again in the background,
+        // which renews or clears the mark. See
+        // `network.highid_downgrade_on_wrong_hash`.
+        if live.network.highid_downgrade_on_wrong_hash {
+            if let Some(uh) = login_user_hash {
+                // Read the mark BEFORE starting the re-check, so this login is
+                // decided by what was known when it arrived.
+                let marked = state.highid_observe.is_marked(peer_ip, client_port, uh);
+                spawn_highid_check(
+                    state,
+                    &live,
+                    peer_ip,
+                    client_port,
+                    *uh,
+                    client_flags,
+                    probe_timeout,
+                    true,
+                );
+                if marked {
+                    state
+                        .highid_observe
+                        .downgraded
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug!(
+                        ip = %peer_ip, port = client_port,
+                        "highid: wrong-hash mark active → LowID"
+                    );
+                    return (state.allocate_low_id(), false, peer_ip);
+                }
+            }
+            let id = high_id_from_ip(peer_ip).unwrap_or_else(|| state.allocate_low_id());
+            return (id, true, peer_ip);
+        }
         let id = high_id_from_ip(peer_ip).unwrap_or_else(|| state.allocate_low_id());
+        // OBSERVE ONLY. The verdict above is already final and is returned
+        // unchanged on the next line; this merely counts what the stricter,
+        // Lugdunum-style check would have said. Detached, so the login does not
+        // wait for it. See `network.highid_verify_observe`.
+        if live.network.highid_verify_observe {
+            if let Some(uh) = login_user_hash {
+                spawn_highid_check(
+                    state,
+                    &live,
+                    peer_ip,
+                    client_port,
+                    *uh,
+                    client_flags,
+                    probe_timeout,
+                    false,
+                );
+            }
+        }
         return (id, true, peer_ip);
     }
 
@@ -322,8 +516,7 @@ pub async fn assign_client_id_for(
                 // Derived from the same seckey the obfuscated handshake uses,
                 // so it is stable across restarts. Computed only on this path,
                 // which a normal login never reaches.
-                let ours =
-                    server_pseudo_user_hash(&crate::server::udp::resolve_seckey(&live));
+                let ours = server_pseudo_user_hash(&crate::server::udp::resolve_seckey(&live));
 
                 // Obfuscate when the client said at login that it can, which is
                 // what Lugdunum does. A client configured to REQUIRE obfuscation
@@ -374,8 +567,7 @@ pub async fn assign_client_id_for(
                     .await;
                 }
 
-                match outcome
-                {
+                match outcome {
                     Ok(true) => {
                         info!(
                             lan_ip = %peer_ip, public_ip = %this_ip, port = client_port,
@@ -408,6 +600,251 @@ pub async fn assign_client_id_for(
     (state.allocate_low_id(), false, peer_ip)
 }
 
+/// The identity probe as the HighID check runs it: obfuscated first when the
+/// client advertised it, then once in the clear if the crypt handshake itself
+/// was refused. Returns the user hash that answered.
+///
+/// Shared by observe and verdict mode so the two cannot drift: the
+/// observe numbers are only worth something if they describe exactly what the
+/// verdict does. The hairpin code keeps its own copy on purpose (see
+/// `spawn_highid_observe`); if its fallback list ever changes, change this too.
+async fn highid_identity_answer(
+    ip: IpAddr,
+    port: u16,
+    user_hash: [u8; 16],
+    ident: HighIdProbeIdent,
+    timeout_ms: u64,
+    supports_crypt: bool,
+) -> Result<[u8; 16], &'static str> {
+    use crate::server::highid_probe::probe_identity_hash;
+    let HighIdProbeIdent {
+        ours,
+        our_id,
+        our_port,
+    } = ident;
+    let outcome = probe_identity_hash(
+        ip,
+        port,
+        &user_hash,
+        &ours,
+        our_id,
+        our_port,
+        timeout_ms,
+        supports_crypt,
+    )
+    .await;
+    if supports_crypt
+        && matches!(
+            outcome,
+            Err("obfuscated handshake failed")
+                | Err("peer closed during obfuscated handshake")
+                | Err("no crypt answer before timeout")
+        )
+    {
+        return probe_identity_hash(
+            ip, port, &user_hash, &ours, our_id, our_port, timeout_ms, false,
+        )
+        .await;
+    }
+    outcome
+}
+
+/// What the server presents of itself in the identity probe's OP_HELLO.
+#[derive(Clone, Copy)]
+struct HighIdProbeIdent {
+    ours: [u8; 16],
+    our_id: u32,
+    our_port: u16,
+}
+
+impl HighIdProbeIdent {
+    fn from_config(live: &Config) -> Self {
+        use crate::server::highid_probe::{high_id_from_ip, server_pseudo_user_hash};
+        Self {
+            // Never the peer's own hash — a client handed its own hash thinks
+            // it has connected to itself and closes without answering. Same
+            // identity the hairpin probe presents.
+            ours: server_pseudo_user_hash(&crate::server::udp::resolve_seckey(live)),
+            our_id: live
+                .server
+                .this_ip
+                .trim()
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .and_then(|v4| high_id_from_ip(IpAddr::V4(v4)))
+                .unwrap_or(0),
+            our_port: live.network.tcp_port,
+        }
+    }
+}
+
+/// What one identity probe found, as far as the HighID check cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HighIdCheck {
+    /// The client that logged in answered (type markers aside).
+    Same,
+    /// Another client answered: the port is forwarded to someone else.
+    Wrong,
+    /// No usable answer. Proves nothing either way.
+    NoAnswer,
+}
+
+/// Count one identity-probe outcome and classify it. `marking` says the caller
+/// acts on a wrong hash (sets a mark), so the mismatch record says which of
+/// the two modes produced it.
+fn record_highid_outcome(
+    obs: &crate::state::HighIdObserve,
+    ip: IpAddr,
+    port: u16,
+    user_hash: [u8; 16],
+    outcome: Result<[u8; 16], &'static str>,
+    marking: bool,
+) -> HighIdCheck {
+    use crate::server::highid_probe::same_client_hash;
+    use std::sync::atomic::Ordering::Relaxed;
+    match outcome {
+        Ok(answered) if same_client_hash(&answered, &user_hash) => {
+            obs.verified.fetch_add(1, Relaxed);
+            if answered != user_hash {
+                obs.verified_marker_variant.fetch_add(1, Relaxed);
+            }
+            HighIdCheck::Same
+        }
+        Ok(answered) => {
+            obs.mismatch.fetch_add(1, Relaxed);
+            // INFO, not debug: rare, and each one is worth a look — it is the
+            // only outcome that PROVES a HighID points peers at the wrong
+            // machine.
+            info!(
+                %ip, port,
+                login_hash = %hex::encode(user_hash),
+                answered_hash = %hex::encode(answered),
+                marked = marking,
+                "highid check: port answers with a DIFFERENT user hash"
+            );
+            obs.record_mismatch(crate::state::HighIdMismatch {
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                ip,
+                port,
+                login_hash: user_hash,
+                answered_hash: answered,
+                marked: marking,
+            });
+            HighIdCheck::Wrong
+        }
+        Err(reason) => {
+            obs.no_answer.fetch_add(1, Relaxed);
+            *obs.reasons.entry(reason).or_insert(0) += 1;
+            debug!(%ip, port, reason, "highid check: HighID by connect, no hello answer");
+            HighIdCheck::NoAnswer
+        }
+    }
+}
+
+/// Apply a check result to the wrong-hash marks (verdict mode only): a wrong
+/// hash sets or renews the mark, the client's own hash clears it, no answer
+/// leaves it alone — silence proves nothing.
+fn apply_highid_mark(
+    obs: &crate::state::HighIdObserve,
+    ip: IpAddr,
+    port: u16,
+    user_hash: [u8; 16],
+    check: HighIdCheck,
+    ttl: std::time::Duration,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    match check {
+        HighIdCheck::Wrong => {
+            if !obs.mark(ip, port, user_hash, ttl) {
+                warn!(%ip, port, "highid: wrong-hash mark table full, mark not set");
+            }
+        }
+        HighIdCheck::Same => {
+            if obs.unmark(ip, port, &user_hash) {
+                obs.marks_cleared.fetch_add(1, Relaxed);
+                info!(%ip, port, "highid: port answers with the client's own hash again → mark cleared");
+            }
+        }
+        HighIdCheck::NoAnswer => {}
+    }
+}
+
+/// Background identity probe after the plain probe succeeded. Never delays
+/// the login.
+///
+/// `marking` false: observe mode, counts only. `marking` true: verdict mode,
+/// the result also sets, renews or clears the wrong-hash mark that decides
+/// this client's NEXT login (`network.highid_downgrade_on_wrong_hash`).
+///
+/// Same probe, same obfuscation-then-plain fallback, same timeout in both
+/// modes — they share `highid_identity_answer`. The hairpin code is
+/// deliberately left as it is rather than shared with this: it is a verdict
+/// path with its own history, and a refactor for tidiness is not worth the
+/// risk of changing it.
+#[allow(clippy::too_many_arguments)]
+fn spawn_highid_check(
+    state: &ServerState,
+    live: &Config,
+    ip: IpAddr,
+    port: u16,
+    user_hash: [u8; 16],
+    client_flags: u32,
+    timeout_ms: u64,
+    marking: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let obs = std::sync::Arc::clone(&state.highid_observe);
+    // Shed load rather than queue it: a reconnect storm is when this matters
+    // least and costs most. A mark is left as it is when its re-check is shed.
+    let permit = match std::sync::Arc::clone(&obs.permits).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            obs.skipped_busy.fetch_add(1, Relaxed);
+            return;
+        }
+    };
+    let ident = HighIdProbeIdent::from_config(live);
+    let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
+    let ttl = std::time::Duration::from_secs(live.network.highid_wrong_hash_ttl_secs.max(1));
+
+    tokio::spawn(async move {
+        let _permit = permit;
+        let outcome =
+            highid_identity_answer(ip, port, user_hash, ident, timeout_ms, supports_crypt).await;
+        let check = record_highid_outcome(&obs, ip, port, user_hash, outcome, marking);
+        if marking {
+            apply_highid_mark(&obs, ip, port, user_hash, check, ttl);
+        }
+    });
+}
+
+/// Observe mode: count only. The name the observe tests use.
+#[cfg(test)]
+fn spawn_highid_observe(
+    state: &ServerState,
+    live: &Config,
+    ip: IpAddr,
+    port: u16,
+    user_hash: [u8; 16],
+    client_flags: u32,
+    timeout_ms: u64,
+) {
+    spawn_highid_check(
+        state,
+        live,
+        ip,
+        port,
+        user_hash,
+        client_flags,
+        timeout_ms,
+        false,
+    );
+}
+
 /// Process a LOGINREQUEST and register the client.
 pub async fn handle_login(
     // Unused since the ID assignment moved to live_cfg, but kept so callers do
@@ -418,6 +855,7 @@ pub async fn handle_login(
     req: LoginRequest,
 ) -> ClientHandle {
     let client_flags = req.server_flags();
+    let client_ipv6 = req.client_ipv6();
     let (assigned_id, is_high_id, source_ip) =
         assign_client_id_for(state, peer_ip, req.port, Some(&req.user_hash), client_flags).await;
     let nick = req.nick().unwrap_or("(no name)").to_string();
@@ -437,8 +875,12 @@ pub async fn handle_login(
     // ─── Country lookup (for per-client field, shown in web UI) ──────────
     let country = if let IpAddr::V4(v4) = peer_ip {
         let db = state.country_db.read().await;
-        db.lookup(v4).map(|(code, _)| code).unwrap_or_else(|| "??".to_string())
-    } else { "??".to_string() };
+        db.lookup(v4)
+            .map(|(code, _)| code)
+            .unwrap_or_else(|| "??".to_string())
+    } else {
+        "??".to_string()
+    };
 
     // ─── Client software detection ────────────────────────────────────────
     // Multi-pass detection using all available tags:
@@ -476,15 +918,20 @@ pub async fn handle_login(
                         udp_port = (v & 0xFFFF) as u16;
                     }
                 }
-                CT_EMULE_MISCOPTIONS1 | CT_EMULE_MISCOPTIONS2 => { has_emule_ext = true; }
-                0xEF => { has_emule_ext = true; }  // CT_EMULECOMPAT_OPTIONS1
+                CT_EMULE_MISCOPTIONS1 | CT_EMULE_MISCOPTIONS2 => {
+                    has_emule_ext = true;
+                }
+                0xEF => {
+                    has_emule_ext = true;
+                } // CT_EMULECOMPAT_OPTIONS1
                 _ => {}
             }
         }
     }
 
     // Check if CT_MOD_VERSION string says "mldonkey"
-    let mod_is_mldonkey = mod_name_str.as_deref()
+    let mod_is_mldonkey = mod_name_str
+        .as_deref()
         .map(|s| s.to_lowercase().starts_with("mldonkey"))
         .unwrap_or(false);
 
@@ -494,35 +941,42 @@ pub async fn handle_login(
         let cid = compat_id.unwrap_or(0);
         if cid == CLIENTID_EMULE {
             // clientid=0: eMule or one of its mods. CT_MOD_VERSION has mod name.
-            mod_name_str.as_deref().map(|s| {
-                let lower = s.to_lowercase();
-                if lower.contains("emule+") || lower.contains("emuleplus") {
-                    "eMulePlus".to_string()
-                } else if lower.contains("xtreme") {
-                    "eMule-Xtreme".to_string()
-                } else if lower.contains("mephisto") || lower.contains("Mephisto") {
-                    "eMule-Mephisto".to_string()
-                } else {
-                    format!("eMule-{}", s.split_whitespace().next().unwrap_or(s))
-                }
-            }).unwrap_or_else(|| "eMule".to_string())
+            mod_name_str
+                .as_deref()
+                .map(|s| {
+                    let lower = s.to_lowercase();
+                    if lower.contains("emule+") || lower.contains("emuleplus") {
+                        "eMulePlus".to_string()
+                    } else if lower.contains("xtreme") {
+                        "eMule-Xtreme".to_string()
+                    } else if lower.contains("mephisto") || lower.contains("Mephisto") {
+                        "eMule-Mephisto".to_string()
+                    } else {
+                        format!("eMule-{}", s.split_whitespace().next().unwrap_or(s))
+                    }
+                })
+                .unwrap_or_else(|| "eMule".to_string())
         } else {
             match cid {
-                CLIENTID_CDONKEY   => "cDonkey".to_string(),   // also: jed2k
-                CLIENTID_XMULE     => "xMule".to_string(),
-                CLIENTID_AMULE     => "aMule".to_string(),
-                CLIENTID_SHAREAZA  => "Shareaza".to_string(),
-                CLIENTID_MLDONKEY  => "mldonkey".to_string(),
-                CLIENTID_LPHANT    => "lphant".to_string(),
-                n                  => format!("compat({})", n),
+                CLIENTID_CDONKEY => "cDonkey".to_string(), // also: jed2k
+                CLIENTID_XMULE => "xMule".to_string(),
+                CLIENTID_AMULE => "aMule".to_string(),
+                CLIENTID_SHAREAZA => "Shareaza".to_string(),
+                CLIENTID_MLDONKEY => "mldonkey".to_string(),
+                CLIENTID_LPHANT => "lphant".to_string(),
+                n => format!("compat({})", n),
             }
         }
     } else if let Some(ref mname) = mod_name_str {
         // Has CT_MOD_VERSION but no CT_EMULE_VERSION
         let lower = mname.to_lowercase();
-        if lower.starts_with("mldonkey") { "mldonkey".to_string() }
-        else if lower.contains("emule+") { "eMulePlus".to_string() }
-        else { format!("eMule-{}", mname.split_whitespace().next().unwrap_or(mname)) }
+        if lower.starts_with("mldonkey") {
+            "mldonkey".to_string()
+        } else if lower.contains("emule+") {
+            "eMulePlus".to_string()
+        } else {
+            format!("eMule-{}", mname.split_whitespace().next().unwrap_or(mname))
+        }
     } else if has_emule_ext {
         "eMule-old".to_string()
     } else {
@@ -550,7 +1004,9 @@ pub async fn handle_login(
         } else {
             software
         }
-    } else { software };
+    } else {
+        software
+    };
 
     let handle = ClientHandle {
         user_hash: req.user_hash,
@@ -564,15 +1020,40 @@ pub async fn handle_login(
         nick: nick.clone(),
         server_flags,
         is_high_id,
+        // ⚠ THE BARE CAPABILITY BIT IS NOT ACCEPTED, and the asymmetry of the
+        //   two mistakes is why. Judging a client capable when it is not means
+        //   sending it a source record 16 bytes longer than the one it expects,
+        //   and it then reads the next record from the middle of this one and
+        //   mis-parses the rest of the packet. Judging a capable client
+        //   incapable costs it nothing but classic records.
+        //
+        //   `SRVCAP_IPV6` (0x1000) alone is too weak to carry that risk. The
+        //   published spec states the bit and `CT_MOD_IP_V6` are strictly
+        //   coupled — send both or neither — and warns in the same paragraph
+        //   that 0x1000 is reused unofficially elsewhere and should not be
+        //   treated as authoritative on its own. A client presenting the bit
+        //   without the tag is therefore not the client this was written for.
+        //
+        //   So: the tag, or a session that actually arrived over IPv6. Both are
+        //   observations rather than assertions.
+        ipv6_capable: client_ipv6.is_some() || matches!(peer_ip, IpAddr::V6(_)),
+        // Prefer the address the session actually arrived from over the one the
+        // client claims. A socket address is observed; a tag is asserted, and a
+        // client that gets its own address wrong (or lies about it) would
+        // otherwise have that address handed to every peer asking for sources.
+        ipv6: match peer_ip {
+            IpAddr::V6(a) if is_publishable_ipv6(a) => Some(a),
+            _ => client_ipv6.filter(|a| is_publishable_ipv6(*a)),
+        },
         connected_at: Instant::now(),
         country: country.clone(),
         software: software.clone(),
         shared_files: 0,
         csam_attempts: 0,
         tx: None,
-        last_activity_ms: std::sync::Arc::new(
-            std::sync::atomic::AtomicU64::new(ClientHandle::now_ms()),
-        ),
+        last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            ClientHandle::now_ms(),
+        )),
     };
 
     info!(
@@ -588,7 +1069,156 @@ pub async fn handle_login(
 
 #[cfg(test)]
 mod tests {
+    // ⚠ NEEDED SINCE THE CAPABILITY CONSTANTS MOVED TO opcodes.rs. They used to
+    //   be `const` declarations in this file, which a test could name without
+    //   importing anything; they are now `use` aliases, and a glob does not
+    //   carry those into a child module the way a local item is carried. The
+    //   build broke on three assertions that had never had an import line.
     use super::*;
+    // The alias itself. `use super::*` re-exports what login.rs names, and
+    // login.rs reaches the capability bits through `opcodes::*` under their
+    // real names, so the SRVCAP_ spelling exists nowhere until it is written
+    // down. Without this line `cargo test` does not compile — which is how it
+    // stayed broken while `cargo build` kept passing: the three uses below are
+    // all inside `#[cfg(test)]`.
+    use crate::proto::opcodes::CAPABLE_IPV6 as SRVCAP_IPV6;
+
+    #[test]
+    fn an_ipv6_peer_is_never_given_a_high_id() {
+        // An eD2k client id IS a 32-bit IPv4 address, so there is no HighID an
+        // IPv6-only peer could hold. The bug this guards: the probe used to run
+        // for such a peer, `high_id_from_ip` returned None, the code fell
+        // through to a LOW id — and returned it flagged as HighID. Source
+        // replies then published the peer as directly reachable, and the
+        // sentinel rule, which fires only for non-HighID sources, skipped the
+        // one peer it exists for.
+        use crate::server::highid_probe::high_id_from_ip;
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(high_id_from_ip(v6).is_none());
+    }
+
+    #[test]
+    fn only_a_globally_usable_ipv6_is_published() {
+        use std::net::Ipv6Addr;
+        for bad in [
+            "fe80::1",
+            "fd00::1",
+            "::1",
+            "::",
+            "ff02::1",
+            "::ffff:1.2.3.4",
+        ] {
+            let a: Ipv6Addr = bad.parse().unwrap();
+            assert!(!is_publishable_ipv6(a), "{bad}");
+        }
+        for good in ["2001:db8::1", "2a01:4f8::1"] {
+            let a: Ipv6Addr = good.parse().unwrap();
+            assert!(is_publishable_ipv6(a), "{good}");
+        }
+    }
+
+    #[test]
+    fn the_two_capability_bits_are_not_the_same_value() {
+        // The single easiest thing to get backwards here: client->server says
+        // 0x1000 in CT_SERVER_FLAGS, server->client says 0x4000 in the IDCHANGE
+        // and ping flag words. Both published specs define the asymmetry.
+        assert_eq!(SRVCAP_IPV6, 0x1000);
+        assert_eq!(SRV_TCPFLG_IPV6, 0x4000);
+        assert_ne!(SRVCAP_IPV6, SRV_TCPFLG_IPV6);
+        // ...and the server bit must not collide with the flags already sent.
+        assert_eq!(
+            0x0000_05DD & SRV_TCPFLG_IPV6,
+            0,
+            "collides with existing flags"
+        );
+    }
+
+    #[test]
+    fn the_bare_capability_bit_does_not_make_a_client_capable() {
+        // The two mistakes are not symmetric. Treating a client as capable when
+        // it is not sends it a record 16 bytes longer than it expects and breaks
+        // its parse of everything after; treating a capable client as incapable
+        // costs it nothing but classic records. 0x1000 alone does not carry that
+        // risk: the spec couples it to CT_MOD_IP_V6 ("send both or neither") and
+        // warns the value is reused unofficially elsewhere.
+        //
+        // The evidence that made this concrete: a live server showed nine
+        // sessions counted capable against three holding an address — six
+        // clients presenting the bit with no tag, which the spec says should not
+        // happen and which therefore means they mean something else by it.
+        let with_bit_only = LoginRequest {
+            user_hash: [0u8; 16],
+            claimed_id: 0,
+            port: 4662,
+            tags: vec![Tag::byte(CT_SERVER_FLAGS, TagValue::U32(SRVCAP_IPV6))],
+        };
+        assert!(
+            with_bit_only.client_ipv6().is_none(),
+            "the bit is not an address and must not be read as one"
+        );
+    }
+
+    #[test]
+    fn the_status_bits_are_never_set_to_unknown() {
+        // The tag is omitted when there is no verdict, so a client that sees it
+        // can trust every bit: unset means no, never unknown. PROBED in
+        // particular must stay clear — we accept the address on trust and never
+        // dial it back, and claiming a check we do not perform would let a
+        // client draw a stronger conclusion than the evidence supports.
+        assert_eq!(IPV6ST_HAVE, 0x01);
+        assert_eq!(IPV6ST_REACHABLE, 0x02);
+        assert_eq!(IPV6ST_HAVE | IPV6ST_REACHABLE, 0x03);
+        // 0x04 (PROBED) is deliberately not defined here.
+        assert_eq!((IPV6ST_HAVE | IPV6ST_REACHABLE) & 0x04, 0);
+    }
+
+    #[test]
+    fn one_rule_decides_whether_an_ipv6_may_be_published() {
+        // Two functions answering this differently is how an address gets
+        // filtered on one path and published on the other. The state-level
+        // check now delegates here, so a link-local cannot be recorded by one
+        // and emitted by the other.
+        use crate::state::ServerState;
+        use std::net::{IpAddr, Ipv6Addr};
+        for a in ["fe80::1", "fd00::1", "::1", "ff02::1", "::ffff:1.2.3.4"] {
+            let v6: Ipv6Addr = a.parse().unwrap();
+            assert_eq!(
+                is_publishable_ipv6(v6),
+                ServerState::is_publishable_source_ip(IpAddr::V6(v6)),
+                "{a}: the two checks disagree"
+            );
+            assert!(!is_publishable_ipv6(v6), "{a}");
+        }
+        let good: Ipv6Addr = "2a01:4f8::1".parse().unwrap();
+        assert!(is_publishable_ipv6(good));
+        assert!(ServerState::is_publishable_source_ip(IpAddr::V6(good)));
+    }
+
+    #[test]
+    fn the_ipv6_tag_is_accepted_only_as_a_16_byte_hash() {
+        // Accepting any tag type would let a client with a string in 0xAE be
+        // read as v6-reachable, and the tag's presence is itself a capability
+        // signal.
+        let mk = |v: TagValue| LoginRequest {
+            user_hash: [0u8; 16],
+            claimed_id: 0,
+            port: 4662,
+            tags: vec![Tag::byte(CT_MOD_IP_V6, v)],
+        };
+        assert!(mk(TagValue::String("2001:db8::1".into()))
+            .client_ipv6()
+            .is_none());
+        assert!(mk(TagValue::U32(1)).client_ipv6().is_none());
+        assert!(mk(TagValue::Blob(vec![0u8; 4])).client_ipv6().is_none());
+        let mut raw = [0u8; 16];
+        raw[0] = 0x20;
+        raw[1] = 0x01;
+        raw[15] = 0x01;
+        assert_eq!(
+            mk(TagValue::Blob(raw.to_vec())).client_ipv6(),
+            Some(std::net::Ipv6Addr::from(raw))
+        );
+    }
 
     /// user_hash(16) + claimed_id(4) + port(2) = the shortest legitimate login.
     fn head() -> Vec<u8> {
@@ -647,5 +1277,464 @@ mod tests {
         p.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let r = LoginRequest::parse(&p).expect("must not panic on a lying tag count");
         assert!(r.tags.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod highid_observe_tests {
+    //! The observation path must count, never decide. These run the real
+    //! identity probe against local listeners that behave like the three kinds
+    //! of port found on the network.
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn state() -> Arc<ServerState> {
+        let cfg = Arc::new(crate::config::Config::minimal_test_config());
+        Arc::new(ServerState::new(
+            Arc::new(crate::filter::ContentFilter::new()),
+            cfg,
+        ))
+    }
+
+    async fn wait_for(
+        state: &ServerState,
+        pred: impl Fn(&HighIdObserveView) -> bool,
+    ) -> HighIdObserveView {
+        for _ in 0..200 {
+            let v = HighIdObserveView::of(state);
+            if pred(&v) {
+                return v;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        HighIdObserveView::of(state)
+    }
+
+    #[derive(Debug)]
+    struct HighIdObserveView {
+        verified: u64,
+        mismatch: u64,
+        no_answer: u64,
+        skipped: u64,
+    }
+    impl HighIdObserveView {
+        fn of(s: &ServerState) -> Self {
+            let o = &s.highid_observe;
+            Self {
+                verified: o.verified.load(Relaxed),
+                mismatch: o.mismatch.load(Relaxed),
+                no_answer: o.no_answer.load(Relaxed),
+                skipped: o.skipped_busy.load(Relaxed),
+            }
+        }
+    }
+
+    /// Accept one connection, read the hello, answer OP_HELLOANSWER carrying
+    /// `hash` — what a real client behind an open port does.
+    async fn answering_listener(hash: [u8; 16]) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut c, _) = l.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = c.read(&mut buf).await;
+            let mut body = vec![0x4Cu8]; // OP_HELLOANSWER
+            body.extend_from_slice(&hash);
+            body.extend_from_slice(&[0u8; 4 + 2 + 4 + 4 + 2]); // id, port, 0 tags, server ip, port
+            let mut frame = vec![0xE3u8];
+            frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&body);
+            let _ = c.write_all(&frame).await;
+        });
+        port
+    }
+
+    /// Accept and close without a byte — a port that is open but has no eD2k
+    /// client behind it. The case Lugdunum turns into LowID and we do not.
+    async fn silent_listener() -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((c, _)) = l.accept().await {
+                drop(c);
+            }
+        });
+        port
+    }
+
+    const LOCAL: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+
+    /// What a port that accepts and immediately closes looks like to the probe.
+    ///
+    /// ⚠ TWO REASONS FOR ONE EVENT. If the peer closes before our HELLO lands in
+    ///   its receive buffer, the kernel sends FIN and we read "peer closed without
+    ///   sending a byte". If the HELLO is already sitting there unread, closing
+    ///   sends RST and the read fails instead. Which one happens is a race. The
+    ///   same applies on the live network — eMule rejecting our address through
+    ///   its IP filter shows up under both names — so the two counts belong
+    ///   together when reading the Status tab.
+    const SILENT_CLOSE: [Result<bool, &str>; 2] = [
+        Err("peer closed without sending a byte"),
+        Err("read failed"),
+    ];
+
+    #[tokio::test]
+    async fn a_port_that_answers_with_the_right_hash_is_verified() {
+        let st = state();
+        let live = st.live_cfg.load_full();
+        let uh = [0x42u8; 16];
+        let port = answering_listener(uh).await;
+        spawn_highid_observe(&st, &live, LOCAL, port, uh, 0, 2000);
+        let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
+        assert_eq!((v.verified, v.mismatch, v.no_answer), (1, 0, 0), "{v:?}");
+    }
+
+    #[tokio::test]
+    async fn a_port_answering_for_someone_else_is_a_mismatch() {
+        let st = state();
+        let live = st.live_cfg.load_full();
+        let port = answering_listener([0x99u8; 16]).await;
+        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
+        assert_eq!((v.verified, v.mismatch, v.no_answer), (0, 1, 0), "{v:?}");
+        // Both hashes are kept, so the case can be traced to a second client.
+        let rec: Vec<_> = st
+            .highid_observe
+            .recent_mismatches
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
+        assert_eq!(rec.len(), 1);
+        assert_eq!(rec[0].login_hash, [0x42u8; 16]);
+        assert_eq!(rec[0].answered_hash, [0x99u8; 16]);
+        assert_eq!((rec[0].ip, rec[0].port), (LOCAL, port));
+    }
+
+    #[tokio::test]
+    async fn the_hairpin_wrapper_still_answers_true_and_false() {
+        // probe_identity is now a comparison over probe_identity_hash. The
+        // hairpin VERDICT path calls it, so its results must be unchanged.
+        use crate::server::highid_probe::{probe_identity, probe_identity_hash};
+        let ours = [0x11u8; 16];
+        let port = answering_listener([0x42u8; 16]).await;
+        assert_eq!(
+            probe_identity(LOCAL, port, &[0x42u8; 16], &ours, 0, 4661, 2000, false).await,
+            Ok(true)
+        );
+        let port = answering_listener([0x99u8; 16]).await;
+        assert_eq!(
+            probe_identity(LOCAL, port, &[0x42u8; 16], &ours, 0, 4661, 2000, false).await,
+            Ok(false)
+        );
+        let port = answering_listener([0x99u8; 16]).await;
+        assert_eq!(
+            probe_identity_hash(LOCAL, port, &[0x42u8; 16], &ours, 0, 4661, 2000, false).await,
+            Ok([0x99u8; 16])
+        );
+        let port = silent_listener().await;
+        let r = probe_identity(LOCAL, port, &[0x42u8; 16], &ours, 0, 4661, 2000, false).await;
+        assert!(SILENT_CLOSE.contains(&r), "{r:?}");
+    }
+
+    fn h(hex_str: &str) -> [u8; 16] {
+        let v = hex::decode(hex_str).unwrap();
+        let mut a = [0u8; 16];
+        a.copy_from_slice(&v);
+        a
+    }
+
+    #[test]
+    fn a_different_type_marker_is_the_same_client() {
+        use crate::server::highid_probe::same_client_hash;
+        // Real pairs from the live server: login hash with eMule's 0E/6F,
+        // hello answer with MLDonkey's 4D/4C, the other 14 bytes identical.
+        for (login, answered) in [
+            (
+                "b060873b2d0ed162b0b037c02c716f0e",
+                "b060873b2d4dd162b0b037c02c714c0e",
+            ),
+            (
+                "cd312acd250e88cdf553e432744a6f89",
+                "cd312acd254d88cdf553e432744a4c89",
+            ),
+        ] {
+            assert!(
+                same_client_hash(&h(login), &h(answered)),
+                "{login} vs {answered}"
+            );
+        }
+        // Real pair of genuinely different clients (the second machine behind
+        // one NAT): must stay different.
+        assert!(!same_client_hash(
+            &h("8746e2693c0e1e4a165d044caf576f7b"),
+            &h("5ba688ae970e78131fcb5020950f6fe1")
+        ));
+        // One byte outside the marker positions is enough to be different.
+        let a = h("b060873b2d0ed162b0b037c02c716f0e");
+        for i in (0..16).filter(|i| *i != 5 && *i != 14) {
+            let mut b = a;
+            b[i] ^= 0x01;
+            assert!(!same_client_hash(&a, &b), "byte {i} must count");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_marker_variant_is_verified_and_counted_separately() {
+        let st = state();
+        let live = st.live_cfg.load_full();
+        let login = h("b060873b2d0ed162b0b037c02c716f0e");
+        let port = answering_listener(h("b060873b2d4dd162b0b037c02c714c0e")).await;
+        spawn_highid_observe(&st, &live, LOCAL, port, login, 0, 2000);
+        let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
+        assert_eq!((v.verified, v.mismatch, v.no_answer), (1, 0, 0), "{v:?}");
+        assert_eq!(st.highid_observe.verified_marker_variant.load(Relaxed), 1);
+        assert!(st
+            .highid_observe
+            .recent_mismatches
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_hairpin_wrapper_accepts_a_marker_variant() {
+        // The verdict path: this client IS the host behind the port.
+        use crate::server::highid_probe::probe_identity;
+        let port = answering_listener(h("b060873b2d4dd162b0b037c02c714c0e")).await;
+        assert_eq!(
+            probe_identity(
+                LOCAL,
+                port,
+                &h("b060873b2d0ed162b0b037c02c716f0e"),
+                &[0x11; 16],
+                0,
+                4661,
+                2000,
+                false
+            )
+            .await,
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn mismatches_are_classified_against_who_is_connected() {
+        let st = ServerState::for_test();
+        // register_test_client puts id N at 10.0.0.(N+1).
+        st.register_test_client([0xB1; 16], 1, true, 0); // 10.0.0.2
+        st.register_test_client([0xB2; 16], 2, true, 0); // 10.0.0.3
+        let rec = |ip: [u8; 4], answered: [u8; 16]| crate::state::HighIdMismatch {
+            at: 0,
+            ip: IpAddr::V4(std::net::Ipv4Addr::from(ip)),
+            port: 4662,
+            login_hash: [0xA0; 16],
+            answered_hash: answered,
+            marked: false,
+        };
+        let o = &st.highid_observe;
+        // Second client behind the same NAT: answered hash is logged in from
+        // exactly the address we probed.
+        o.record_mismatch(rec([10, 0, 0, 2], [0xB1; 16]));
+        // Answered hash is logged in, but from somewhere else.
+        o.record_mismatch(rec([10, 0, 0, 9], [0xB2; 16]));
+        // Answered hash is not connected to us at all.
+        o.record_mismatch(rec([10, 0, 0, 7], [0xCC; 16]));
+        assert_eq!(o.classify_mismatches(&st.clients), (1, 1, 1, 3));
+    }
+
+    #[test]
+    fn the_mismatch_buffer_is_bounded() {
+        let st = ServerState::for_test();
+        for i in 0..(crate::state::HighIdObserve::RECENT_MISMATCHES + 50) {
+            st.highid_observe
+                .record_mismatch(crate::state::HighIdMismatch {
+                    at: i as u64,
+                    ip: LOCAL,
+                    port: 1,
+                    login_hash: [0; 16],
+                    answered_hash: [1; 16],
+                    marked: false,
+                });
+        }
+        let q = st.highid_observe.recent_mismatches.lock().unwrap();
+        assert_eq!(q.len(), crate::state::HighIdObserve::RECENT_MISMATCHES);
+        assert_eq!(
+            q.back().unwrap().at,
+            (crate::state::HighIdObserve::RECENT_MISMATCHES + 49) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_but_silent_port_is_counted_with_its_reason() {
+        // The exact situation cap_probe.py measured: TCP accepted, nothing said.
+        // The plain probe calls this HighID; this path must say so plainly.
+        let st = state();
+        let live = st.live_cfg.load_full();
+        let port = silent_listener().await;
+        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        let v = wait_for(&st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
+        assert_eq!((v.verified, v.mismatch, v.no_answer), (0, 0, 1), "{v:?}");
+        let reasons: Vec<&str> = st.highid_observe.reasons.iter().map(|e| *e.key()).collect();
+        assert_eq!(reasons.len(), 1);
+        assert!(SILENT_CLOSE.contains(&Err(reasons[0])), "{reasons:?}");
+    }
+
+    #[tokio::test]
+    async fn a_full_cap_sheds_instead_of_queueing() {
+        let st = state();
+        let live = st.live_cfg.load_full();
+        // Take every permit, as a reconnect storm would.
+        let _held = Arc::clone(&st.highid_observe.permits)
+            .acquire_many_owned(crate::state::HighIdObserve::MAX_CONCURRENT as u32)
+            .await
+            .unwrap();
+        let port = silent_listener().await;
+        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        let v = HighIdObserveView::of(&st);
+        assert_eq!(v.skipped, 1);
+        assert_eq!(
+            v.verified + v.mismatch + v.no_answer,
+            0,
+            "nothing was probed"
+        );
+    }
+
+    // ─── verdict mode: network.highid_downgrade_on_wrong_hash ─────────────
+
+    fn verdict_live(st: &ServerState) -> Arc<crate::config::Config> {
+        let mut c = (*st.live_cfg.load_full()).clone();
+        c.network.highid_downgrade_on_wrong_hash = true;
+        Arc::new(c)
+    }
+
+    async fn settle(st: &ServerState) {
+        wait_for(st, |v| v.verified + v.mismatch + v.no_answer > 0).await;
+        // The mark is applied right after the counters, in the same task.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    }
+
+    #[tokio::test]
+    async fn a_wrong_hash_marks_the_login_for_next_time() {
+        let st = state();
+        let live = verdict_live(&st);
+        let uh = h("b060873b2d0ed162b0b037c02c716f0e");
+        let port = answering_listener(h("8746e2693c0e1e4a165d044caf576f7b")).await;
+        assert!(!st.highid_observe.is_marked(LOCAL, port, &uh));
+        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
+        settle(&st).await;
+        assert!(st.highid_observe.is_marked(LOCAL, port, &uh));
+        // Only this exact login is marked: another hash, or another port, is not.
+        assert!(!st.highid_observe.is_marked(LOCAL, port, &[0x42; 16]));
+        assert!(!st
+            .highid_observe
+            .is_marked(LOCAL, port.wrapping_add(1), &uh));
+        let rec = st.highid_observe.recent_mismatches.lock().unwrap();
+        assert!(rec[0].marked);
+    }
+
+    #[tokio::test]
+    async fn the_own_hash_again_clears_the_mark() {
+        let st = state();
+        let live = verdict_live(&st);
+        let uh = [0x42u8; 16];
+        let port = answering_listener(uh).await;
+        st.highid_observe
+            .mark(LOCAL, port, uh, std::time::Duration::from_secs(3600));
+        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
+        settle(&st).await;
+        assert!(!st.highid_observe.is_marked(LOCAL, port, &uh));
+        assert_eq!(st.highid_observe.marks_cleared.load(Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_marker_variant_neither_marks_nor_keeps_a_mark() {
+        let st = state();
+        let live = verdict_live(&st);
+        let uh = h("b060873b2d0ed162b0b037c02c716f0e");
+        let port = answering_listener(h("b060873b2d4dd162b0b037c02c714c0e")).await;
+        st.highid_observe
+            .mark(LOCAL, port, uh, std::time::Duration::from_secs(3600));
+        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
+        settle(&st).await;
+        assert!(
+            !st.highid_observe.is_marked(LOCAL, port, &uh),
+            "same client → cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn silence_leaves_a_mark_as_it_is() {
+        let st = state();
+        let live = verdict_live(&st);
+        let uh = [0x42u8; 16];
+        // Silent port: the peer's IP filter, say. Never sets a mark...
+        let port = silent_listener().await;
+        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
+        settle(&st).await;
+        assert!(!st.highid_observe.is_marked(LOCAL, port, &uh));
+        // ...and never clears one either.
+        let st = state();
+        let port = silent_listener().await;
+        st.highid_observe
+            .mark(LOCAL, port, uh, std::time::Duration::from_secs(3600));
+        spawn_highid_check(&st, &live, LOCAL, port, uh, 0, 2000, true);
+        settle(&st).await;
+        assert!(st.highid_observe.is_marked(LOCAL, port, &uh));
+        assert_eq!(st.highid_observe.marks_cleared.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn observe_mode_records_but_never_marks() {
+        let st = state();
+        let live = st.live_cfg.load_full();
+        let port = answering_listener([0x99u8; 16]).await;
+        spawn_highid_observe(&st, &live, LOCAL, port, [0x42u8; 16], 0, 2000);
+        settle(&st).await;
+        assert_eq!(st.highid_observe.mismatch.load(Relaxed), 1);
+        assert!(!st.highid_observe.is_marked(LOCAL, port, &[0x42u8; 16]));
+        assert!(!st.highid_observe.recent_mismatches.lock().unwrap()[0].marked);
+    }
+
+    #[tokio::test]
+    async fn a_mark_expires() {
+        let st = ServerState::for_test();
+        let o = &st.highid_observe;
+        o.mark(LOCAL, 4662, [1; 16], std::time::Duration::from_millis(20));
+        assert!(o.is_marked(LOCAL, 4662, &[1; 16]));
+        assert_eq!(o.marks_active(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(!o.is_marked(LOCAL, 4662, &[1; 16]));
+        assert_eq!(o.marks_active(), 0);
+        assert!(
+            o.wrong_hash_marks.is_empty(),
+            "expired mark removed on lookup"
+        );
+    }
+
+    #[test]
+    fn the_mark_table_is_bounded() {
+        let st = ServerState::for_test();
+        let o = &st.highid_observe;
+        let ttl = std::time::Duration::from_secs(3600);
+        for i in 0..crate::state::HighIdObserve::MAX_MARKS {
+            let mut h = [0u8; 16];
+            h[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            assert!(o.mark(LOCAL, 1, h, ttl));
+        }
+        assert!(
+            !o.mark(LOCAL, 1, [0xFF; 16], ttl),
+            "full table refuses a new mark"
+        );
+        let mut h0 = [0u8; 16];
+        h0[..8].copy_from_slice(&0u64.to_le_bytes());
+        assert!(
+            o.mark(LOCAL, 1, h0, ttl),
+            "renewing an existing mark still works"
+        );
     }
 }

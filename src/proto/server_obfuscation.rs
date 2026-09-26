@@ -92,8 +92,8 @@ fn derive_cipher(server_key: u32, salt: [u8; 2]) -> Rc4 {
     input[6] = 0x00;
 
     let digest = Md5::digest(input); // 16-byte RC4 key
-    // Server-to-server RC4 does NOT drop the first 1024 bytes (unlike the
-    // client DH obfuscation) — eserver.c uses the keystream immediately.
+                                     // Server-to-server RC4 does NOT drop the first 1024 bytes (unlike the
+                                     // client DH obfuscation) — eserver.c uses the keystream immediately.
     Rc4::new(&digest, false)
 }
 
@@ -117,7 +117,7 @@ fn derive_cipher(server_key: u32, salt: [u8; 2]) -> Rc4 {
 pub fn derive_cipher_with_obfbyte(server_key: u32, salt: [u8; 2], obf_byte: u8) -> Rc4 {
     let mut input = [0u8; 7];
     input[0..4].copy_from_slice(&server_key.to_le_bytes());
-    input[4] = obf_byte;   // obf_byte BEFORE salt — confirmed from packet capture
+    input[4] = obf_byte; // obf_byte BEFORE salt — confirmed from packet capture
     input[5] = salt[0];
     input[6] = salt[1];
     let digest = Md5::digest(input);
@@ -237,7 +237,12 @@ pub fn encode(message: &[u8], server_key: u32, rng_seed: u32) -> Vec<u8> {
 
 /// Like `encode`, but with an explicit obfuscation-channel byte.
 /// `0x00` = plain s2s channel (default), `0xa5` = TCP+12 obfpingport channel.
-pub fn encode_with_obfbyte(message: &[u8], server_key: u32, rng_seed: u32, obf_byte: u8) -> Vec<u8> {
+pub fn encode_with_obfbyte(
+    message: &[u8],
+    server_key: u32,
+    rng_seed: u32,
+    obf_byte: u8,
+) -> Vec<u8> {
     let mut state = rng_seed ^ 0x9E37_79B9;
     let mut next = || {
         state ^= state << 13;
@@ -269,7 +274,6 @@ pub fn encode_with_obfbyte(message: &[u8], server_key: u32, rng_seed: u32, obf_b
     datagram.extend_from_slice(&blob);
     datagram
 }
-
 
 #[cfg(test)]
 mod tests {

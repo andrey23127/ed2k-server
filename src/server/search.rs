@@ -15,8 +15,76 @@ use anyhow::Result;
 use bytes::{BufMut, BytesMut};
 use tracing::{debug, info};
 
-/// Maximum results per response (SPEC.md §3.4.1, default 200).
-const MAX_RESULTS: usize = 200;
+/// One match together with the key it is ranked by.
+///
+/// ⚠ `Ord` IS INVERTED: greater means WORSE. `BinaryHeap` is a max-heap and its
+///   `pop` removes the greatest element, so ordering this the intuitive way
+///   round — greater means better — makes the heap discard the best result on
+///   every overflow and return the N worst matches. Inverted, `peek` is the
+///   weakest entry kept and `pop` evicts it, which is what a bounded top-N
+///   needs. `into_sorted_vec` then yields best-first with no reversal.
+///
+/// Ties break on the file id, lower winning. That matters more than it looks:
+/// on a real index most files share a source count — very often exactly one —
+/// so the tie-break decides the bulk of the ordering. It has to be total and
+/// deterministic, or the same query against an unchanged index answers
+/// differently on each call.
+struct Ranked {
+    sources: u32,
+    id: crate::state::file_id::FileId,
+    rec: crate::state::file_id::FileRecord,
+}
+
+/// Same ordering, exported for the UDP search path so the two channels rank
+/// identically. Kept as a separate type only because `Ranked` is private.
+pub struct UdpRanked {
+    pub sources: u32,
+    pub id: crate::state::file_id::FileId,
+    pub rec: crate::state::file_id::FileRecord,
+}
+
+impl PartialEq for UdpRanked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for UdpRanked {}
+impl PartialOrd for UdpRanked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for UdpRanked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Inverted, for the reason spelled out at `Ranked`.
+        other
+            .sources
+            .cmp(&self.sources)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Ranked {}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Inverted: greater = worse. Fewer sources is worse; on equal sources
+        // the HIGHER id is worse, so the lower id survives a tie.
+        other
+            .sources
+            .cmp(&self.sources)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
 
 /// Upper bound on records examined by a search with no indexable token.
 ///
@@ -27,7 +95,8 @@ const MAX_RESULTS: usize = 200;
 /// millions of records, and any client can ask for it repeatedly: a one-token
 /// query whose token happens to miss the index takes the same path.
 ///
-/// 50k is far more than a client can use (MAX_RESULTS is 200) and small enough
+/// 50k is far more than a client can use (the result cap defaults to 200) and
+/// small enough
 /// that a walk stays in the millisecond range. Past the cap the answer is
 /// best-effort — the right trade, since a metadata-only query has no precise
 /// answer worth protecting, while a stalled server affects every user.
@@ -46,11 +115,33 @@ impl SearchRequest {
 }
 
 /// Process a search request. Returns the SEARCHRESULT frame to send back.
-/// Run a search and return ALL matching file entries (up to MAX_RESULTS).
+/// Run a search and return the best matching file entries, at most
+/// `limits.max_search_results` of them, best-sourced first.
 /// The caller paginates this into SEARCHRESULT frames via
 /// build_search_result_page + QUERY_MORE_RESULT.
-pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::state::file_id::FileRecord> {
-    let tokens = collect_terms(&req.tree);
+pub fn handle_search(
+    state: &ServerState,
+    req: SearchRequest,
+) -> Vec<crate::state::file_id::FileRecord> {
+    state.note_search();
+
+    // Drop words no indexed file contains, so one typo does not empty the whole
+    // search. The rewritten tree replaces `req.tree` for EVERY stage below —
+    // candidate lookup and `evaluate` alike — which is the only way the change
+    // is visible at all: see the warning at `drop_unknown_words`.
+    let tree = if state.live_cfg.load().limits.search_drop_unknown_words {
+        let (t, dropped) = crate::proto::search::drop_unknown_words(&req.tree, &|tok: &str| {
+            state.keyword_index.contains_token(tok)
+        });
+        if !dropped.is_empty() {
+            state.note_search_words_dropped();
+            debug!(?dropped, "search: dropped words no indexed file contains");
+        }
+        t
+    } else {
+        req.tree.clone()
+    };
+    let tokens = collect_terms(&tree);
 
     debug!(?tokens, "search tokens extracted from tree");
 
@@ -71,11 +162,33 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
         .filter(|t| t != "*" && t != "**")
         .collect();
 
+    // The same terms, grouped the way the tree combined them: one group per AND
+    // operand, all of an OR's branches inside a single group. The flat list
+    // above still decides whether there is any keyword at all; only the
+    // candidate lookup needs the shape.
+    // ⚠ A GROUP OF ONE EXPANDS INTO SEVERAL GROUPS, NOT INTO ONE BIGGER GROUP.
+    //   Many clients send the whole query as a single Term node — "ubuntu linux
+    //   bible" — and `tokenize_search_term` splits it into three tokens that
+    //   must ALL match. Letting those three sit in one group turns them into
+    //   alternatives, which is the opposite of what #10 established, and the
+    //   candidate set becomes the UNION of three common words over the whole
+    //   index instead of their intersection.
+    //
+    //   Results stayed correct, because `evaluate` still applies the real
+    //   condition, and that is what made it invisible: the only symptom was the
+    //   server going from 3% CPU to 92% on a 1.6M-file index.
+    //
+    //   A genuine OR group (more than one element) is different: its branches
+    //   are alternatives by construction, so its tokens are unioned as before.
+    // Shared with the UDP path, so the two cannot drift — they used to carry
+    // a copy each, and both copies had the same per-term marker bug.
+    let groups: Vec<Vec<String>> = crate::proto::search::candidate_groups(&tree);
+
     // Candidates: keyword lookup if we have tokens, otherwise full scan
     // (handles "*" search and metadata-only queries like Type=Video + size).
     //
     // IMPORTANT: with no keyword token the tree predicate must be applied
-    // BEFORE the MAX_RESULTS cap. Taking the first 200 records and filtering
+    // BEFORE the result cap. Taking the first 200 records and filtering
     // afterwards is a bug: iteration order is arbitrary, so a metadata query
     // (Type=Video, size range, no filename) would return a different,
     // mostly-tiny result set every time. The walk is bounded by
@@ -92,16 +205,36 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
     // The predicate is evaluated IN PLACE via `with_record`, and only a match is
     // cloned. Cloning first and filtering second paid for a full `FileRecord`
     // copy — sources SmallVec plus an Arc bump — on every candidate, when a busy
-    // query examines thousands and keeps at most MAX_RESULTS.
-    let mut matches: Vec<crate::state::file_id::FileRecord> = Vec::new();
+    // query examines thousands and keeps at most `max_results`.
+    // Ranking, not first-come.
+    //
+    // The cap used to truncate in FileId order, which is publication order: for
+    // any query with more matches than the cap, the oldest matching files were
+    // permanently visible and the newest permanently were not. That is not a
+    // limit, it is a silent filter, and on a network where people search for
+    // new content it filters the wrong way round.
+    //
+    // So every candidate is examined and the best `max_results` kept by source
+    // count, bounded by `rank_scan` so a common word cannot turn one search
+    // into a walk of a six-figure posting list.
+    let live = state.live_cfg.load();
+    let max_results = live.limits.max_search_results as usize;
+    let rank_scan = (live.limits.search_rank_scan as usize).max(max_results);
+
+    let mut heap: std::collections::BinaryHeap<Ranked> =
+        std::collections::BinaryHeap::with_capacity(max_results + 1);
     let mut n_candidates = 0usize;
     let mut scanned = 0usize;
     let mut scan_capped = false;
+    let mut rank_scan_capped = false;
+    let mut total_matched = 0usize;
 
-    // Test one candidate. Returns false once enough matches are collected.
+    // Test one candidate. Returns false once the examination budget is spent.
     // Shared by both paths below so they cannot drift apart.
-    let mut consider = |entry: &crate::state::file_id::FileRecord,
-                        matches: &mut Vec<crate::state::file_id::FileRecord>| -> bool {
+    let mut consider = |id: crate::state::file_id::FileId,
+                        entry: &crate::state::file_id::FileRecord,
+                        heap: &mut std::collections::BinaryHeap<Ranked>|
+     -> bool {
         scanned += 1;
         // The FULL filter applies to what is SERVED, not only to what is
         // published — see ContentFilter::is_withheld. A term added today has to
@@ -118,25 +251,53 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
         if entry.sources.is_empty() {
             return true;
         }
-        let name_lower = entry.name.to_lowercase();
-        if evaluate(&req.tree, &name_lower, entry.size) {
-            matches.push(entry.clone());
-            if matches.len() >= MAX_RESULTS {
-                return false;
+        // Folded, so the predicate compares like with like — see the warning
+        // at `evaluate`.
+        let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
+        if evaluate(&tree, &name_lower, entry.size) {
+            total_matched += 1;
+            // Cheap rejection before the clone: once the heap is full, anything
+            // no better than its worst entry cannot survive, and cloning a
+            // FileRecord costs a sources SmallVec plus an Arc bump. On a common
+            // word the overwhelming majority of matches land here.
+            let keep = match heap.peek() {
+                Some(worst) if heap.len() >= max_results => {
+                    let cand_sources = entry.sources.len() as u32;
+                    (cand_sources, std::cmp::Reverse(id))
+                        > (worst.sources, std::cmp::Reverse(worst.id))
+                }
+                _ => true,
+            };
+            if keep {
+                heap.push(Ranked {
+                    sources: entry.sources.len() as u32,
+                    id,
+                    rec: entry.clone(),
+                });
+                if heap.len() > max_results {
+                    heap.pop();
+                }
             }
+        }
+        // Stop examining once the budget is spent. Unlike the old cap this
+        // bounds WORK, not the result set: everything seen so far has already
+        // been ranked against everything else seen so far.
+        if scanned >= rank_scan {
+            rank_scan_capped = true;
+            return false;
         }
         true
     };
 
     if keyword_filtered {
-        let ids = state.keyword_index.find_intersection(&token_lower);
+        let ids = state.keyword_index.find_grouped(&groups);
         n_candidates = ids.len();
         for fid in ids {
             // A tombstoned id yields None and is skipped — it can't be a live
             // match anyway.
             let keep_going = state
                 .file_slab
-                .with_record(fid, |r| consider(r, &mut matches))
+                .with_record(fid, |r| consider(fid, r, &mut heap))
                 .unwrap_or(true);
             if !keep_going {
                 break;
@@ -147,7 +308,7 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
         // (Type=Video + size range). There is no candidate set to narrow with,
         // so the tree has to be applied to live records directly.
         //
-        // The predicate must run BEFORE the MAX_RESULTS cap: taking the first N
+        // The predicate must run BEFORE the result cap: taking the first N
         // records and filtering afterwards would test an arbitrary N — shard
         // iteration order is not meaningful — so a metadata query would return a
         // different, mostly-tiny result set every time.
@@ -159,20 +320,35 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
         // MAX_UNINDEXED_SCAN and the answer is best-effort past that point,
         // which is the correct trade: a metadata-only query has no precise
         // answer to protect, while a stalled server affects everyone.
-        state.file_slab.for_each_live_while(|_id, r| {
+        state.file_slab.for_each_live_while(|id, r| {
             if n_candidates >= MAX_UNINDEXED_SCAN {
                 scan_capped = true;
                 return false;
             }
             n_candidates += 1;
-            consider(r, &mut matches)
+            consider(id, r, &mut heap)
         });
     }
+
+    // `Ord` is inverted (see `Ranked`), so ascending order is best first and
+    // no reversal is wanted here.
+    let matches: Vec<crate::state::file_id::FileRecord> =
+        heap.into_sorted_vec().into_iter().map(|r| r.rec).collect();
+
     if scan_capped {
         debug!(
             limit = MAX_UNINDEXED_SCAN,
             matched = matches.len(),
             "unindexed search hit the scan cap; result set is partial"
+        );
+    }
+    if rank_scan_capped {
+        state.note_search_rank_capped();
+        debug!(
+            limit = rank_scan,
+            candidates = n_candidates,
+            matched_before_cap = total_matched,
+            "search hit the ranking scan cap; ranked over what was examined"
         );
     }
 
@@ -183,7 +359,9 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
         candidates = n_candidates,
         scanned,
         scan_capped,
-        matched = matches.len(),
+        rank_scan_capped,
+        total_matched,
+        returned = matches.len(),
         "search processed"
     );
 
@@ -199,17 +377,27 @@ pub fn handle_search(state: &ServerState, req: SearchRequest) -> Vec<crate::stat
     matches
 }
 
-/// Number of result records sent per SEARCHRESULT frame. eMule then sends
-/// QUERY_MORE_RESULT (0x21) to pull each subsequent page. Lugdunum uses a
-/// similar chunking; ~50 keeps each frame comfortably small even before
-/// zlib compression kicks in.
-/// Results per SEARCHRESULT page. Lugdunum sends up to ~200 in a single
-/// packet; eMule only triggers QUERY_MORE_RESULT (the "More" button) when
-/// the server actually capped at this size AND the trailing "more" byte was
-/// set. Using 50 here made every search look like "exactly 50 hits" because
-/// eMule populated the list with the first page and waited for a manual
-/// More click — which isn't the expected behaviour.
-pub const SEARCH_PAGE_SIZE: usize = 200;
+/// Hard ceiling on records per SEARCHRESULT frame, independent of the result
+/// cap. Only a guard against an enormous single frame: at the
+/// `max_search_results` ceiling of 5000 this splits the answer into three
+/// pages, and at any ordinary cap it never applies at all.
+const SEARCH_PAGE_HARD_MAX: usize = 2_000;
+
+/// Records per SEARCHRESULT frame.
+///
+/// ⚠ THIS MUST FOLLOW `limits.max_search_results`, NOT BE A CONSTANT OF ITS
+///   OWN. It was fixed at 200, so raising the result cap to 300 still put 200
+///   in the first frame and left the rest behind the "More" button — the server
+///   had genuinely found 300 and the user saw 200, with nothing in the logs to
+///   say why.
+///
+/// A stock Lugdunum sends its whole answer in one frame: measured at 309
+/// records in a single 20399-byte OP_SEARCHRESULT. eMule shows the "More"
+/// button only when the trailing byte says more remain, so one frame is both
+/// what the reference does and what a client expects.
+pub fn search_page_size(state: &ServerState) -> usize {
+    (state.live_cfg.load().limits.max_search_results as usize).clamp(1, SEARCH_PAGE_HARD_MAX)
+}
 
 /// Build one SEARCHRESULT frame for a page of results, and report whether
 /// more results remain after this page.
@@ -248,7 +436,10 @@ pub fn build_search_result_page(
         if size_hi > 0 {
             tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
         }
-        tags.push(Tag::byte(FT_SOURCES, TagValue::U32(file.sources.len() as u32)));
+        tags.push(Tag::byte(
+            FT_SOURCES,
+            TagValue::U32(file.sources.len() as u32),
+        ));
         tags.push(Tag::byte(
             FT_COMPLETE_SOURCES,
             TagValue::U32(file.complete_source_count()),
@@ -288,7 +479,13 @@ mod pagination_and_largefile_tests {
             hash: [0u8; 16],
             size,
             name: name.into(),
-            sources: vec![crate::state::Source::new([1u8; 16], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, true)].into(),
+            sources: vec![crate::state::Source::new(
+                [1u8; 16],
+                IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                4662,
+                true,
+            )]
+            .into(),
             last_seen: 0,
             alive: true,
         }
@@ -328,7 +525,11 @@ mod pagination_and_largefile_tests {
         let page = vec![entry("a", 1), entry("b", 2)];
         // has_more = true → trailing byte 1
         let f = build_search_result_page(&page, true);
-        assert_eq!(*f.payload.last().unwrap(), 1, "has_more should set trailing byte");
+        assert_eq!(
+            *f.payload.last().unwrap(),
+            1,
+            "has_more should set trailing byte"
+        );
         // has_more = false → trailing byte 0
         let f = build_search_result_page(&page, false);
         assert_eq!(*f.payload.last().unwrap(), 0, "no more → trailing byte 0");

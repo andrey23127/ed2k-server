@@ -40,7 +40,10 @@ pub async fn make_stream(mut stream: TcpStream, support_crypt: bool) -> Result<C
     }
 
     // Step 2: obfuscated — read the rest of the DH packet
-    info!(marker = format!("0x{marker:02x}"), "obfuscated connection — DH handshake");
+    info!(
+        marker = format!("0x{marker:02x}"),
+        "obfuscated connection — DH handshake"
+    );
 
     // Full negotiate buffer: marker(1) + A(96) + pad_len(1) + padding(0-15)
     // We need at least DH_REST_MIN more bytes after the marker.
@@ -74,7 +77,8 @@ pub async fn make_stream(mut stream: TcpStream, support_crypt: bool) -> Result<C
     let mut obf = TcpObfuscation::new(true);
 
     // Phase 1: parse client DH pubkey, produce server response
-    let server_resp = obf.negotiate(&full_buf)
+    let server_resp = obf
+        .negotiate(&full_buf)
         .map_err(|e| anyhow!("obfuscation negotiate: {e}"))?;
     stream.write_all(&server_resp).await?;
 
@@ -86,11 +90,13 @@ pub async fn make_stream(mut stream: TcpStream, support_crypt: bool) -> Result<C
     }
     ack.truncate(m);
 
-    let leftover = obf.handshake(&mut ack)
+    let leftover = obf
+        .handshake(&mut ack)
         .map_err(|e| anyhow!("obfuscation handshake: {e}"))?
         .to_vec();
 
-    let (recv_key, send_key) = obf.take_keys()
+    let (recv_key, send_key) = obf
+        .take_keys()
         .ok_or_else(|| anyhow!("keys missing after handshake"))?;
 
     info!("DH handshake complete — RC4 stream active");
@@ -98,8 +104,13 @@ pub async fn make_stream(mut stream: TcpStream, support_crypt: bool) -> Result<C
     if leftover.is_empty() {
         Ok(CryptStream::encrypted(stream, recv_key, send_key))
     } else {
-        debug!(leftover = leftover.len(), "client pipelined frame after ack");
-        Ok(CryptStream::encrypted_with_prefix(stream, recv_key, send_key, leftover))
+        debug!(
+            leftover = leftover.len(),
+            "client pipelined frame after ack"
+        );
+        Ok(CryptStream::encrypted_with_prefix(
+            stream, recv_key, send_key, leftover,
+        ))
     }
 }
 
@@ -220,7 +231,11 @@ mod tests {
     async fn end_to_end_handshake_minimal_hello() {
         // pad_len = 0: the 97-byte hello the interop report describes.
         let payload = run_handshake(0, false).await;
-        assert_eq!(&payload[..3], &[0xE3, 0x05, 0x00], "eD2k frame must survive");
+        assert_eq!(
+            &payload[..3],
+            &[0xE3, 0x05, 0x00],
+            "eD2k frame must survive"
+        );
     }
 
     #[tokio::test]

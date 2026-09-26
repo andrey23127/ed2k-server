@@ -104,6 +104,38 @@ pub fn resolve_seckey(cfg: &Config) -> [u8; 16] {
 }
 
 #[cfg(test)]
+mod ipv6_tests {
+    #[test]
+    fn the_udp_sentinel_gate_is_the_query_address_family() {
+        // UDP has no session, so there is nothing else to gate on. A datagram
+        // that arrived over IPv6 came from a peer that necessarily speaks it; a
+        // peer on IPv4 might be anything.
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+        let v6 = SocketAddr::new(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()), 4665);
+        let v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4665);
+        assert!(v6.is_ipv6());
+        assert!(!v4.is_ipv6());
+        // An IPv4-mapped address must NOT be treated as an IPv6 peer. The TCP
+        // path normalises those away before anything sees them; here the socket
+        // is v6-only, so one can only appear if that ever changes.
+        let mapped: Ipv6Addr = "::ffff:1.2.3.4".parse().unwrap();
+        assert!(mapped.to_ipv4_mapped().is_some(), "still an IPv4 peer");
+    }
+
+    #[test]
+    fn one_file_block_per_datagram_is_what_makes_the_sentinel_safe() {
+        // A legacy client walks a chained datagram with a fixed count*6 stride,
+        // so a single 22-byte record inside one desynchronises everything after
+        // it. This reply path sends one hash per datagram, which is the whole
+        // reason the sentinel is permitted here at all. If multiple hashes are
+        // ever batched into one datagram, the sentinel must be disabled for it.
+        const CLASSIC_RECORD: usize = 4 + 2;
+        const SENTINEL_RECORD: usize = 4 + 2 + 16;
+        assert_eq!(SENTINEL_RECORD - CLASSIC_RECORD, 16);
+    }
+}
+
+#[cfg(test)]
 mod searchreq_tests {
     use super::*;
 
@@ -150,7 +182,10 @@ mod searchreq_tests {
             0x01, 0x0a, 0x00, b'd', b'a', b'm', b'p', b'y', b'r', b' ', b'3', b'1', b'3',
         ];
         let tree = strip_searchreq3_tags(framed).expect("tag set must strip");
-        assert_eq!(tree[0], 0x01, "what remains starts a string node, as 0x98 does");
+        assert_eq!(
+            tree[0], 0x01,
+            "what remains starts a string node, as 0x98 does"
+        );
         assert_eq!(
             u16::from_le_bytes([tree[1], tree[2]]) as usize,
             tree.len() - 3,
@@ -250,11 +285,64 @@ impl UdpServer {
         let socket = UdpSocket::bind(&bind_addr).await?;
         tracing::info!(addr = %bind_addr, "UDP listener ready");
         let socket = Arc::new(socket);
-        state.udp_sockets.insert(cfg.network.udp_port(), Arc::clone(&socket));
+        state
+            .udp_sockets
+            .insert(cfg.network.udp_port(), Arc::clone(&socket));
         Ok(Self {
             cfg,
             state,
             socket,
+            seckey,
+        })
+    }
+
+    /// Bind the IPv6 UDP listener, on the same port as the IPv4 one.
+    ///
+    /// A second socket rather than a dual-stack one, for the same reason the TCP
+    /// side uses two: the IPv4 path stays exactly as it was, and a host without
+    /// IPv6 loses nothing.
+    ///
+    /// ⚠ NOT registered in `state.udp_sockets`. That map is keyed by PORT alone
+    ///   and is what gossip and the obfuscated reply path use to find "the
+    ///   socket for port N" — inserting a v6 socket under the same port would
+    ///   REPLACE the v4 one, and server-to-server traffic that must originate
+    ///   from the v4 address would start leaving the v6 socket instead. The web
+    ///   UI reads the same map to report which ports are bound.
+    ///
+    ///   The consequence is deliberate and worth stating: this listener answers
+    ///   queries that arrive on it, and nothing else in the server sends
+    ///   through it. Gossip stays IPv4-only, which is correct — the server list
+    ///   format carries 4-byte addresses and has nowhere to put a v6 one.
+    pub async fn bind_v6(
+        cfg: Arc<Config>,
+        state: Arc<ServerState>,
+        port: u16,
+        seckey: [u8; 16],
+    ) -> Result<Self> {
+        let bind_addr = format!("[{}]:{}", cfg.network.listen_ip6, port);
+        // ⚠ IPV6_V6ONLY, same reason as the TCP listener. On Linux
+        //   `net.ipv6.bindv6only` defaults to 0, so a socket on `[::]` also
+        //   claims the IPv4 wildcard for that port — and the IPv4 UDP listener
+        //   already holds it. Without the flag this bind fails with EADDRINUSE
+        //   and, because the failure is non-fatal, the server runs looking
+        //   healthy while answering nothing over IPv6.
+        let socket = {
+            use socket2::{Domain, Protocol, Socket, Type};
+            let sa: std::net::SocketAddr = bind_addr
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad IPv6 bind address {bind_addr}: {e}"))?;
+            let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+            sock.set_only_v6(true)?;
+            sock.set_reuse_address(true)?;
+            sock.set_nonblocking(true)?;
+            sock.bind(&sa.into())?;
+            UdpSocket::from_std(std::net::UdpSocket::from(sock))?
+        };
+        tracing::info!(addr = %bind_addr, "IPv6 UDP listener ready");
+        Ok(Self {
+            cfg,
+            state,
+            socket: Arc::new(socket),
             seckey,
         })
     }
@@ -293,11 +381,16 @@ impl UdpServer {
         loop {
             let (len, peer) = match self.socket.recv_from(&mut buf).await {
                 Ok(x) => x,
-                Err(e) => { warn!(error = %e, "UDP recv error"); continue; }
+                Err(e) => {
+                    warn!(error = %e, "UDP recv error");
+                    continue;
+                }
             };
 
             let data = &buf[..len];
-            if data.len() < 2 { continue; }
+            if data.len() < 2 {
+                continue;
+            }
 
             // Drop datagrams from temporarily-banned flood bots BEFORE any
             // parsing, crypto, or response. One DashMap lookup; the bot's entire
@@ -352,11 +445,15 @@ impl UdpServer {
                 // Obfuscated path.
                 let sender_ip_le = match peer.ip() {
                     std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
-                    _ => { continue; } // eD2k is IPv4-only
+                    _ => {
+                        continue;
+                    } // eD2k is IPv4-only
                 };
                 let sender_v4 = match peer.ip() {
                     std::net::IpAddr::V4(v4) => v4,
-                    _ => { continue; }
+                    _ => {
+                        continue;
+                    }
                 };
 
                 // Try multiple key+formula combinations to decode the packet.
@@ -380,7 +477,11 @@ impl UdpServer {
                 use crate::proto::server_obfuscation::{decode, decode_with_obfbyte, ip_obfuscate};
 
                 #[derive(Clone, Copy, PartialEq)]
-                enum Formula { Plain, ObfA5, Obf6B }
+                enum Formula {
+                    Plain,
+                    ObfA5,
+                    Obf6B,
+                }
                 fn try_decode(data: &[u8], key: u32, f: Formula) -> Option<Vec<u8>> {
                     let inner = match f {
                         Formula::Plain => decode(data, key)?,
@@ -389,7 +490,9 @@ impl UdpServer {
                     };
                     if inner.len() >= 2 && inner[0] == PROTO_EDONKEY {
                         Some(inner)
-                    } else { None }
+                    } else {
+                        None
+                    }
                 }
 
                 let last = self.state.obf_decode_cache.get(&sender_v4).map(|e| *e);
@@ -408,7 +511,10 @@ impl UdpServer {
                 if decoded_opt.is_none() {
                     let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
                     let keys_to_try: [Option<u32>; 3] = [
-                        self.state.our_sent_random_parts.get(&sender_v4).map(|r| r.0),
+                        self.state
+                            .our_sent_random_parts
+                            .get(&sender_v4)
+                            .map(|r| r.0),
                         self.state.seed_server_keys.get(&sender_v4).map(|r| *r),
                         Some(ip_obf_key),
                     ];
@@ -423,7 +529,9 @@ impl UdpServer {
                                     Formula::ObfA5 => 1u8,
                                     Formula::Obf6B => 2u8,
                                 };
-                                if lk == k && lf == fnum { continue; }
+                                if lk == k && lf == fnum {
+                                    continue;
+                                }
                             }
                             if let Some(inner) = try_decode(data, k, f) {
                                 decoded_opt = Some(inner);
@@ -476,13 +584,9 @@ impl UdpServer {
                         // which is also what lets a 4..=9 byte frame reach here.
                         if on_obfping_port && (4..=18).contains(&data.len()) {
                             // Extract peer's random_part (first 4 bytes, LE).
-                            let random_part = u32::from_le_bytes([
-                                data[0], data[1], data[2], data[3],
-                            ]);
-                            if let Err(e) = self
-                                .reply_to_obf_ping(peer, random_part)
-                                .await
-                            {
+                            let random_part =
+                                u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                            if let Err(e) = self.reply_to_obf_ping(peer, random_part).await {
                                 debug!(ip = %peer.ip(), error = %e,
                                        "failed to send OBF ping reply");
                             } else {
@@ -605,10 +709,26 @@ impl UdpServer {
         // gossip server_list, preventing mldonkey/eMule UDP-only clients that
         // skip TCP login from appearing as "peer servers".
         match opcode {
-            OP_GLOB_GETSOURCES | OP_GLOB_GETSOURCES2
-            | OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 | OP_GLOB_SEARCHREQ3 => {
+            OP_GLOB_GETSOURCES | OP_GLOB_GETSOURCES2 | OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2
+            | OP_GLOB_SEARCHREQ3 => {
+                // ⚠ IPv4 ONLY, and it is worth being explicit about what an
+                //   IPv6 querier therefore escapes: the bot-rate detector, the
+                //   recent-client record that keeps a UDP-only client out of the
+                //   gossip server list, and the observed-port record used for
+                //   hole punching. All three are keyed on `Ipv4Addr` through
+                //   several structures each.
+                //
+                //   Left as is deliberately for now. Widening those keys is a
+                //   change to the bot detector and to the gossip filter — two
+                //   things that took real work to get right — and it should be
+                //   done on its own, measured, not folded into the IPv6 wiring.
+                //   Until then an IPv6 querier is unmetered, which is acceptable
+                //   while v6 clients number in the handful and every one of them
+                //   is also subject to the per-connection limits on TCP.
                 if let std::net::IpAddr::V4(v4) = peer.ip() {
-                    self.state.recent_client_ips.insert(v4, std::time::Instant::now());
+                    self.state
+                        .recent_client_ips
+                        .insert(v4, std::time::Instant::now());
                     // Bot detector: track query rate and interval patterns.
                     crate::server::bot_detector::record_query(&self.state, v4);
                     // NAT-traversal: remember the EXTERNAL (post-NAT) UDP port this
@@ -617,15 +737,17 @@ impl UdpServer {
                     // building OP_LOWID_HOLEPUNCH_INFO, so the peer punches the port
                     // the NAT actually opened. Cone NATs reuse this port toward the
                     // peer; symmetric NATs don't, and there we fall back gracefully.
-                    self.state.observed_udp_ports.insert(v4, (peer.port(), std::time::Instant::now()));
+                    self.state
+                        .observed_udp_ports
+                        .insert(v4, (peer.port(), std::time::Instant::now()));
                 }
             }
             _ => {}
         }
 
         match opcode {
-            OP_GLOB_GETSOURCES   => self.handle_getsources_single(payload, peer, obf).await,
-            OP_GLOB_GETSOURCES2  => self.handle_getsources_multi(payload, peer, obf).await,
+            OP_GLOB_GETSOURCES => self.handle_getsources_single(payload, peer, obf).await,
+            OP_GLOB_GETSOURCES2 => self.handle_getsources_multi(payload, peer, obf).await,
             OP_SERVER_NATT_KEEPALIVE => {
                 // NAT-traversal keepalive: payload is the sender's 16-byte
                 // userhash. Record the EXTERNAL UDP port we saw it arrive from
@@ -662,31 +784,29 @@ impl UdpServer {
                         "NAT-T keepalive received"
                     );
                     if let std::net::IpAddr::V4(v4) = peer.ip() {
-                        self.state.observed_udp_ports.insert(v4, (peer.port(), std::time::Instant::now()));
+                        self.state
+                            .observed_udp_ports
+                            .insert(v4, (peer.port(), std::time::Instant::now()));
                     }
                 }
                 Ok(())
             }
-            OP_GLOB_SERVSTATREQ  => self.handle_servstat(payload, peer, obf).await,
+            OP_GLOB_SERVSTATREQ => self.handle_servstat(payload, peer, obf).await,
             // 0x97 = GLOBSERVSTATRES — seed server responding to our keepalive ping
             0x97 => self.handle_pingreply(payload, peer).await,
-            OP_SERVER_DESC_REQ   => self.handle_server_desc(payload, peer, obf).await,
+            OP_SERVER_DESC_REQ => self.handle_server_desc(payload, peer, obf).await,
             // 0x92 and 0x98 carry the same payload — a bare expression tree. See
             // the note on OP_GLOB_SEARCHREQ2.
-            OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 => {
-                self.handle_search(payload, peer, obf).await
-            }
+            OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 => self.handle_search(payload, peer, obf).await,
             // 0x90 carries a leading tag set before the expression tree; 0x98
             // does not. See strip_searchreq3_tags.
-            OP_GLOB_SEARCHREQ3   => {
-                match strip_searchreq3_tags(payload) {
-                    Some(tree) => self.handle_search(tree, peer, obf).await,
-                    None => {
-                        debug!(ip = %peer.ip(), "0x90: malformed tag set — dropping");
-                        Ok(())
-                    }
+            OP_GLOB_SEARCHREQ3 => match strip_searchreq3_tags(payload) {
+                Some(tree) => self.handle_search(tree, peer, obf).await,
+                None => {
+                    debug!(ip = %peer.ip(), "0x90: malformed tag set — dropping");
+                    Ok(())
                 }
-            }
+            },
             // 0xA1 SERVER_LIST_RES — response to our gossip SERVER_LIST_REQ.
             // Seed servers send this back after we query them on startup.
             0xA1 => self.handle_server_list_res(payload, peer).await,
@@ -698,7 +818,8 @@ impl UdpServer {
                 // We just note they exist and send our list back.
                 // (Full ServerAdd logic would add them to our peer table — MVP: skip)
                 let data = crate::server::gossip::build_server_list_res(&self.state).await;
-                if data.len() > 3 { // only send if we have servers
+                if data.len() > 3 {
+                    // only send if we have servers
                     self.reply(&data, peer, obf).await?;
                     debug!(ip = %peer.ip(), "server_list_req(0xA0): registered + sent list");
                 }
@@ -793,8 +914,12 @@ impl UdpServer {
         while i + 20 <= payload.len() && hashes.len() < MAX_BATCH {
             let mut hash = [0u8; 16];
             hash.copy_from_slice(&payload[i..i + 16]);
-            let size_lo =
-                u32::from_le_bytes([payload[i + 16], payload[i + 17], payload[i + 18], payload[i + 19]]);
+            let size_lo = u32::from_le_bytes([
+                payload[i + 16],
+                payload[i + 17],
+                payload[i + 18],
+                payload[i + 19],
+            ]);
             i += 20;
             if size_lo == 0 {
                 // Large-file sentinel: a u64 follows. A truncated tail here means
@@ -869,6 +994,7 @@ impl UdpServer {
         // past the end.
         let mut entries = BytesMut::new();
         let mut emitted: u8 = 0;
+        let v6_query = self.state.live_cfg.load().network.ipv6_publish_sources && peer.is_ipv6();
         for (user_hash, ip, port) in &sources {
             // Encode the source ID the way eD2k clients expect — identical to
             // the TCP path in server/get_sources.rs:
@@ -882,6 +1008,45 @@ impl UdpServer {
             // TCP path resolved it. The same client was therefore anonymised on
             // one channel and exposed on the other — and, just as importantly,
             // looked like a HighID peer that nobody could ever reach.
+            // ── IPv6 sentinel over UDP ───────────────────────────────────
+            //
+            // Gated on the QUERY'S OWN ADDRESS FAMILY, not on any capability
+            // flag. UDP has no session, so there is nothing else to gate on: a
+            // datagram that arrived over IPv6 came from a peer that necessarily
+            // speaks it, and a peer on IPv4 might be anything.
+            //
+            // ⚠ AND ONLY BECAUSE THIS REPLY CARRIES ONE FILE BLOCK. A legacy
+            //   client walking a chained datagram steps `count * 6` bytes to
+            //   find the next block, so a record 16 bytes longer desynchronises
+            //   everything after it — and unlike TCP there is no capability
+            //   state to gate on. This path sends exactly one hash per
+            //   datagram, which is what makes the sentinel safe here. If
+            //   multiple hashes are ever batched into one datagram, the sentinel
+            //   must be disabled for that datagram.
+            let v6 = if v6_query {
+                self.state
+                    .client_ipv6
+                    .get(user_hash)
+                    .map(|e| *e.value())
+                    .filter(|a| crate::server::login::is_publishable_ipv6(*a))
+                    .filter(|_| {
+                        !self
+                            .state
+                            .clients
+                            .get(user_hash)
+                            .map(|h| h.is_high_id)
+                            .unwrap_or(false)
+                    })
+            } else {
+                None
+            };
+            if v6.is_some() {
+                entries.put_u32_le(crate::server::get_sources::IPV6_SOURCE_SENTINEL);
+                entries.put_u16_le(*port);
+                entries.put_slice(&v6.unwrap().octets());
+                emitted += 1;
+                continue;
+            }
             let id = match self.state.clients.get(user_hash) {
                 Some(handle) if !handle.is_high_id => handle.assigned_id,
                 _ => {
@@ -944,22 +1109,26 @@ impl UdpServer {
             0
         };
 
-        let users    = self.state.client_count() as u32;
-        let files    = self.state.file_count() as u32;
-        let lowid    = self.state.lowid_count() as u32;
+        let users = self.state.client_count() as u32;
+        let files = self.state.file_count() as u32;
+        let lowid = self.state.lowid_count() as u32;
         // Read limits from live_cfg (hot-reloadable via /api/config).
         let live = self.state.live_cfg.load();
         let max_conn = live.limits.max_clients;
-        let soft     = live.limits.soft_limit_files;
-        let hard     = live.limits.hard_limit_files;
+        let soft = live.limits.soft_limit_files;
+        let hard = live.limits.hard_limit_files;
         // Same mask as ST_UDPFLAGS at login — the two must not diverge, or a
         // client sees one set of capabilities on connect and another on ping.
-        let pingflg: u32 = crate::proto::opcodes::SERVER_UDP_FLAGS;
+        let mut pingflg: u32 = crate::proto::opcodes::SERVER_UDP_FLAGS;
+        if live.network.ipv6_publish_sources {
+            // Same bit and same meaning as in OP_IDCHANGE, in the UDP flags word
+            // this time. See SRV_TCPFLG_IPV6 for the direction asymmetry.
+            pingflg |= crate::server::login::SRV_TCPFLG_IPV6;
+        }
 
         // Check for server-to-server magic: challenge bytes [2:3] == 0x55AA
         // (payload[2] == 0xAA, payload[3] == 0x55 in LE)
-        let is_server_probe = payload.len() >= 4
-            && payload[2] == 0xAA && payload[3] == 0x55;
+        let is_server_probe = payload.len() >= 4 && payload[2] == 0xAA && payload[3] == 0x55;
 
         let mut out = BytesMut::new();
         out.put_u8(PROTO_EDONKEY);
@@ -1026,14 +1195,16 @@ impl UdpServer {
                 std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
                 _ => 0,
             };
-            let our_server_key = crate::proto::server_obfuscation::ip_obfuscate(
-                &self.seckey, peer_ip_le,
-            );
+            let our_server_key =
+                crate::proto::server_obfuscation::ip_obfuscate(&self.seckey, peer_ip_le);
             out.put_u32_le(our_server_key);
 
             // Trailer: our own public IP (network byte order). Matches what
             // captured Lugdunum 0x97 extended replies put here.
-            let our_ip: std::net::Ipv4Addr = self.cfg.server.this_ip
+            let our_ip: std::net::Ipv4Addr = self
+                .cfg
+                .server
+                .this_ip
                 .parse()
                 .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
 
@@ -1110,8 +1281,10 @@ impl UdpServer {
                 let send_socket = match self.state.udp_sockets.get(&our_obf_port) {
                     Some(s) => Arc::clone(&s),
                     None => {
-                        debug!(port = our_obf_port,
-                               "no socket registered for portUDPobf — skipping obf 0x97 follow-up");
+                        debug!(
+                            port = our_obf_port,
+                            "no socket registered for portUDPobf — skipping obf 0x97 follow-up"
+                        );
                         return Ok(());
                     }
                 };
@@ -1152,28 +1325,27 @@ impl UdpServer {
     /// plain server probe: 8 stat fields + portUDPobf + portTCPobf +
     /// ServerKey + our_ip. That gives the peer everything it needs to mark
     /// us as a verified obfuscation-capable server.
-    async fn reply_to_obf_ping(
-        &self,
-        peer: SocketAddr,
-        random_part: u32,
-    ) -> Result<()> {
+    async fn reply_to_obf_ping(&self, peer: SocketAddr, random_part: u32) -> Result<()> {
         // Build the inner eD2k 0x97 GLOBSERVSTATRES message (same fields as
         // handle_servstat's extended form).
-        let users    = self.state.client_count() as u32;
-        let files    = self.state.file_count() as u32;
-        let lowid    = self.state.lowid_count() as u32;
+        let users = self.state.client_count() as u32;
+        let files = self.state.file_count() as u32;
+        let lowid = self.state.lowid_count() as u32;
         // Read limits from live_cfg (hot-reloadable via /api/config).
         let live = self.state.live_cfg.load();
         let max_conn = live.limits.max_clients;
-        let soft     = live.limits.soft_limit_files;
-        let hard     = live.limits.hard_limit_files;
+        let soft = live.limits.soft_limit_files;
+        let hard = live.limits.hard_limit_files;
         let pingflg: u32 = 0x0000_17FB;
 
         // Use the peer's random_part as the implicit challenge — Lugdunum
         // doesn't carry a separate challenge in the OBF ping wire format.
         let challenge = random_part;
 
-        let our_ip: std::net::Ipv4Addr = self.cfg.server.this_ip
+        let our_ip: std::net::Ipv4Addr = self
+            .cfg
+            .server
+            .this_ip
             .parse()
             .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
         // ServerKey: IPObfuscate(my_seckey, PEER_ip) — peer-specific, see
@@ -1184,9 +1356,8 @@ impl UdpServer {
             std::net::IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
             _ => 0,
         };
-        let our_server_key = crate::proto::server_obfuscation::ip_obfuscate(
-            &self.seckey, peer_ip_le,
-        );
+        let our_server_key =
+            crate::proto::server_obfuscation::ip_obfuscate(&self.seckey, peer_ip_le);
 
         let mut inner = BytesMut::new();
         inner.put_u8(PROTO_EDONKEY);
@@ -1224,7 +1395,10 @@ impl UdpServer {
             nanos.wrapping_mul(0x9E37_79B9).wrapping_add(random_part)
         };
         let wire = crate::proto::server_obfuscation::encode_with_obfbyte(
-            &inner, random_part, rng_seed, 0xa5,
+            &inner,
+            random_part,
+            rng_seed,
+            0xa5,
         );
 
         self.socket.send_to(&wire, peer).await?;
@@ -1237,7 +1411,9 @@ impl UdpServer {
     /// The seed is responding to our GLOBSERVSTATREQ keepalive/probe.
     /// We update our knowledge of the seed's stats (users/files) for the server list.
     async fn handle_pingreply(&self, payload: &[u8], from: SocketAddr) -> Result<()> {
-        if payload.len() < 12 { return Ok(()); }
+        if payload.len() < 12 {
+            return Ok(());
+        }
         let users = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
         let files = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
 
@@ -1245,7 +1421,9 @@ impl UdpServer {
         // CLIENTS never reply to 0x96 ping). Mark verified so the periodic
         // cleanup won't evict it.
         if let std::net::IpAddr::V4(v4) = from.ip() {
-            self.state.verified_servers.insert(v4, std::time::Instant::now());
+            self.state
+                .verified_servers
+                .insert(v4, std::time::Instant::now());
             // Also record the exact ip:TCP-port this proves. We probed tcp_port+4 and
             // the reply comes from that UDP port, so tcp = from.port() - 4 (the UDP =
             // TCP+4 convention). Only ip:port pairs verified this way are handed out,
@@ -1267,9 +1445,8 @@ impl UdpServer {
         // encrypt outbound obfuscated UDP to this seed. Store it so gossip
         // can switch from plain to obfuscated for this peer.
         if payload.len() >= 40 {
-            let server_key = u32::from_le_bytes([
-                payload[36], payload[37], payload[38], payload[39],
-            ]);
+            let server_key =
+                u32::from_le_bytes([payload[36], payload[37], payload[38], payload[39]]);
             if let std::net::IpAddr::V4(v4) = from.ip() {
                 let previous = self.state.seed_server_keys.insert(v4, server_key);
                 if previous != Some(server_key) {
@@ -1319,8 +1496,9 @@ impl UdpServer {
         // lands (or after its TTL expires while the client is still connected),
         // but it now runs only when the cheap check misses.
         let sender_is_client = self.state.recent_client_ips.contains_key(&sender_v4)
-            || self.state.clients.iter().any(|e| {
-                match e.ip { std::net::IpAddr::V4(v4) => v4 == sender_v4, _ => false }
+            || self.state.clients.iter().any(|e| match e.ip {
+                std::net::IpAddr::V4(v4) => v4 == sender_v4,
+                _ => false,
             });
         if sender_is_client {
             debug!(ip = %from.ip(),
@@ -1370,7 +1548,9 @@ impl UdpServer {
         let client_ips: std::collections::HashSet<std::net::Ipv4Addr> = {
             let mut set = std::collections::HashSet::new();
             for e in self.state.clients.iter() {
-                if let std::net::IpAddr::V4(v4) = e.ip { set.insert(v4); }
+                if let std::net::IpAddr::V4(v4) = e.ip {
+                    set.insert(v4);
+                }
             }
             for e in self.state.recent_client_ips.iter() {
                 set.insert(*e.key());
@@ -1379,14 +1559,21 @@ impl UdpServer {
         };
         for _ in 0..count {
             let ip = std::net::Ipv4Addr::new(
-                payload[pos], payload[pos+1], payload[pos+2], payload[pos+3]
+                payload[pos],
+                payload[pos + 1],
+                payload[pos + 2],
+                payload[pos + 3],
             );
-            let port = u16::from_le_bytes([payload[pos+4], payload[pos+5]]);
+            let port = u16::from_le_bytes([payload[pos + 4], payload[pos + 5]]);
             pos += 6;
             // Reject obvious garbage: unspecified, loopback, private RFC1918,
             // and multicast IPs cannot be public eD2k servers.
-            if port == 0 || ip.is_unspecified() || ip.is_loopback()
-                || ip.is_private() || ip.is_multicast() || ip.is_broadcast()
+            if port == 0
+                || ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_multicast()
+                || ip.is_broadcast()
             {
                 continue;
             }
@@ -1424,11 +1611,17 @@ impl UdpServer {
             }
             if !list.contains(&s) {
                 list.push(s);
-                self.state.server_list_added_at.insert(*s.ip(), std::time::Instant::now());
+                self.state
+                    .server_list_added_at
+                    .insert(*s.ip(), std::time::Instant::now());
             }
         }
         if list.len() > before {
-            info!(total = list.len(), added = list.len() - before, "gossip: server list updated");
+            info!(
+                total = list.len(),
+                added = list.len() - before,
+                "gossip: server list updated"
+            );
         }
 
         Ok(())
@@ -1466,8 +1659,10 @@ impl UdpServer {
     ) -> Result<()> {
         // Read server name/desc/version from live_cfg (hot-reloadable).
         let live = self.state.live_cfg.load();
-        let version_str = format!("{}.{}", live.server.version_major,
-                                            live.server.version_minor);
+        let version_str = format!(
+            "{}.{}",
+            live.server.version_major, live.server.version_minor
+        );
         let name = live.server.name.clone();
         let desc = live.server.desc.clone();
 
@@ -1519,21 +1714,23 @@ impl UdpServer {
         // challenge set to 0xF0FF (INV_SERV_DESC_LEN), so they take the NEW path and
         // get an order-independent taglist. Only legacy clients that don't send that
         // marker fall back to the OLD format.
-        let low2 = u16::from_le_bytes([payload.get(0).copied().unwrap_or(0),
-                                        payload.get(1).copied().unwrap_or(0)]);
-        let is_new_format_request = payload.len() >= 4
-            && (low2 == 0xF0FF || challenge == 0x7c7d7e7f);
+        let low2 = u16::from_le_bytes([
+            payload.first().copied().unwrap_or(0),
+            payload.get(1).copied().unwrap_or(0),
+        ]);
+        let is_new_format_request =
+            payload.len() >= 4 && (low2 == 0xF0FF || challenge == 0x7c7d7e7f);
 
         if is_new_format_request {
             // ─── NEW FORMAT ONLY (taglist with version; parsed by tag name) ──────
             let mut new_pkt = BytesMut::new();
             new_pkt.put_u8(PROTO_EDONKEY);
             new_pkt.put_u8(OP_SERVER_DESC_RES);
-            new_pkt.put_u32_le(challenge);   // echo the exact challenge
-            new_pkt.put_u32_le(3u32);        // tag_count
-            write_old_str_tag(&mut new_pkt, ST_SERVERNAME,  &name);
+            new_pkt.put_u32_le(challenge); // echo the exact challenge
+            new_pkt.put_u32_le(3u32); // tag_count
+            write_old_str_tag(&mut new_pkt, ST_SERVERNAME, &name);
             write_old_str_tag(&mut new_pkt, ST_DESCRIPTION, &desc);
-            write_old_str_tag(&mut new_pkt, ST_VERSION,     &version_str);
+            write_old_str_tag(&mut new_pkt, ST_VERSION, &version_str);
             self.reply(&new_pkt, peer, obf).await?;
         } else {
             // ─── OLD FORMAT ONLY (legacy clients: <name_len><name><desc_len><desc>)
@@ -1574,6 +1771,20 @@ impl UdpServer {
                 return Ok(());
             }
         };
+        // Same unknown-word rewrite as the TCP path, applied before anything
+        // else reads the tree. If only one channel dropped unknown words, the
+        // same query would return results over TCP and nothing over UDP.
+        let tree = if self.state.live_cfg.load().limits.search_drop_unknown_words {
+            let (t, dropped) = crate::proto::search::drop_unknown_words(&tree, &|tok: &str| {
+                self.state.keyword_index.contains_token(tok)
+            });
+            if !dropped.is_empty() {
+                self.state.note_search_words_dropped();
+            }
+            t
+        } else {
+            tree
+        };
 
         // Same splitting as the TCP path — see server/search.rs. The two must
         // tokenize identically, or a query answered by one channel and not the
@@ -1588,35 +1799,90 @@ impl UdpServer {
             .filter(|t| t != "*" && t != "**")
             .collect();
 
-        if tokens.is_empty() { return Ok(()); }
+        if tokens.is_empty() {
+            return Ok(());
+        }
 
-        let candidate_ids = self.state.keyword_index.find_intersection(&tokens);
+        // Grouped exactly as the TCP path does. The two must not disagree, or a
+        // query answered by one channel and not the other becomes a
+        // protocol-dependent result set.
+        // ⚠ A GROUP OF ONE EXPANDS INTO SEVERAL GROUPS, NOT INTO ONE BIGGER GROUP.
+        //   Many clients send the whole query as a single Term node — "ubuntu linux
+        //   bible" — and `tokenize_search_term` splits it into three tokens that
+        //   must ALL match. Letting those three sit in one group turns them into
+        //   alternatives, which is the opposite of what #10 established, and the
+        //   candidate set becomes the UNION of three common words over the whole
+        //   index instead of their intersection.
+        //
+        //   Results stayed correct, because `evaluate` still applies the real
+        //   condition, and that is what made it invisible: the only symptom was the
+        //   server going from 3% CPU to 92% on a 1.6M-file index.
+        //
+        //   A genuine OR group (more than one element) is different: its branches
+        //   are alternatives by construction, so its tokens are unioned as before.
+        // Shared with the TCP path — see `candidate_groups`.
+        let groups: Vec<Vec<String>> = crate::proto::search::candidate_groups(&tree);
+        let candidate_ids = self.state.keyword_index.find_grouped(&groups);
+
+        // Ranked by source count, exactly as the TCP path does.
+        //
+        // UDP returns far fewer results (UDP_MAX_SEARCH_RESULTS), which makes
+        // the ordering matter MORE, not less: taking the first ten candidates
+        // in FileId order means the ten oldest matching files, every time. The
+        // two channels must also agree — a result set that depends on which
+        // protocol asked is worse than either ordering on its own.
+        let ranked: Vec<crate::state::file_id::FileRecord> = {
+            let live = self.state.live_cfg.load();
+            let rank_scan = (live.limits.search_rank_scan as usize).max(UDP_MAX_SEARCH_RESULTS);
+            let mut heap: std::collections::BinaryHeap<crate::server::search::UdpRanked> =
+                std::collections::BinaryHeap::with_capacity(UDP_MAX_SEARCH_RESULTS + 1);
+            let mut examined = 0usize;
+            for fid in candidate_ids {
+                if examined >= rank_scan {
+                    self.state.note_search_rank_capped();
+                    break;
+                }
+                examined += 1;
+                let entry = match self.state.file_slab.with_record(fid, |r| r.clone()) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                // Full filter, not just the hash lists — see
+                // ContentFilter::is_withheld. The UDP and TCP search paths must
+                // withhold the same records, or a file merely moves from one to
+                // the other.
+                if self.state.filter.is_withheld(&entry.hash, &entry.name) {
+                    continue;
+                }
+                // Skip orphans (no live source). See src/server/search.rs for
+                // the full rationale — orphans are useless to return.
+                if entry.sources.is_empty() {
+                    continue;
+                }
+                // Folded, exactly as the TCP path does. The two must agree or a
+                // query answered by one channel and not the other becomes a
+                // protocol-dependent result set.
+                let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
+                if !evaluate(&tree, &name_lower, entry.size) {
+                    continue;
+                }
+                heap.push(crate::server::search::UdpRanked {
+                    sources: entry.sources.len() as u32,
+                    id: fid,
+                    rec: entry,
+                });
+                if heap.len() > UDP_MAX_SEARCH_RESULTS {
+                    heap.pop();
+                }
+            }
+            // Ord is inverted (see `Ranked` in server/search.rs), so ascending
+            // is already best first.
+            heap.into_sorted_vec().into_iter().map(|r| r.rec).collect()
+        };
 
         let mut sent = 0;
-        for fid in candidate_ids {
-            if sent >= UDP_MAX_SEARCH_RESULTS { break; }
-            // One lock, no id → hash → id round trip: with_record resolves the
-            // FileId in place. A tombstoned id yields None and is skipped.
-            let entry = match self.state.file_slab.with_record(fid, |r| r.clone()) {
-                Some(e) => e,
-                None => continue,
-            };
+        for entry in ranked {
             let hash = entry.hash;
-            // Full filter, not just the hash lists — see
-            // ContentFilter::is_withheld. The UDP and TCP search paths must
-            // withhold the same records, or a file merely moves from one to the
-            // other.
-            if self.state.filter.is_withheld(&hash, &entry.name) {
-                continue;
-            }
-            // Skip orphans (no live source). See src/server/search.rs for the
-            // full rationale — orphans are useless to return.
-            if entry.sources.is_empty() {
-                continue;
-            }
-            let name_lower = entry.name.to_lowercase();
-            if !evaluate(&tree, &name_lower, entry.size) { continue; }
-
             // One file per UDP datagram
             let mut out = BytesMut::new();
             out.put_u8(PROTO_EDONKEY);
@@ -1642,7 +1908,10 @@ impl UdpServer {
             if size_hi > 0 {
                 tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
             }
-            tags.push(Tag::byte(FT_SOURCES, TagValue::U32(entry.sources.len() as u32)));
+            tags.push(Tag::byte(
+                FT_SOURCES,
+                TagValue::U32(entry.sources.len() as u32),
+            ));
             // FT_COMPLETE_SOURCES (0x30) MUST be sent or eMule's "Complete"
             // column stays at "0% (0)" forever — the UDP search response path
             // was missing this tag before v0.9.40. Server-side we use the
@@ -1672,12 +1941,12 @@ impl UdpServer {
 
 // ─── Additional opcode constants used only by UDP ──────────────────────────
 
-const OP_GLOB_GETSOURCES:  u8 = 0x9A;
+const OP_GLOB_GETSOURCES: u8 = 0x9A;
 const OP_GLOB_GETSOURCES2: u8 = 0x94;
 const OP_GLOB_SERVSTATREQ: u8 = 0x96;
-const OP_SERVER_DESC_REQ:  u8 = 0xA2;
-const OP_GLOB_SEARCHREQ:   u8 = 0x98;
-const OP_GLOB_SEARCHREQ3:  u8 = 0x90;
+const OP_SERVER_DESC_REQ: u8 = 0xA2;
+const OP_GLOB_SEARCHREQ: u8 = 0x98;
+const OP_GLOB_SEARCHREQ3: u8 = 0x90;
 /// Middle rung of eMule's three-way UDP search ladder.
 ///
 /// Payload is IDENTICAL to `OP_GLOB_SEARCHREQ` (0x98) — a bare expression tree,
@@ -1695,12 +1964,12 @@ const OP_GLOB_SEARCHREQ3:  u8 = 0x90;
 /// each retrying the same query unanswered. Routing it to the same handler as
 /// 0x98 is the whole fix — the alternative, dropping the capability bit, would
 /// push those clients down to 0x98 and lose large-file search for no reason.
-const OP_GLOB_SEARCHREQ2:  u8 = 0x92;
+const OP_GLOB_SEARCHREQ2: u8 = 0x92;
 // NAT-traversal: client→server UDP keepalive carrying the sender's userhash.
 // Lets us record the client's external (post-NAT) UDP port for hole punching.
 const OP_SERVER_NATT_KEEPALIVE: u8 = 0x9F;
 
 const OP_GLOB_FOUNDSOURCES: u8 = 0x9B;
-const OP_GLOB_SERVSTATRES:  u8 = 0x97;
-const OP_SERVER_DESC_RES:   u8 = 0xA3;
-const OP_GLOB_SEARCHRES:    u8 = 0x99;
+const OP_GLOB_SERVSTATRES: u8 = 0x97;
+const OP_SERVER_DESC_RES: u8 = 0xA3;
+const OP_GLOB_SEARCHRES: u8 = 0x99;

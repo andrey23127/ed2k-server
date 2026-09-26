@@ -83,13 +83,12 @@ fn unrelated_name_count<S: AsRef<str>>(names: &[S]) -> usize {
 /// alias table and the CSV export so both agree on the threshold.
 fn size_contradicts_extension(name: &str, size: u64) -> bool {
     const DOC_LIKE: &[&str] = &[
-        ".pdf", ".txt", ".doc", ".docx", ".epub", ".djvu", ".chm", ".mobi",
-        ".jpg", ".jpeg", ".png", ".gif",
+        ".pdf", ".txt", ".doc", ".docx", ".epub", ".djvu", ".chm", ".mobi", ".jpg", ".jpeg",
+        ".png", ".gif",
     ];
     let l = name.to_ascii_lowercase();
     DOC_LIKE.iter().any(|e| l.ends_with(e)) && size > 50 * 1024 * 1024
 }
-
 
 /// Live-collected counters wired into hot paths. Atomic so they can be
 /// touched from any task without locks. The web handler just reads them.
@@ -112,10 +111,7 @@ impl Metrics {
     }
 
     pub fn uptime_secs(&self) -> u64 {
-        self.start
-            .get()
-            .map(|s| s.elapsed().as_secs())
-            .unwrap_or(0)
+        self.start.get().map(|s| s.elapsed().as_secs()).unwrap_or(0)
     }
 }
 
@@ -151,8 +147,8 @@ fn read_proc_stats() -> ProcStats {
             // fields[0]=state, ..., fields[11]=utime, fields[12]=stime, fields[19]=starttime
             // (all 0-indexed after the ')' split; matches /proc/[pid]/stat column offsets minus 3)
             if fields.len() > 19 {
-                s.utime_jiffies  = fields[11].parse().unwrap_or(0);
-                s.stime_jiffies  = fields[12].parse().unwrap_or(0);
+                s.utime_jiffies = fields[11].parse().unwrap_or(0);
+                s.stime_jiffies = fields[12].parse().unwrap_or(0);
                 s.starttime_jiffy = fields[19].parse().unwrap_or(0);
             }
         }
@@ -167,7 +163,7 @@ struct ProcStats {
     peak_kib: u64,
     utime_jiffies: u64,
     stime_jiffies: u64,
-    starttime_jiffy: u64,  // ticks since system boot when process started
+    starttime_jiffy: u64, // ticks since system boot when process started
     threads: u64,
 }
 
@@ -197,6 +193,7 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/", get(dashboard))
             .route("/api/status", get(api_status))
             .route("/api/stats", get(api_stats))
+            .route("/api/highid_mismatches", get(api_highid_mismatches))
             .route("/api/clients", get(api_clients))
             .route("/api/peers", get(api_peers))
             .route("/api/reload", post(api_reload))
@@ -255,6 +252,8 @@ struct StatusResp {
     /// capability (sent CT_EMULE_UDPPORTS at login = our client mod). Lets the
     /// operator watch adoption of the NAT-traversal client mod.
     natt_capable_clients: u64,
+    ipv6_clients: u64,
+    ipv6_sources: u64,
     /// How many LowID↔LowID hole punches the server has coordinated since start.
     natt_coordinated: u64,
 }
@@ -265,7 +264,8 @@ async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
         description: s.config.server.desc.clone(),
         version: format!(
             "{}.{} (ed2k-server {})",
-            s.config.server.version_major, s.config.server.version_minor,
+            s.config.server.version_major,
+            s.config.server.version_minor,
             env!("CARGO_PKG_VERSION")
         ),
         public_ip: s.cached_public_ip.clone(),
@@ -273,7 +273,10 @@ async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
         udp_port: s.config.network.udp_port(),
         uptime_seconds: s.metrics.uptime_secs(),
         client_count: s.server.clients.len() as u64,
-        low_id_count: s.server.lowid_count_cached.load(std::sync::atomic::Ordering::Relaxed) as u64,
+        low_id_count: s
+            .server
+            .lowid_count_cached
+            .load(std::sync::atomic::Ordering::Relaxed) as u64,
         file_count: s.server.file_slab.live_count() as u64,
         keyword_count: s.server.keyword_index.keyword_count() as u64,
         seckey_hex: s.seckey_hex.clone(),
@@ -281,7 +284,17 @@ async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
         incoming_seed_challenges_entries: s.server.incoming_seed_challenges.len() as u64,
         banned_bots: s.server.banned_bots.len() as u64,
         natt_capable_clients: s.server.clients.iter().filter(|c| c.natt_capable).count() as u64,
-        natt_coordinated: s.server.block_stats.get("holepunch_coordinated").map(|v| *v).unwrap_or(0),
+        // Two different questions, and both are worth watching while this is new:
+        // how many sessions could receive an inline IPv6 source record, and how
+        // many publishers actually have an address to put in one.
+        ipv6_clients: s.server.clients.iter().filter(|c| c.ipv6_capable).count() as u64,
+        ipv6_sources: s.server.client_ipv6.len() as u64,
+        natt_coordinated: s
+            .server
+            .block_stats
+            .get("holepunch_coordinated")
+            .map(|v| *v)
+            .unwrap_or(0),
     })
 }
 
@@ -298,6 +311,49 @@ struct StatsResp {
     bytes_out: u64,
     // Operation counters
     searches_total: u64,
+    /// Searches served since start, counted by the search path itself.
+    /// `searches_total` above comes from a Metrics atomic that was never wired
+    /// to the hot path; this one is the real figure.
+    searches_served: u64,
+    /// Of those, how many exhausted `limits.search_rank_scan` and were ranked
+    /// over a prefix of the candidate set rather than over all of it.
+    searches_rank_capped: u64,
+    /// The same as a percentage, which is the number worth watching: a large
+    /// share means the scan cap is deciding results often enough that keeping
+    /// source counts in the posting lists starts to pay for itself.
+    searches_rank_capped_pct: f64,
+    /// Searches that had at least one unknown word dropped rather than
+    /// returning nothing.
+    searches_words_dropped: u64,
+    /// `network.highid_verify_observe`: whether the counters below are live.
+    highid_observe_enabled: bool,
+    highid_observe_verified: u64,
+    /// Of the verified: same client, different type marker in login vs hello.
+    highid_observe_verified_marker: u64,
+    highid_observe_mismatch: u64,
+    highid_observe_no_answer: u64,
+    highid_observe_skipped: u64,
+    /// `network.highid_downgrade_on_wrong_hash`: the check is a verdict.
+    highid_downgrade_enabled: bool,
+    /// Logins given LowID because a wrong-hash mark was active for them.
+    highid_downgraded: u64,
+    /// Wrong-hash marks live now.
+    highid_marks_active: u64,
+    /// Marks dropped because the client's own hash answered again.
+    highid_marks_cleared: u64,
+    /// "reason: count" pairs, most frequent first.
+    highid_observe_reasons: String,
+    /// Of the recent wrong-hash cases (bounded buffer), how many answering
+    /// clients are connected to us RIGHT NOW from the same address — a second
+    /// client behind the same NAT, the case where HighID provably misleads.
+    highid_mismatch_same_ip: u64,
+    /// Answering client connected, but from a different address. Suggests a
+    /// client that presents different hashes, not a shared NAT.
+    highid_mismatch_other_ip: u64,
+    /// Answering client not connected to this server at all.
+    highid_mismatch_not_here: u64,
+    /// How many cases the three figures above were computed over.
+    highid_mismatch_recent: u64,
     get_sources_total: u64,
     get_sources_cache_hits: u64,
     get_sources_cache_hit_rate: f32,
@@ -320,6 +376,11 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
     // GETSOURCES cache hit rate comes from the SmartSources cache's own
     // hit/miss counters. (The Metrics::get_sources_* atomics were never wired
     // to the hot path, which is why this used to read a constant 0.0%.)
+    let (search_capped, search_served) = s.server.search_rank_stats();
+    let (mm_same, mm_other, mm_none, mm_total) = s
+        .server
+        .highid_observe
+        .classify_mismatches(&s.server.clients);
     let (gs_hits, gs_misses) = s.server.smart_sources.stats();
     let gs_total = gs_hits + gs_misses;
     let hit_rate = if gs_total > 0 {
@@ -336,6 +397,58 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         bytes_in: m.bytes_in.load(Ordering::Relaxed),
         bytes_out: m.bytes_out.load(Ordering::Relaxed),
         searches_total: m.searches_total.load(Ordering::Relaxed),
+        searches_served: search_served,
+        searches_rank_capped: search_capped,
+        searches_words_dropped: s.server.search_words_dropped_count(),
+        highid_observe_enabled: {
+            let n = &s.server.live_cfg.load().network;
+            n.highid_verify_observe || n.highid_downgrade_on_wrong_hash
+        },
+        highid_downgrade_enabled: s
+            .server
+            .live_cfg
+            .load()
+            .network
+            .highid_downgrade_on_wrong_hash,
+        highid_downgraded: s.server.highid_observe.downgraded.load(Ordering::Relaxed),
+        highid_marks_active: s.server.highid_observe.marks_active() as u64,
+        highid_marks_cleared: s
+            .server
+            .highid_observe
+            .marks_cleared
+            .load(Ordering::Relaxed),
+        highid_observe_verified: s.server.highid_observe.verified.load(Ordering::Relaxed),
+        highid_observe_verified_marker: s
+            .server
+            .highid_observe
+            .verified_marker_variant
+            .load(Ordering::Relaxed),
+        highid_observe_mismatch: s.server.highid_observe.mismatch.load(Ordering::Relaxed),
+        highid_observe_no_answer: s.server.highid_observe.no_answer.load(Ordering::Relaxed),
+        highid_observe_skipped: s.server.highid_observe.skipped_busy.load(Ordering::Relaxed),
+        highid_mismatch_same_ip: mm_same,
+        highid_mismatch_other_ip: mm_other,
+        highid_mismatch_not_here: mm_none,
+        highid_mismatch_recent: mm_total,
+        highid_observe_reasons: {
+            let mut v: Vec<(&'static str, u64)> = s
+                .server
+                .highid_observe
+                .reasons
+                .iter()
+                .map(|e| (*e.key(), *e.value()))
+                .collect();
+            v.sort_by(|a, b| b.1.cmp(&a.1));
+            v.iter()
+                .map(|(r, n)| format!("{r}: {n}"))
+                .collect::<Vec<_>>()
+                .join("; ")
+        },
+        searches_rank_capped_pct: if search_served > 0 {
+            (search_capped as f64) * 100.0 / (search_served as f64)
+        } else {
+            0.0
+        },
         get_sources_total: gs_total,
         get_sources_cache_hits: gs_hits,
         get_sources_cache_hit_rate: hit_rate,
@@ -345,9 +458,13 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
             // where process_uptime = system_uptime_secs * CLK_TCK - starttime_jiffies
             // CLK_TCK = 100 on virtually all Linux systems.
             // /proc/uptime gives system uptime in seconds.
-            let sys_uptime_secs = std::fs::read_to_string("/proc/uptime").ok()
-                .and_then(|s| s.split_whitespace().next()
-                    .and_then(|v| v.parse::<f64>().ok()))
+            let sys_uptime_secs = std::fs::read_to_string("/proc/uptime")
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                })
                 .unwrap_or(0.0);
             const CLK_TCK: f64 = 100.0;
             let sys_uptime_ticks = sys_uptime_secs * CLK_TCK;
@@ -357,7 +474,9 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         },
         rss_mb: proc.rss_kib as f64 / 1024.0,
         allocated_mb: {
-            jemalloc_allocated().map(|b| b as f64 / 1_048_576.0).unwrap_or(0.0)
+            jemalloc_allocated()
+                .map(|b| b as f64 / 1_048_576.0)
+                .unwrap_or(0.0)
         },
         bytes_per_file: {
             let files = s.server.file_slab.live_count() as f64;
@@ -379,6 +498,16 @@ struct ClientRow {
     shared_files: u32,
     high_id: bool,
     connected_seconds: u64,
+    /// This session can parse an inline IPv6 source record.
+    ipv6_capable: bool,
+    /// The client's own IPv6, when it has one we would publish.
+    ///
+    /// Shown because there is no other way to tell WHICH clients these are: a
+    /// client speaking the IPv6 extension is indistinguishable from a plain
+    /// eMule at login — same CT_EMULE_VERSION, no mod tag, no compatible-client
+    /// tag. The only distinguishing signal is the address itself, so that is
+    /// what gets shown rather than a guess at a product name.
+    ipv6: Option<String>,
 }
 
 async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
@@ -399,6 +528,8 @@ async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
                 shared_files: c.shared_files,
                 high_id: c.is_high_id,
                 connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
+                ipv6_capable: c.ipv6_capable,
+                ipv6: c.ipv6.map(|a| a.to_string()),
             }
         })
         .collect();
@@ -530,7 +661,11 @@ async fn api_update_run(
             "message": format!("unknown target {:?}", req.target)
         }));
     };
-    let mode = if req.mode == "merge" { Mode::Merge } else { Mode::Replace };
+    let mode = if req.mode == "merge" {
+        Mode::Merge
+    } else {
+        Mode::Replace
+    };
 
     let credential = if target.needs_credentials() {
         match access_key_hex(&s) {
@@ -608,7 +743,10 @@ async fn api_reload(State(s): State<WebState>) -> impl IntoResponse {
 }
 
 #[derive(Serialize)]
-struct ClientStatEntry { software: String, count: u64 }
+struct ClientStatEntry {
+    software: String,
+    count: u64,
+}
 
 async fn api_client_stats(State(s): State<WebState>) -> Json<Vec<ClientStatEntry>> {
     // Compute from CURRENTLY connected clients (not cumulative history).
@@ -616,7 +754,8 @@ async fn api_client_stats(State(s): State<WebState>) -> Json<Vec<ClientStatEntry
     for entry in s.server.clients.iter() {
         *map.entry(entry.value().software.clone()).or_insert(0) += 1;
     }
-    let mut entries: Vec<ClientStatEntry> = map.into_iter()
+    let mut entries: Vec<ClientStatEntry> = map
+        .into_iter()
         .map(|(software, count)| ClientStatEntry { software, count })
         .collect();
     entries.sort_by(|a, b| b.count.cmp(&a.count));
@@ -624,7 +763,10 @@ async fn api_client_stats(State(s): State<WebState>) -> Json<Vec<ClientStatEntry
 }
 
 #[derive(Serialize)]
-struct CountryStatEntry { code: String, count: u64 }
+struct CountryStatEntry {
+    code: String,
+    count: u64,
+}
 
 async fn api_country_stats(State(s): State<WebState>) -> Json<Vec<CountryStatEntry>> {
     // Compute from CURRENTLY connected clients.
@@ -632,7 +774,8 @@ async fn api_country_stats(State(s): State<WebState>) -> Json<Vec<CountryStatEnt
     for entry in s.server.clients.iter() {
         *map.entry(entry.value().country.clone()).or_insert(0) += 1;
     }
-    let mut entries: Vec<CountryStatEntry> = map.into_iter()
+    let mut entries: Vec<CountryStatEntry> = map
+        .into_iter()
         .map(|(code, count)| CountryStatEntry { code, count })
         .collect();
     entries.sort_by(|a, b| b.count.cmp(&a.count));
@@ -648,7 +791,10 @@ struct FilterInfoResp {
 async fn api_filter_info(State(s): State<WebState>) -> Json<FilterInfoResp> {
     let ipfilter_ranges = s.server.ip_filter.read().await.len();
     let country_db_loaded = s.server.country_db.read().await.is_loaded();
-    Json(FilterInfoResp { ipfilter_ranges, country_db_loaded })
+    Json(FilterInfoResp {
+        ipfilter_ranges,
+        country_db_loaded,
+    })
 }
 
 #[derive(Serialize)]
@@ -720,10 +866,16 @@ async fn api_config_get(State(s): State<WebState>) -> Json<ConfigGetResp> {
 }
 
 #[derive(serde::Deserialize)]
-struct ConfigSetReq { content: String }
+struct ConfigSetReq {
+    content: String,
+}
 
 #[derive(Serialize)]
-struct ConfigSetResp { ok: bool, error: Option<String>, hint: Option<String> }
+struct ConfigSetResp {
+    ok: bool,
+    error: Option<String>,
+    hint: Option<String>,
+}
 
 async fn api_config_set(
     State(s): State<WebState>,
@@ -739,11 +891,13 @@ async fn api_config_set(
     // 1. Parse the new TOML into a proper Config struct.
     let new_cfg: crate::config::Config = match toml::from_str(&req.content) {
         Ok(c) => c,
-        Err(e) => return Json(ConfigSetResp {
-            ok: false,
-            error: Some(format!("config parse error: {}", e)),
-            hint: Some("config file was not modified".into()),
-        }),
+        Err(e) => {
+            return Json(ConfigSetResp {
+                ok: false,
+                error: Some(format!("config parse error: {}", e)),
+                hint: Some("config file was not modified".into()),
+            })
+        }
     };
 
     // 2. Detect non-hot-reloadable changes (require restart) for the user message.
@@ -760,12 +914,16 @@ async fn api_config_set(
     let tmp_path = format!("{}.tmp", s.config_path);
     if let Err(e) = std::fs::write(&tmp_path, &req.content) {
         return Json(ConfigSetResp {
-            ok: false, error: Some(format!("write tempfile failed: {}", e)), hint: None,
+            ok: false,
+            error: Some(format!("write tempfile failed: {}", e)),
+            hint: None,
         });
     }
     if let Err(e) = std::fs::rename(&tmp_path, &s.config_path) {
         return Json(ConfigSetResp {
-            ok: false, error: Some(format!("rename failed: {}", e)), hint: None,
+            ok: false,
+            error: Some(format!("rename failed: {}", e)),
+            hint: None,
         });
     }
 
@@ -777,7 +935,8 @@ async fn api_config_set(
 
     // 5. Trigger filter/ipfilter/country-db reload via the existing flag.
     //    The reload watcher in main.rs reads paths from live_cfg.
-    s.reload_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    s.reload_flag
+        .store(true, std::sync::atomic::Ordering::Relaxed);
 
     let hint = if restart_needed.is_empty() {
         "saved & applied live. Hot-reloadable settings updated immediately.".to_string()
@@ -788,7 +947,11 @@ async fn api_config_set(
             restart_needed.join(", ")
         )
     };
-    Json(ConfigSetResp { ok: true, error: None, hint: Some(hint) })
+    Json(ConfigSetResp {
+        ok: true,
+        error: None,
+        hint: Some(hint),
+    })
 }
 
 // ─── BOT DETECTION + BLOCK STATS API ─────────────────────────────────────
@@ -810,17 +973,24 @@ struct BotRow {
 
 async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
     let now = std::time::SystemTime::now();
-    let mut rows: Vec<BotRow> = s.server.bot_detections.iter()
+    let mut rows: Vec<BotRow> = s
+        .server
+        .bot_detections
+        .iter()
         .map(|e| {
             let d = e.value();
             // Sanitize floats so JSON serialization never sees NaN/INFINITY.
             // (serde_json represents them as null, but JS code expects numbers.)
             let qpm = if d.queries_per_minute.is_finite() {
                 d.queries_per_minute
-            } else { 0.0 };
+            } else {
+                0.0
+            };
             let stddev = if d.interval_stddev_ms.is_finite() {
                 d.interval_stddev_ms
-            } else { -1.0 };  // sentinel: "not measured"
+            } else {
+                -1.0
+            }; // sentinel: "not measured"
             BotRow {
                 ip: e.key().to_string(),
                 country: d.country.clone(),
@@ -828,8 +998,14 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                 queries_per_minute: qpm,
                 interval_stddev_ms: stddev,
                 reason: d.reason.clone(),
-                first_seen_secs_ago: now.duration_since(d.first_seen).map(|d|d.as_secs()).unwrap_or(0),
-                last_seen_secs_ago: now.duration_since(d.last_seen).map(|d|d.as_secs()).unwrap_or(0),
+                first_seen_secs_ago: now
+                    .duration_since(d.first_seen)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                last_seen_secs_ago: now
+                    .duration_since(d.last_seen)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
                 banned: s.server.is_bot_banned(e.key()),
             }
         })
@@ -900,12 +1076,18 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     let param = |key: &str| -> Option<&str> {
         qs.split('&').find_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            if k == key { Some(v) } else { None }
+            if k == key {
+                Some(v)
+            } else {
+                None
+            }
         })
     };
     let flag = |key: &str| matches!(param(key), Some("1") | Some("true"));
     let csv = matches!(param("format"), Some("csv"));
-    let max_examples: usize = param("max_examples").and_then(|v| v.parse().ok()).unwrap_or(10);
+    let max_examples: usize = param("max_examples")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
 
     // Resolve the window.
     let now = std::time::Instant::now();
@@ -926,7 +1108,14 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         "all retained".to_string()
     } else if let Some(h) = param("hours") {
         format!("last {h}h")
-    } else if s.server.review_watermark.lock().ok().and_then(|g| *g).is_some() {
+    } else if s
+        .server
+        .review_watermark
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .is_some()
+    {
         "since previous export".to_string()
     } else {
         "last 24h (first export)".to_string()
@@ -940,10 +1129,8 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
     // on the publish path and is the only view of decoys we can have: a blocked
     // file never reaches `add_file_with_source`, so the alias table is
     // structurally blind to exactly the hashes under review here.
-    let mut by_hash: std::collections::HashMap<
-        [u8; 16],
-        (crate::state::CsamCatch, Vec<String>),
-    > = std::collections::HashMap::new();
+    let mut by_hash: std::collections::HashMap<[u8; 16], (crate::state::CsamCatch, Vec<String>)> =
+        std::collections::HashMap::new();
     for e in s.server.csam_files_by_user.iter() {
         for (h, c) in e.value().0.iter() {
             if let Some(cutoff) = since {
@@ -951,9 +1138,7 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
                     continue;
                 }
             }
-            let slot = by_hash
-                .entry(*h)
-                .or_insert_with(|| (c.clone(), Vec::new()));
+            let slot = by_hash.entry(*h).or_insert_with(|| (c.clone(), Vec::new()));
             if !slot.1.iter().any(|n| n == &c.name) {
                 slot.1.push(c.name.clone());
             }
@@ -966,12 +1151,15 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         // is "!" when the extension cannot hold a file that large. `name` stays
         // LAST: it is the only field that can contain arbitrary bytes, so a
         // stray separator can never shift another column.
-        let mut out =
-            String::from("hash;layer;reason;size;sizeflag;names;unrelated;name\n");
+        let mut out = String::from("hash;layer;reason;size;sizeflag;names;unrelated;name\n");
         for (h, (c, names)) in &by_hash {
             // ';' cannot appear in the fields we emit except possibly the name.
             let name = c.name.replace(';', ",");
-            let flag = if size_contradicts_extension(&c.name, c.size) { "!" } else { "" };
+            let flag = if size_contradicts_extension(&c.name, c.size) {
+                "!"
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 "{};{:?};{};{};{};{};{};{}\n",
                 hex::encode(h),
@@ -1040,13 +1228,22 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
 
     for k in keys {
         let items = &groups[&k];
-        out.push_str(&format!("=== {} | {} | {} files ===\n", k.0, k.1, items.len()));
+        out.push_str(&format!(
+            "=== {} | {} | {} files ===\n",
+            k.0,
+            k.1,
+            items.len()
+        ));
         for (h, name, size) in items.iter().take(max_examples) {
             let short: String = name.chars().take(120).collect();
             // Size inline, and "[!]" when the extension cannot hold it. A cause
             // whose files are all the same implausible size is a decoy swarm, not
             // a filter question — visible at a glance, without opening the CSV.
-            let flag = if size_contradicts_extension(name, *size) { " [!]" } else { "" };
+            let flag = if size_contradicts_extension(name, *size) {
+                " [!]"
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 "{} {:>6} MB{} {}\n",
                 &hex::encode(h)[..8],
@@ -1084,7 +1281,11 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         ));
         for (h, name, size, total, unrelated) in decoys.iter().take(60) {
             let short: String = name.chars().take(120).collect();
-            let flag = if size_contradicts_extension(name, *size) { " [!]" } else { "" };
+            let flag = if size_contradicts_extension(name, *size) {
+                " [!]"
+            } else {
+                ""
+            };
             out.push_str(&format!(
                 "{} {} names ({} unrelated), {} MB{}\n    {}\n",
                 hex::encode(h),
@@ -1314,21 +1515,22 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
     }
 
     let mut files: Vec<serde_json::Value> = Vec::new();
-    let push_file = |label: &str, path: &str, entries: Option<u64>, files: &mut Vec<serde_json::Value>| {
-        if path.is_empty() {
-            return;
-        }
-        let (exists, size, age) = file_stat(path);
-        files.push(serde_json::json!({
-            "label": label,
-            "path": path,
-            "exists": exists,
-            "entries": entries,
-            "size_bytes": size,
-            "modified_secs_ago": age,
-            "ok": exists && entries.map(|e| e > 0).unwrap_or(true),
-        }));
-    };
+    let push_file =
+        |label: &str, path: &str, entries: Option<u64>, files: &mut Vec<serde_json::Value>| {
+            if path.is_empty() {
+                return;
+            }
+            let (exists, size, age) = file_stat(path);
+            files.push(serde_json::json!({
+                "label": label,
+                "path": path,
+                "exists": exists,
+                "entries": entries,
+                "size_bytes": size,
+                "modified_secs_ago": age,
+                "ok": exists && entries.map(|e| e > 0).unwrap_or(true),
+            }));
+        };
 
     let cf = &s.config.content_filter;
     let blocklist_total = s.server.filter.blocklist_size() as u64;
@@ -1345,10 +1547,20 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
         push_file("filter list (L5)", p, n, &mut files);
     }
     if let Some(p) = &cf.extra_terms_file {
-        push_file("extra terms (L4)", p, Some(s.server.filter.extra_terms_count() as u64), &mut files);
+        push_file(
+            "extra terms (L4)",
+            p,
+            Some(s.server.filter.extra_terms_count() as u64),
+            &mut files,
+        );
     }
     if let Some(p) = &cf.jargon_terms_file {
-        push_file("jargon terms (L1)", p, Some(s.server.filter.jargon_terms_count() as u64), &mut files);
+        push_file(
+            "jargon terms (L1)",
+            p,
+            Some(s.server.filter.jargon_terms_count() as u64),
+            &mut files,
+        );
     }
     if let Some(p) = &cf.layer2_terms_file {
         // Reported like the term files, though it is not one: the count is every
@@ -1364,12 +1576,27 @@ async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
         );
     }
     if let Some(p) = &cf.whitelist_hashes_file {
-        push_file("hash whitelist", p, Some(s.server.filter.whitelist_size() as u64), &mut files);
+        push_file(
+            "hash whitelist",
+            p,
+            Some(s.server.filter.whitelist_size() as u64),
+            &mut files,
+        );
     }
     let ipf = s.server.ip_filter.read().await.len() as u64;
-    push_file("IP filter", &s.config.storage.ipfilter_path, Some(ipf), &mut files);
+    push_file(
+        "IP filter",
+        &s.config.storage.ipfilter_path,
+        Some(ipf),
+        &mut files,
+    );
     let geo = s.server.country_db.read().await.range_count() as u64;
-    push_file("GeoIP database", &s.config.storage.country_db_path, Some(geo), &mut files);
+    push_file(
+        "GeoIP database",
+        &s.config.storage.country_db_path,
+        Some(geo),
+        &mut files,
+    );
 
     // ── recent warnings/errors ───────────────────────────────────────────
     let entries = crate::health::ring().snapshot(100);
@@ -1393,20 +1620,27 @@ async fn api_publishers(
     let param = |key: &str| -> Option<&str> {
         qs.split('&').find_map(|kv| {
             let (k, v) = kv.split_once('=')?;
-            if k == key { Some(v) } else { None }
+            if k == key {
+                Some(v)
+            } else {
+                None
+            }
         })
     };
-    let min_flagged: usize = param("min_flagged").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let min_flagged: usize = param("min_flagged")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
     // Cap per-publisher file listings so one prolific account cannot produce a
     // multi-megabyte response.
-    let max_files: usize = param("max_files").and_then(|v| v.parse().ok()).unwrap_or(200);
+    let max_files: usize = param("max_files")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     // flagged_only=1 → return, per publisher, ONLY the files that actually tripped
     // the filter (resolved to their names), and skip the rest of their library.
     // This is the QA view: exactly the handful of files that caused each ban, so a
     // human can confirm the filter did not misfire. Small and bounded (≤ threshold
     // files per publisher), unlike the full library dump.
-    let flagged_only: bool =
-        matches!(param("flagged_only"), Some("1") | Some("true"));
+    let flagged_only: bool = matches!(param("flagged_only"), Some("1") | Some("true"));
     // Only report files caught within this window. Defaults to 24 h because the
     // records live for `publisher_blacklist_seconds` (30 days by default), so an
     // unfiltered export grows every day the server stays up. Pass 0 for "all".
@@ -1467,21 +1701,21 @@ async fn api_publishers(
         let mut published: Vec<serde_json::Value> = Vec::new();
         let mut published_total = 0usize;
         if !flagged_only {
-        if let Some(files) = s.server.user_files.get(&user_hash) {
-            published_total = files.len();
-            for fid in files.iter().take(max_files) {
-                if let Some(rec) = s.server.file_slab.get(*fid) {
-                    published.push(serde_json::json!({
-                        "hash": hex::encode(rec.hash),
-                        "name": &*rec.name,
-                        "size": rec.size,
-                        "sources": rec.sources.len(),
-                        // true = this exact file already tripped the filter
-                        "flagged": flagged_map.contains_key(&rec.hash),
-                    }));
+            if let Some(files) = s.server.user_files.get(&user_hash) {
+                published_total = files.len();
+                for fid in files.iter().take(max_files) {
+                    if let Some(rec) = s.server.file_slab.get(*fid) {
+                        published.push(serde_json::json!({
+                            "hash": hex::encode(rec.hash),
+                            "name": &*rec.name,
+                            "size": rec.size,
+                            "sources": rec.sources.len(),
+                            // true = this exact file already tripped the filter
+                            "flagged": flagged_map.contains_key(&rec.hash),
+                        }));
+                    }
                 }
             }
-        }
         }
 
         let mut entry = serde_json::json!({
@@ -1502,7 +1736,9 @@ async fn api_publishers(
 
     // Worst offenders first.
     out.sort_by(|a, b| {
-        b["flagged_files"].as_u64().unwrap_or(0)
+        b["flagged_files"]
+            .as_u64()
+            .unwrap_or(0)
             .cmp(&a["flagged_files"].as_u64().unwrap_or(0))
     });
 
@@ -1510,6 +1746,183 @@ async fn api_publishers(
         "publishers": out.len(),
         "min_flagged": min_flagged,
         "results": out,
+    }))
+}
+
+/// The stored "port answered with a DIFFERENT user hash" cases, for analysis
+/// without turning logging on.
+///
+/// `?anonymize=1` replaces each IP with its /24 prefix plus a pseudonym that is
+/// stable within this process (so repeats stay visible) but not reversible.
+/// Use it for anything leaving the server: the IPs are other people's.
+///
+/// Every record is annotated with what can be learned NOW:
+/// * whether the answering hash is connected to us, and from which address
+///   (`same_ip` = a second client behind the same NAT holds the port);
+/// * whether the answer is simply OUR OWN probe hash echoed back — a client or
+///   mod that reflects the hello rather than a different machine;
+/// * whether each hash carries eMule's marker bytes (index 5 = 0x0E,
+///   index 14 = 0x6F), which other implementations do not set;
+/// * the client software of whichever side is still connected.
+async fn api_highid_mismatches(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Json<serde_json::Value> {
+    use std::collections::HashMap;
+    let anonymize = q
+        .as_deref()
+        .map(|q| {
+            q.split('&')
+                .any(|kv| kv == "anonymize=1" || kv == "anonymize=true")
+        })
+        .unwrap_or(false);
+
+    let live = s.server.live_cfg.load();
+    let our_probe_hash = crate::server::highid_probe::server_pseudo_user_hash(
+        &crate::server::udp::resolve_seckey(&live),
+    );
+
+    let recent: Vec<crate::state::HighIdMismatch> = s
+        .server
+        .highid_observe
+        .recent_mismatches
+        .lock()
+        .map(|q| q.iter().cloned().collect())
+        .unwrap_or_default();
+
+    // Pseudonyms: a salted hash, salt drawn once per process. Stable across
+    // calls so two exports from one run can be compared, useless after restart.
+    static SALT: once_cell::sync::Lazy<[u8; 16]> = once_cell::sync::Lazy::new(|| {
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&crate::proto::obfuscation::random_bytes(16)[..16]);
+        b
+    });
+    let show_ip = |ip: std::net::IpAddr| -> serde_json::Value {
+        if !anonymize {
+            return serde_json::json!(ip.to_string());
+        }
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(*SALT);
+        h.update(ip.to_string().as_bytes());
+        let tag = hex::encode(&h.finalize()[..4]);
+        let prefix = match ip {
+            std::net::IpAddr::V4(v4) => {
+                let o = v4.octets();
+                format!("{}.{}.{}.x", o[0], o[1], o[2])
+            }
+            std::net::IpAddr::V6(_) => "v6".to_string(),
+        };
+        serde_json::json!(format!("{prefix}#{tag}"))
+    };
+    let emule_marker = |h: &[u8; 16]| h[5] == 0x0E && h[14] == 0x6F;
+
+    let mut by_ip: HashMap<String, u64> = HashMap::new();
+    let mut by_answered: HashMap<String, u64> = HashMap::new();
+    let mut logins: std::collections::HashSet<[u8; 16]> = Default::default();
+    let (mut same, mut other, mut none, mut echo) = (0u64, 0u64, 0u64, 0u64);
+    let (mut login_marked, mut answered_marked) = (0u64, 0u64);
+    let mut marked = 0u64;
+
+    let mut records = Vec::with_capacity(recent.len());
+    for m in &recent {
+        let ip_shown = show_ip(m.ip);
+        *by_ip
+            .entry(ip_shown.as_str().unwrap_or("").to_string())
+            .or_insert(0) += 1;
+        *by_answered.entry(hex::encode(m.answered_hash)).or_insert(0) += 1;
+        logins.insert(m.login_hash);
+
+        let answered_now = s
+            .server
+            .clients
+            .get(&m.answered_hash)
+            .map(|c| (c.ip, c.software.clone()));
+        let login_now = s
+            .server
+            .clients
+            .get(&m.login_hash)
+            .map(|c| (c.ip, c.software.clone()));
+        let answered_status = match &answered_now {
+            Some((ip, _)) if *ip == m.ip => {
+                same += 1;
+                "connected_same_ip"
+            }
+            Some(_) => {
+                other += 1;
+                "connected_other_ip"
+            }
+            None => {
+                none += 1;
+                "not_connected"
+            }
+        };
+        let is_echo = m.answered_hash == our_probe_hash;
+        if is_echo {
+            echo += 1;
+        }
+        if emule_marker(&m.login_hash) {
+            login_marked += 1;
+        }
+        if emule_marker(&m.answered_hash) {
+            answered_marked += 1;
+        }
+        if m.marked {
+            marked += 1;
+        }
+        records.push(serde_json::json!({
+            "at": chrono::DateTime::from_timestamp(m.at as i64, 0).map(|d| d.to_rfc3339()),
+            "ip": ip_shown,
+            "port": m.port,
+            "marked": m.marked,
+            "login_hash": hex::encode(m.login_hash),
+            "answered_hash": hex::encode(m.answered_hash),
+            "answered_is_our_probe_hash": is_echo,
+            "login_hash_emule_marker": emule_marker(&m.login_hash),
+            "answered_hash_emule_marker": emule_marker(&m.answered_hash),
+            "answered_client_now": answered_status,
+            "answered_client_software": answered_now.map(|(_, sw)| sw),
+            "login_client_still_connected": login_now.is_some(),
+            "login_client_software": login_now.map(|(_, sw)| sw),
+        }));
+    }
+
+    let top = |m: HashMap<String, u64>| -> Vec<serde_json::Value> {
+        let mut v: Vec<(String, u64)> = m.into_iter().filter(|(_, n)| *n > 1).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.truncate(20);
+        v.into_iter()
+            .map(|(k, n)| serde_json::json!({ "key": k, "count": n }))
+            .collect()
+    };
+    let distinct_ips = by_ip.len();
+    let distinct_answered = by_answered.len();
+
+    Json(serde_json::json!({
+        "anonymized": anonymize,
+        "our_probe_hash": hex::encode(our_probe_hash),
+        "total_since_start": s.server.highid_observe.mismatch.load(Ordering::Relaxed),
+        "lowid_logins_by_mark_since_start": s.server.highid_observe.downgraded.load(Ordering::Relaxed),
+        "marks_active": s.server.highid_observe.marks_active(),
+        "marks_cleared_since_start": s.server.highid_observe.marks_cleared.load(Ordering::Relaxed),
+        "downgrade_on_wrong_hash": live.network.highid_downgrade_on_wrong_hash,
+        "summary": {
+            "records": recent.len(),
+            "marked": marked,
+            "buffer_capacity": crate::state::HighIdObserve::RECENT_MISMATCHES,
+            "distinct_ips": distinct_ips,
+            "distinct_login_hashes": logins.len(),
+            "distinct_answered_hashes": distinct_answered,
+            "answered_is_our_probe_hash": echo,
+            "answered_client_connected_same_ip": same,
+            "answered_client_connected_other_ip": other,
+            "answered_client_not_connected": none,
+            "login_hash_has_emule_marker": login_marked,
+            "answered_hash_has_emule_marker": answered_marked,
+            "repeated_ips": top(by_ip),
+            "repeated_answered_hashes": top(by_answered),
+        },
+        "records": records,
     }))
 }
 
@@ -1531,6 +1944,10 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
         .collect();
     let allocated = jemalloc_allocated().unwrap_or(0);
     Json(serde_json::json!({
+        // Which tokenisation built this index. Recorded in the reading itself so
+        // a before/after comparison cannot mix up which snapshot was which — the
+        // flag is only read at startup, and nothing else in this JSON reveals it.
+        "index_subtokens": s.server.keyword_index.subtokens_enabled(),
         "sizes_bytes": sizes,
         "tracked_total_bytes": tracked,
         "jemalloc_allocated_bytes": allocated,
@@ -1636,14 +2053,23 @@ fn jemalloc_allocated() -> Option<u64> {
 }
 
 async fn api_block_stats(State(s): State<WebState>) -> Json<Vec<BlockStatRow>> {
-    let mut rows: Vec<BlockStatRow> = s.server.block_stats.iter()
+    let mut rows: Vec<BlockStatRow> = s
+        .server
+        .block_stats
+        .iter()
         .map(|e| {
             let reason = e.key().clone();
             // For CSAM: also report distinct IPs blocked (one user can publish many files).
             let unique_ips = if reason == "csam" {
                 Some(s.server.csam_unique_ips.len() as u64)
-            } else { None };
-            BlockStatRow { reason, count: *e.value(), unique_ips }
+            } else {
+                None
+            };
+            BlockStatRow {
+                reason,
+                count: *e.value(),
+                unique_ips,
+            }
         })
         .collect();
     rows.sort_by(|a, b| b.count.cmp(&a.count));
@@ -1914,8 +2340,14 @@ async function refreshStatus() {
      <tr><td>TCP Port</td><td>${st.tcp_port}</td></tr>
      <tr><td>Seckey</td><td><code style="font-size:.75rem">${st.seckey_hex}</code></td></tr>
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
+     <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
+     ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
+     <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
+     <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
      <tr><td>NAT-T capable clients</td><td>${fmt(st.natt_capable_clients)} <span style="color:#6b7280;font-size:.75rem">connected clients with the NAT-traversal mod</span></td></tr>
+     <tr><td>IPv6-capable clients</td><td>${fmt(st.ipv6_clients)} <span style="color:#6b7280;font-size:.75rem">sessions that can parse an inline IPv6 source record</span></td></tr>
+     <tr><td>IPv6 publishers</td><td>${fmt(st.ipv6_sources)} <span style="color:#6b7280;font-size:.75rem">connected clients with a usable IPv6 address</span></td></tr>
      <tr><td>NAT-T punches coordinated</td><td>${fmt(st.natt_coordinated)} <span style="color:#6b7280;font-size:.75rem">LowID↔LowID since start</span></td></tr>
      <tr><td>obf_decode_cache</td><td>${fmt(st.obf_decode_cache_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 8192)</span></td></tr>
      <tr><td>seed_challenges</td><td>${fmt(st.incoming_seed_challenges_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 2048)</span></td></tr>
@@ -1959,7 +2391,7 @@ async function refreshClients() {
       }).join('');
   document.getElementById('clients-table').innerHTML = rows.length === 0
     ? '<div class="empty">No clients connected.</div>'
-    : '<table><thead><tr><th>IP</th><th>Country</th><th>Software</th><th>Nick</th><th>Files</th><th>ID</th><th>Connected</th></tr></thead><tbody>'
+    : '<table><thead><tr><th>IP</th><th>Country</th><th>Software</th><th>Nick</th><th>Files</th><th>ID</th><th>IPv6</th><th>Connected</th></tr></thead><tbody>'
       + rows.slice(0,100).map(c =>
           `<tr><td>${c.ip}</td>`
           + `<td>${countryFlag(c.country)} ${c.country}</td>`
@@ -1967,8 +2399,10 @@ async function refreshClients() {
           + `<td>${c.nick}</td>`
           + `<td>${c.shared_files||0}</td>`
           + `<td><span class="badge ${c.high_id?'yes':'no'}">${c.high_id?'High':'Low'}</span></td>`
+          + `<td>${c.ipv6 ? `<code style="font-size:11px">${c.ipv6}</code>`
+                          : (c.ipv6_capable ? '<span style="opacity:.6">capable</span>' : '')}</td>`
           + `<td>${fmtDur(c.connected_seconds)}</td></tr>`).join('')
-      + (rows.length>100?`<tr><td colspan="5" style="color:#6b7280">… and ${rows.length-100} more</td></tr>`:'')
+      + (rows.length>100?`<tr><td colspan="8" style="color:#6b7280">… and ${rows.length-100} more</td></tr>`:'')
       + '</tbody></table>';
 }
 
@@ -2269,3 +2703,105 @@ setInterval(refresh, 5000);
 </script>
 </body></html>
 "##;
+
+#[cfg(test)]
+mod highid_mismatch_endpoint_tests {
+    use super::*;
+    use crate::state::HighIdMismatch;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn web_state() -> WebState {
+        let server = Arc::new(ServerState::for_test());
+        let config = Arc::new(Config::minimal_test_config());
+        WebState {
+            server,
+            config,
+            metrics: Arc::new(Metrics::new()),
+            seckey_hex: String::new(),
+            config_path: String::new(),
+            reload_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cached_public_ip: String::new(),
+        }
+    }
+
+    fn rec(ip: [u8; 4], login: [u8; 16], answered: [u8; 16]) -> HighIdMismatch {
+        HighIdMismatch {
+            at: 1_790_000_000,
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            port: 4662,
+            login_hash: login,
+            answered_hash: answered,
+            marked: false,
+        }
+    }
+
+    async fn call(ws: &WebState, q: Option<&str>) -> serde_json::Value {
+        let Json(v) = api_highid_mismatches(
+            State(ws.clone()),
+            axum::extract::RawQuery(q.map(|s| s.to_string())),
+        )
+        .await;
+        v
+    }
+
+    #[tokio::test]
+    async fn summarises_what_the_analysis_needs() {
+        let ws = web_state();
+        let st = &ws.server;
+        // A second client behind the same NAT: connected from the probed IP.
+        st.register_test_client([0xB1; 16], 1, true, 0); // 10.0.0.2
+        let live = st.live_cfg.load();
+        let ours = crate::server::highid_probe::server_pseudo_user_hash(
+            &crate::server::udp::resolve_seckey(&live),
+        );
+        let mut emule = [0x11u8; 16];
+        emule[5] = 0x0E;
+        emule[14] = 0x6F;
+        let o = &st.highid_observe;
+        o.record_mismatch(rec([10, 0, 0, 2], emule, [0xB1; 16])); // same-IP NAT
+        o.record_mismatch(rec([10, 9, 9, 9], [0x22; 16], ours)); // echo of our hello
+        o.record_mismatch(rec([10, 9, 9, 9], [0x22; 16], ours)); // same IP again
+
+        let v = call(&ws, None).await;
+        let sm = &v["summary"];
+        assert_eq!(sm["records"], 3);
+        assert_eq!(sm["distinct_ips"], 2);
+        assert_eq!(sm["distinct_answered_hashes"], 2);
+        assert_eq!(sm["answered_is_our_probe_hash"], 2);
+        assert_eq!(sm["answered_client_connected_same_ip"], 1);
+        assert_eq!(sm["answered_client_not_connected"], 2);
+        assert_eq!(sm["login_hash_has_emule_marker"], 1);
+        assert_eq!(sm["repeated_ips"][0]["key"], "10.9.9.9");
+        assert_eq!(sm["repeated_ips"][0]["count"], 2);
+        assert_eq!(v["our_probe_hash"], hex::encode(ours));
+        assert_eq!(v["records"][0]["answered_client_now"], "connected_same_ip");
+        assert_eq!(v["records"][1]["answered_is_our_probe_hash"], true);
+    }
+
+    #[tokio::test]
+    async fn anonymize_hides_addresses_but_keeps_repeats_visible() {
+        let ws = web_state();
+        let o = &ws.server.highid_observe;
+        o.record_mismatch(rec([85, 17, 116, 5], [1; 16], [2; 16]));
+        o.record_mismatch(rec([85, 17, 116, 5], [1; 16], [2; 16]));
+        o.record_mismatch(rec([85, 17, 116, 6], [3; 16], [4; 16]));
+        let v = call(&ws, Some("anonymize=1")).await;
+        assert_eq!(v["anonymized"], true);
+        let ips: Vec<String> = v["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["ip"].as_str().unwrap().to_string())
+            .collect();
+        for ip in &ips {
+            assert!(ip.starts_with("85.17.116.x#"), "{ip}");
+            assert!(!ip.contains("116.5") && !ip.contains("116.6"), "{ip}");
+        }
+        assert_eq!(
+            ips[0], ips[1],
+            "the same address must map to the same pseudonym"
+        );
+        assert_ne!(ips[0], ips[2], "different addresses must not collide here");
+        assert_eq!(v["summary"]["distinct_ips"], 2);
+    }
+}

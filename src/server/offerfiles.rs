@@ -59,9 +59,21 @@ pub fn parse_offerfiles(payload: &[u8]) -> Result<Vec<OfferedFile>> {
         for tag in read_tag_list(&mut slice, tag_count) {
             if let TagName::Byte(b) = tag.name {
                 match b {
-                    FT_FILENAME  => { if let Some(s) = tag.str_value() { filename = s.to_string(); } }
-                    FT_FILESIZE  => { if let Some(v) = tag.as_u32() { size_lo = v; } }
-                    FT_FILESIZE_HI => { if let Some(v) = tag.as_u32() { size_hi = v; } }
+                    FT_FILENAME => {
+                        if let Some(s) = tag.str_value() {
+                            filename = s.to_string();
+                        }
+                    }
+                    FT_FILESIZE => {
+                        if let Some(v) = tag.as_u32() {
+                            size_lo = v;
+                        }
+                    }
+                    FT_FILESIZE_HI => {
+                        if let Some(v) = tag.as_u32() {
+                            size_hi = v;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -145,7 +157,10 @@ pub fn handle_offerfiles(
                     // Break down by layer so the operator can see WHICH filter
                     // catches most files — helps spot if a specific layer is
                     // producing false positives.
-                    *state.block_stats.entry(layer.stat_key().to_string()).or_insert(0) += 1;
+                    *state
+                        .block_stats
+                        .entry(layer.stat_key().to_string())
+                        .or_insert(0) += 1;
                     if counts {
                         if let std::net::IpAddr::V4(v4) = client.ip {
                             *state.csam_unique_ips.entry(v4).or_insert(0) += 1;
@@ -169,9 +184,16 @@ pub fn handle_offerfiles(
                     let count_window = cfg.content_filter.count_window();
                     let retention = cfg.content_filter.ban_ttl();
                     if state.record_csam_file_for_user(
-                        client.user_hash, file.hash, &file.filename, file.size,
-                        layer, &reason, threshold, count_window, retention)
-                    {
+                        client.user_hash,
+                        file.hash,
+                        &file.filename,
+                        file.size,
+                        layer,
+                        &reason,
+                        threshold,
+                        count_window,
+                        retention,
+                    ) {
                         // Threshold of distinct blocked files reached. ban_publisher
                         // is idempotent (it reports whether the ban was newly
                         // added), so log the ban line exactly ONCE — not once per
@@ -182,8 +204,10 @@ pub fn handle_offerfiles(
                         // and the server kept filtering the rest of the batch for a
                         // client it had already banned.
                         if state.ban_publisher_is_new(client.user_hash) {
-                            warn!(publisher_user_hash = hex::encode(client.user_hash),
-                                  threshold, "csam publisher threshold reached — user_hash banned");
+                            warn!(
+                                publisher_user_hash = hex::encode(client.user_hash),
+                                threshold, "csam publisher threshold reached — user_hash banned"
+                            );
                         }
                         // Log this blocked file (it counts toward the totals) then
                         // stop processing the remainder of the batch: the publisher
@@ -315,10 +339,10 @@ mod large_file_tests {
         payload.extend_from_slice(&1u32.to_le_bytes()); // file_count
 
         // file record: hash(16) + client_id(4) + port(2) + tag_count(4) + tags
-        payload.extend_from_slice(&[0x77; 16]);                       // hash
-        payload.extend_from_slice(&0xFBFB_FBFBu32.to_le_bytes());     // complete marker
-        payload.extend_from_slice(&0xFBFBu16.to_le_bytes());           // port marker
-        payload.extend_from_slice(&3u32.to_le_bytes());               // tag_count = 3
+        payload.extend_from_slice(&[0x77; 16]); // hash
+        payload.extend_from_slice(&0xFBFB_FBFBu32.to_le_bytes()); // complete marker
+        payload.extend_from_slice(&0xFBFBu16.to_le_bytes()); // port marker
+        payload.extend_from_slice(&3u32.to_le_bytes()); // tag_count = 3
 
         // FT_FILENAME (newtag string with 1-byte name)
         payload.push(0x82);
@@ -344,15 +368,26 @@ mod large_file_tests {
         // End-to-end through state: file should be searchable AND the search
         // result should carry an FT_FILESIZE_HI tag.
         let filter = Arc::new(ContentFilter::new());
-        let state = ServerState::new(filter, std::sync::Arc::new(crate::config::Config::minimal_test_config()));
+        let state = ServerState::new(
+            filter,
+            std::sync::Arc::new(crate::config::Config::minimal_test_config()),
+        );
         state.add_file_with_source(
             files[0].hash,
             files[0].size,
             files[0].filename.clone(),
-            ([1u8; 16], std::net::IpAddr::V4(std::net::Ipv4Addr::new(10,0,0,1)), 4662, true),
+            (
+                [1u8; 16],
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+                4662,
+                true,
+            ),
         );
 
-        let entry = state.file_slab.get_by_hash(&files[0].hash).expect("indexed");
+        let entry = state
+            .file_slab
+            .get_by_hash(&files[0].hash)
+            .expect("indexed");
         assert_eq!(entry.size, size_64, "stored size still 5 GiB");
     }
 }

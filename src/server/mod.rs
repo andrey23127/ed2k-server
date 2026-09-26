@@ -1,9 +1,9 @@
-pub mod highid_probe;
 pub mod bot_detector;
 pub mod callback;
 pub mod connection;
 pub mod get_sources;
 pub mod gossip;
+pub mod highid_probe;
 pub mod holepunch;
 pub mod keepalive;
 pub mod login;

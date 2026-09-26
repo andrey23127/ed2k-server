@@ -10,4 +10,6 @@ pub use crypt_stream::CryptStream;
 
 pub use frame::{Ed2kCodec, Frame, FrameError};
 pub use opcodes::*;
-pub use tags::{read_tag, read_tag_list, write_tag, write_tag_list, Tag, TagError, TagName, TagValue};
+pub use tags::{
+    read_tag, read_tag_list, write_tag, write_tag_list, Tag, TagError, TagName, TagValue,
+};

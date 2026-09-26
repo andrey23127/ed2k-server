@@ -331,15 +331,24 @@ fn http_get(
             // 403 here is the normal "not approved yet" answer and deserves a
             // readable message rather than a status number.
             let hint = match code {
-                401 | 403 => " — this server is not on the update service's allow list, \
+                401 | 403 => {
+                    " — this server is not on the update service's allow list, \
                                or its access key has changed (seckey regenerated, or the \
-                               server moved to a different IP)",
+                               server moved to a different IP)"
+                }
                 404 => " — no such file on the update service",
                 _ => "",
             };
             let body = r.into_string().unwrap_or_default();
             let body = body.chars().take(200).collect::<String>();
-            bail!("HTTP {code}{hint}{}", if body.is_empty() { String::new() } else { format!(": {body}") });
+            bail!(
+                "HTTP {code}{hint}{}",
+                if body.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {body}")
+                }
+            );
         }
         Err(e) => bail!("request failed: {e}"),
     };
@@ -648,20 +657,13 @@ fn hash_of_line(line: &str) -> LineKind {
     if line.starts_with('#') || line.starts_with(';') || line.starts_with("//") {
         return LineKind::Comment;
     }
-    let token: String = line
-        .chars()
-        .take_while(|c| c.is_ascii_hexdigit())
-        .collect();
+    let token: String = line.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
     if token.len() != 32 {
         return LineKind::Junk;
     }
     // The character right after must not be another hex digit, or this is a
     // longer token that merely starts like a hash.
-    if line
-        .chars()
-        .nth(32)
-        .is_some_and(|c| c.is_ascii_hexdigit())
-    {
+    if line.chars().nth(32).is_some_and(|c| c.is_ascii_hexdigit()) {
         return LineKind::Junk;
     }
     match hex::decode(&token) {
@@ -728,7 +730,11 @@ pub fn merge_hash_lists(old: &str, new: &str, stamp: &str) -> String {
         if !out.last().map(|l| l.trim().is_empty()).unwrap_or(true) {
             out.push(String::new());
         }
-        out.push(format!("# ── merged {} entries on {} ──", appended.len(), stamp));
+        out.push(format!(
+            "# ── merged {} entries on {} ──",
+            appended.len(),
+            stamp
+        ));
         out.extend(appended);
     }
 
@@ -787,7 +793,9 @@ fn install_atomic(path: &Path, content: &[u8]) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
         ".{}.tmp",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("update")
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("update")
     ));
     {
         let mut f = std::fs::File::create(&tmp)?;
@@ -891,9 +899,7 @@ pub fn run(req: &UpdateRequest) -> Result<UpdateReport, UpdateError> {
 
     // ── 5. compare against what is already installed ─────────────────────
     let existing = std::fs::read(&path).ok();
-    let entries_before = existing
-        .as_ref()
-        .and_then(|b| validate(target, b).ok());
+    let entries_before = existing.as_ref().and_then(|b| validate(target, b).ok());
 
     let final_bytes: Vec<u8> = if req.mode == Mode::Merge {
         let old = existing
@@ -1119,11 +1125,7 @@ mod tests {
         )
         .is_ok());
         assert!(validate(Target::IpToCountry, b"nope\n").is_err());
-        assert!(validate(
-            Target::IpToCountry,
-            b"16777216,16777471,AU,Australia\n"
-        )
-        .is_ok());
+        assert!(validate(Target::IpToCountry, b"16777216,16777471,AU,Australia\n").is_ok());
         assert!(validate(Target::GuardingP2p, b"Some range:1.2.3.4-1.2.3.9\n").is_ok());
     }
 

@@ -226,7 +226,7 @@ fn default_admin_port() -> u16 {
 }
 
 /// Persistent storage of the file index across restarts.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct StorageConfig {
     /// Path to IP filter file in guarding.p2p format (eMule-compatible).
     /// Leave empty to disable. Reloaded on SIGHUP without restart.
@@ -236,15 +236,6 @@ pub struct StorageConfig {
     /// Format: start_int,end_int,ISO2,CountryName. Leave empty to disable.
     #[serde(default)]
     pub country_db_path: String,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        Self {
-            ipfilter_path: String::new(),
-            country_db_path: String::new(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -328,6 +319,92 @@ pub struct NetworkConfig {
     ///   If that check is ever weakened, this option has to go with it.
     #[serde(default)]
     pub hairpin_lan_clients: bool,
+
+    /// OBSERVE ONLY: after a client gets HighID from the plain TCP probe, also
+    /// run the identity probe (OP_HELLO → OP_HELLOANSWER with the user hash that
+    /// logged in) in the background, and count what it finds. The verdict is
+    /// NOT changed and the login does NOT wait for it.
+    ///
+    /// Why: HighID is decided by a bare TCP connect. A stock Lugdunum requires a
+    /// protocol answer — measured, it reports "No answer from your NNNN port"
+    /// and gives LowID to a port that accepts connections but does not speak
+    /// eD2k, where this server gives HighID. Such a client is published as a
+    /// source nobody can download from. Before tightening the verdict to match,
+    /// this counts how many real HighID clients would lose it, and why — so the
+    /// change is decided on numbers, not on a guess.
+    ///
+    /// Cost: one extra outbound connection per HighID login (two if the client
+    /// advertised obfuscation and refuses it), bounded by a concurrency cap so a
+    /// reconnect storm after a restart cannot turn into a probe storm.
+    ///
+    /// Does not touch the hairpin path: that runs only when the plain probe has
+    /// already FAILED, and this only when it has SUCCEEDED.
+    #[serde(default)]
+    pub highid_verify_observe: bool,
+
+    /// VERDICT, remembered: when a HighID client's port answers OP_HELLO with
+    /// a DIFFERENT user hash (type-marker bytes ignored, see
+    /// `same_client_hash`), remember (address, port, login hash) for
+    /// `highid_wrong_hash_ttl_secs`, and give that client LowID on its next
+    /// logins while the mark lasts.
+    ///
+    /// That answer proves the forward belongs to another eD2k client: two
+    /// machines behind one NAT, both on the default port, the router forwarding
+    /// it to one of them. The other one holds a HighID every peer is sent to
+    /// the wrong machine by; as LowID it is reached through server callback.
+    ///
+    /// The check runs in the BACKGROUND and the login is answered at once — a
+    /// synchronous check was tried and measured: clients whose login is still
+    /// pending mostly do not answer the hello in time, so the login waited and
+    /// the check caught little. The price is that the first session after a
+    /// mismatch keeps its HighID; such clients reconnect often.
+    ///
+    /// A marked client is re-checked in the background on every login. If its
+    /// port now answers with its own hash (forwarding fixed), the mark is
+    /// dropped and the next login gets HighID again. A wrong hash again renews
+    /// the mark. No answer leaves it as it is.
+    ///
+    /// Every outcome other than a different hash keeps HighID exactly as
+    /// before: silent close and reset (the peer's IP filter drops us), timeout,
+    /// refused, garbage. Supersedes `highid_verify_observe` while on (the same
+    /// counters are fed). Hairpin path unaffected.
+    #[serde(default)]
+    pub highid_downgrade_on_wrong_hash: bool,
+
+    /// How long a wrong-hash mark lasts, seconds. Default 86400 (a day).
+    #[serde(default = "default_highid_wrong_hash_ttl_secs")]
+    pub highid_wrong_hash_ttl_secs: u64,
+
+    /// Accept client connections over IPv6, on the same TCP port.
+    ///
+    /// A separate listener rather than a dual-stack socket: the IPv4 path stays
+    /// byte-identical, and a host without IPv6 simply logs a warning and serves
+    /// IPv4 as before.
+    #[serde(default)]
+    pub ipv6_enabled: bool,
+
+    /// Address the IPv6 listener binds to. `::` is every interface.
+    #[serde(default = "default_listen_ip6")]
+    pub listen_ip6: String,
+
+    /// This server's public IPv6, announced to clients that speak the
+    /// extension. Empty means the server has none; sources are then still
+    /// accepted over IPv6 but the server does not advertise itself.
+    #[serde(default)]
+    pub this_ip6: String,
+
+    /// Publish IPv6 sources to clients that can parse them.
+    ///
+    /// Separate from `ipv6_enabled` on purpose: accepting IPv6 clients is a
+    /// local decision, while publishing IPv6 sources changes what other peers
+    /// receive, and an operator may want the first without the second while
+    /// watching how it behaves.
+    #[serde(default)]
+    pub ipv6_publish_sources: bool,
+}
+
+fn default_listen_ip6() -> String {
+    "::".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -344,6 +421,78 @@ pub struct LimitsConfig {
     pub max_string_size: u32,
     #[serde(default = "default_ping_delay")]
     pub ping_delay_seconds: u64,
+
+    /// Maximum file records returned for one search, across all pages.
+    ///
+    /// Lugdunum has no single number here: it picks between `maxSearchCount`
+    /// and `maxSearchCountz` on the client's zlib capability bit, then halves
+    /// the result for LowID clients, so the same query answers differently for
+    /// two clients looking at the same index. Measured against a stock 17.15
+    /// (query "1080p"): 309 and 205 for HighID with and without zlib, 153 and
+    /// 101 for the same two as LowID — half minus one, consistently.
+    ///
+    /// We deliberately keep ONE number for everybody. A client has no way to
+    /// learn it was served the smaller set, and an operator has no way to say
+    /// what their users actually receive.
+    #[serde(default = "default_max_search_results")]
+    pub max_search_results: u32,
+
+    /// Upper bound on candidate records examined while ranking one search.
+    ///
+    /// Ranking has to look at more than it returns: to serve the best-sourced
+    /// matches it must examine every candidate, where the unranked path could
+    /// stop at the first `max_search_results` that matched. On a common word
+    /// that is the difference between a couple of hundred records and a posting
+    /// list of hundreds of thousands — the cost profile that took this server
+    /// from 3% to 92% CPU once already.
+    ///
+    /// Past this many candidates the ranking is over what was seen rather than
+    /// over everything, `search.rank_scan_capped` counts it and a log line says
+    /// so. The default is 100x the default result cap, so it only bites on
+    /// words common enough that no ordering of them is meaningful anyway.
+    #[serde(default = "default_search_rank_scan")]
+    pub search_rank_scan: u32,
+
+    /// Also index letter/digit sub-tokens of each word: `S01E08` becomes
+    /// findable as `s01` and `e08`, `1080p` as `1080`.
+    ///
+    /// Why: a stock Lugdunum reaches those files through a substring filter
+    /// over candidates seeded by another word, so `<title> s01` finds the
+    /// whole season there and nothing here. Indexing the pieces gets most of
+    /// that recall with a predictable cost — an intersection, not a filter
+    /// whose outcome depends on which word happened to be rarest.
+    ///
+    /// Cost: measured on 1482 real filenames at +10% distinct keywords and
+    /// +12% postings. That sample is small; measure on your own index before
+    /// relying on it (compare the Health tab's memory and keyword figures with
+    /// this off, then on, after the index has refilled).
+    ///
+    /// ⚠ READ ONCE AT STARTUP, NOT HOT-RELOADED. `add_file` and `remove_file`
+    ///   must split names identically for the life of the index. Flipping this
+    ///   while files are indexed would remove fewer tokens than were added and
+    ///   leave stale ids in postings permanently. Changing it takes a restart,
+    ///   and the index refills from publishes as it always does.
+    ///
+    /// Off by default: turning it on changes what searches return.
+    #[serde(default)]
+    pub index_subtokens: bool,
+
+    /// Drop query words that no indexed file contains, instead of returning
+    /// nothing because of them.
+    ///
+    /// One unknown word — a typo, a word in another language, a tag nobody
+    /// else used — used to empty the whole search however good the other words
+    /// were. Lugdunum does the same; we deliberately do not.
+    ///
+    /// Safe to have on only because results are ranked. Without ranking, a
+    /// query whose distinguishing words were all unknown would come back as the
+    /// cap's worth of files matching whatever common word survived, in
+    /// publication order — worse than an honest zero. With ranking it is the
+    /// best-sourced files for the words that do exist.
+    ///
+    /// A query where EVERY word is unknown still returns nothing. Applied live.
+    #[serde(default = "default_true")]
+    pub search_drop_unknown_words: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -473,7 +622,9 @@ impl Default for LogConfig {
     }
 }
 
-fn default_worker_threads() -> usize { 1 }
+fn default_worker_threads() -> usize {
+    1
+}
 
 fn default_listen_ip() -> String {
     "0.0.0.0".into()
@@ -484,11 +635,24 @@ fn default_backlog() -> u32 {
 fn default_max_frame() -> u32 {
     1_000_000
 }
-fn default_udp_server_key() -> u32 { 0x1234_5678 }
-fn default_login_timeout_ms() -> u64 { 2000 }
-fn default_true() -> bool { true }
-fn default_version_major() -> u8 { 17 }
-fn default_version_minor() -> u8 { 15 }
+fn default_udp_server_key() -> u32 {
+    0x1234_5678
+}
+fn default_login_timeout_ms() -> u64 {
+    2000
+}
+fn default_highid_wrong_hash_ttl_secs() -> u64 {
+    86_400
+}
+fn default_true() -> bool {
+    true
+}
+fn default_version_major() -> u8 {
+    17
+}
+fn default_version_minor() -> u8 {
+    15
+}
 fn default_max_clients() -> u32 {
     1024
 }
@@ -501,8 +665,23 @@ fn default_hard_limit() -> u32 {
 fn default_per_ip() -> u32 {
     10
 }
-fn default_max_string() -> u32 { 250 }
-fn default_ping_delay() -> u64 { 300 }
+fn default_max_string() -> u32 {
+    250
+}
+fn default_ping_delay() -> u64 {
+    300
+}
+/// Refuse a result cap above this. Well past anything a client displays, and
+/// low enough that one search cannot be turned into a multi-megabyte response.
+pub const MAX_SEARCH_RESULTS_CEILING: u32 = 5_000;
+
+/// 200 keeps the behaviour every existing deployment already has.
+fn default_max_search_results() -> u32 {
+    200
+}
+fn default_search_rank_scan() -> u32 {
+    20_000
+}
 fn default_csam_disconnect_threshold() -> u32 {
     3
 }
@@ -628,6 +807,27 @@ whitelist_hashes = ""
                  to be configured (see SPEC.md §1.2 / §7.6.3). Refusing to start."
             );
         }
+        if self.limits.max_search_results == 0 {
+            bail!("limits.max_search_results must be at least 1");
+        }
+        if self.limits.max_search_results > MAX_SEARCH_RESULTS_CEILING {
+            bail!(
+                "limits.max_search_results = {} exceeds the ceiling of {}. Every result \
+                 carries a filename and a tag set, so a large cap turns one search into \
+                 a multi-megabyte response the client never asked for.",
+                self.limits.max_search_results,
+                MAX_SEARCH_RESULTS_CEILING
+            );
+        }
+        if (self.limits.search_rank_scan as u64) < self.limits.max_search_results as u64 {
+            bail!(
+                "limits.search_rank_scan ({}) is below limits.max_search_results ({}). \
+                 Ranking would then examine fewer candidates than it returns, which \
+                 silently reinstates the arbitrary-order cap this setting exists to remove.",
+                self.limits.search_rank_scan,
+                self.limits.max_search_results
+            );
+        }
         Ok(())
     }
 }
@@ -725,6 +925,10 @@ hash_filter = ""
 whitelist_hashes = ""
 "#;
         let cfg: Config = toml::from_str(toml_str).expect("stale key must not break parsing");
-        assert_eq!(cfg.network.udp_port(), 6266, "must derive, not use the stale 9999");
+        assert_eq!(
+            cfg.network.udp_port(),
+            6266,
+            "must derive, not use the stale 9999"
+        );
     }
 }

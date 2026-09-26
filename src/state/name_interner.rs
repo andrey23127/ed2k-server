@@ -45,7 +45,9 @@ pub struct NameInterner {
 
 impl NameInterner {
     pub fn new() -> Self {
-        Self { table: DashMap::new() }
+        Self {
+            table: DashMap::new(),
+        }
     }
 
     /// Return an `Arc<str>` for these bytes.

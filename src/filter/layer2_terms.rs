@@ -88,64 +88,172 @@ impl Default for Layer2Terms {
     fn default() -> Self {
         Self {
             sex_substring: to_vec(&[
-            "porn", "blowjob", "handjob", "dildo", "orgasm", "masturbat", "sexuell", "ficken",
-            "porno", "follar", "desnud", "sesso", "секс", "голая", "детский секс видео",
-            "голая девочка", "секс с малолеткой", "секс", "порн", "голая", "обнаж", "sexe",
-            "援助交際", "원조교제", "ロリ", "loli", "幼女", "young girl", "近親相姦", "강간", "レイプ",
-            "vagina", "penis", "cunt", "boobs", "tits",
+                "porn",
+                "blowjob",
+                "handjob",
+                "dildo",
+                "orgasm",
+                "masturbat",
+                "sexuell",
+                "ficken",
+                "porno",
+                "follar",
+                "desnud",
+                "sesso",
+                "секс",
+                "голая",
+                "детский секс видео",
+                "голая девочка",
+                "секс с малолеткой",
+                "секс",
+                "порн",
+                "голая",
+                "обнаж",
+                "sexe",
+                "援助交際",
+                "원조교제",
+                "ロリ",
+                "loli",
+                "幼女",
+                "young girl",
+                "近親相姦",
+                "강간",
+                "レイプ",
+                "vagina",
+                "penis",
+                "cunt",
+                "boobs",
+                "tits",
             ]),
-            sex_prefix: to_vec(&[
-            "fuck", "nude", "naked", "molest", "rape",
-            ]),
+            sex_prefix: to_vec(&["fuck", "nude", "naked", "molest", "rape"]),
             sex_bounded: to_vec(&[
-            "sex", "xxx", "anal", "oral", "cum", "nackt", "nud", "scopa", "pussy", "incest", "cock",
+                "sex", "xxx", "anal", "oral", "cum", "nackt", "nud", "scopa", "pussy", "incest",
+                "cock",
             ]),
             exceptions: to_vec(&[
-            "голая правда", "голой правды", "голую правду", "сексуальное воспитан",
-            "половое воспитан", "сексуальная революц", "секс-просвет", "сексолог",
-            "сексопатолог",
+                "голая правда",
+                "голой правды",
+                "голую правду",
+                "сексуальное воспитан",
+                "половое воспитан",
+                "сексуальная революц",
+                "секс-просвет",
+                "сексолог",
+                "сексопатолог",
             ]),
             // Empty by default. A phrase belongs here only after it has been
             // measured against a review window, and the operator file is where
             // that reasoning gets written down.
             term_exceptions: Vec::new(),
             minor_cjk: to_vec(&[
-            "中学生", "中學生", "初中生", "小学生", "小學生", "未成年", "minor", "미성년", "중학생", "초등학생",
+                "中学生",
+                "中學生",
+                "初中生",
+                "小学生",
+                "小學生",
+                "未成年",
+                "minor",
+                "미성년",
+                "중학생",
+                "초등학생",
             ]),
-            minor_latin: to_vec(&[
-            "kleinkind",
-            ]),
+            minor_latin: to_vec(&["kleinkind"]),
             minor_ru: to_vec(&[
-            "школьниц", "школьник", "малолет", "несовершеннолет", "подростк", "девочк",
-            "мальчик", "детск", "дети", "ребён", "ребен", "малыш", "дочк", "сынок", "юная",
-            "юные", "юной",
+                "школьниц",
+                "школьник",
+                "малолет",
+                "несовершеннолет",
+                "подростк",
+                "девочк",
+                "мальчик",
+                "детск",
+                "дети",
+                "ребён",
+                "ребен",
+                "малыш",
+                "дочк",
+                "сынок",
+                "юная",
+                "юные",
+                "юной",
             ]),
             sex_ru: to_vec(&[
-            "ебёт", "ебет", "ебля", "ебут", "ебал", "трахае", "трахну", "трахал", "сосёт",
-            "сосет", "минет", "дрочит", "дрочь", "изнасил", "порево", "сексом",
-            "занимаются сексом", "порн", "мастурбац", "развратн", "стриптиз", "совращ",
-            "инцест", "голенькая",
+                "ебёт",
+                "ебет",
+                "ебля",
+                "ебут",
+                "ебал",
+                "трахае",
+                "трахну",
+                "трахал",
+                "сосёт",
+                "сосет",
+                "минет",
+                "дрочит",
+                "дрочь",
+                "изнасил",
+                "порево",
+                "сексом",
+                "занимаются сексом",
+                "порн",
+                "мастурбац",
+                "развратн",
+                "стриптиз",
+                "совращ",
+                "инцест",
+                "голенькая",
             ]),
             age_guard: to_vec(&[
                 // Product and version contexts. An age written with no space before
                 // the y is an unpaired notation, and that same form names a model, a
                 // firmware build or a support window.
-                "whisk", "malt", "scotch", "bourbon", "cognac", "brandy", "tequila",
-                "cask", "barrel", "reserva", "solera", "anejo", "distiller", "tasting",
-                "aged", "vintage", "service manual", "warranty", "guarantee", "mileage",
-                "windows", "iphone", "galaxy", "firmware", "build", "version", "episode",
-                "season", "model", "release",
+                "whisk",
+                "malt",
+                "scotch",
+                "bourbon",
+                "cognac",
+                "brandy",
+                "tequila",
+                "cask",
+                "barrel",
+                "reserva",
+                "solera",
+                "anejo",
+                "distiller",
+                "tasting",
+                "aged",
+                "vintage",
+                "service manual",
+                "warranty",
+                "guarantee",
+                "mileage",
+                "windows",
+                "iphone",
+                "galaxy",
+                "firmware",
+                "build",
+                "version",
+                "episode",
+                "season",
+                "model",
+                "release",
             ]),
             zoo_animals: to_vec(&[
-            "horse", "pony", "mare", "stallion", "donkey", "canine", "equine", "k9",
+                "horse", "pony", "mare", "stallion", "donkey", "canine", "equine", "k9",
             ]),
             zoo_acts: to_vec(&[
-            "cum", "cums", "fuck", "fucks", "fucking", "fucked", "pussy", "suck", "sucks",
-            "knot", "penetrat",
+                "cum", "cums", "fuck", "fucks", "fucking", "fucked", "pussy", "suck", "sucks",
+                "knot", "penetrat",
             ]),
             zoo_guard: to_vec(&[
-            "veterinar", "breeding guide", "husbandry", "artificial insemination", "stud farm",
-            "equine reproduction", "livestock", "insemination",
+                "veterinar",
+                "breeding guide",
+                "husbandry",
+                "artificial insemination",
+                "stud farm",
+                "equine reproduction",
+                "livestock",
+                "insemination",
             ]),
             unpaired_age_max: 12,
             age_guard_window: 24,
@@ -155,15 +263,27 @@ impl Default for Layer2Terms {
 
 /// Collapse the separators scene releases use into single spaces, lowercased.
 ///
-/// `.`, `_` and `-` become a space and runs of whitespace collapse, so one entry
-/// covers every way a title is written. Nothing else changes — accents and
-/// non-Latin script are left alone, because an entry may legitimately contain
-/// them.
+/// Every character that is neither a letter nor a digit becomes a space, and
+/// runs of them collapse, so one entry covers every way a title is punctuated.
+/// Accents and non-Latin script are left alone: they are letters, and an entry
+/// may legitimately consist of them.
+///
+/// ⚠ THIS USED TO COLLAPSE ONLY `.`, `_`, `-` AND WHITESPACE, and the gap was
+///   invisible until an exemption failed to fire. A subtitle named
+///   `[ENG] Jailbait (2014).eng.it.srt` was not matched by the exemption phrase
+///   `jailbait 2014`, because the brackets around the year survived
+///   normalisation and the phrase had no brackets in it.
+///
+///   Publishers punctuate however they like — parentheses around a year, square
+///   brackets around a language tag, a `#` before an issue number. An exemption
+///   list that only tolerates three of those separators makes every entry a
+///   guess about which spelling will arrive, and the failure is silent: the
+///   entry sits there looking correct while the file stays blocked.
 pub fn normalize_separators(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut pending_space = false;
     for c in name.chars() {
-        if c == '.' || c == '_' || c == '-' || c.is_whitespace() {
+        if !c.is_alphanumeric() {
             pending_space = !out.is_empty();
             continue;
         }
@@ -269,9 +389,7 @@ impl Layer2Terms {
                             format!("line {}: age_guard_window must be a number", lineno + 1)
                         })?;
                     }
-                    other => {
-                        return Err(format!("line {}: unknown limit '{other}'", lineno + 1))
-                    }
+                    other => return Err(format!("line {}: unknown limit '{other}'", lineno + 1)),
                 }
                 continue;
             }
@@ -294,29 +412,64 @@ impl Layer2Terms {
         // A section named but left empty is taken at face value — that is how an
         // operator disables a category. Only sections NOT named fall back.
         let d = Self::default();
-        if !seen.contains("sex.substring") { t.sex_substring = d.sex_substring; }
-        if !seen.contains("sex.prefix") { t.sex_prefix = d.sex_prefix; }
-        if !seen.contains("sex.bounded") { t.sex_bounded = d.sex_bounded; }
-        if !seen.contains("exceptions") { t.exceptions = d.exceptions; }
-        if !seen.contains("term.exceptions") { t.term_exceptions = d.term_exceptions; }
-        if !seen.contains("minor.cjk") { t.minor_cjk = d.minor_cjk; }
-        if !seen.contains("minor.latin") { t.minor_latin = d.minor_latin; }
-        if !seen.contains("minor.ru") { t.minor_ru = d.minor_ru; }
-        if !seen.contains("sex.ru") { t.sex_ru = d.sex_ru; }
-        if !seen.contains("age.guard") { t.age_guard = d.age_guard; }
-        if !seen.contains("zoo.animals") { t.zoo_animals = d.zoo_animals; }
-        if !seen.contains("zoo.acts") { t.zoo_acts = d.zoo_acts; }
-        if !seen.contains("zoo.guard") { t.zoo_guard = d.zoo_guard; }
+        if !seen.contains("sex.substring") {
+            t.sex_substring = d.sex_substring;
+        }
+        if !seen.contains("sex.prefix") {
+            t.sex_prefix = d.sex_prefix;
+        }
+        if !seen.contains("sex.bounded") {
+            t.sex_bounded = d.sex_bounded;
+        }
+        if !seen.contains("exceptions") {
+            t.exceptions = d.exceptions;
+        }
+        if !seen.contains("term.exceptions") {
+            t.term_exceptions = d.term_exceptions;
+        }
+        if !seen.contains("minor.cjk") {
+            t.minor_cjk = d.minor_cjk;
+        }
+        if !seen.contains("minor.latin") {
+            t.minor_latin = d.minor_latin;
+        }
+        if !seen.contains("minor.ru") {
+            t.minor_ru = d.minor_ru;
+        }
+        if !seen.contains("sex.ru") {
+            t.sex_ru = d.sex_ru;
+        }
+        if !seen.contains("age.guard") {
+            t.age_guard = d.age_guard;
+        }
+        if !seen.contains("zoo.animals") {
+            t.zoo_animals = d.zoo_animals;
+        }
+        if !seen.contains("zoo.acts") {
+            t.zoo_acts = d.zoo_acts;
+        }
+        if !seen.contains("zoo.guard") {
+            t.zoo_guard = d.zoo_guard;
+        }
         Ok(t)
     }
 
     fn is_known_section(name: &str) -> bool {
         matches!(
             name,
-            "sex.substring" | "sex.prefix" | "sex.bounded" | "exceptions"
+            "sex.substring"
+                | "sex.prefix"
+                | "sex.bounded"
+                | "exceptions"
                 | "term.exceptions"
-                | "minor.cjk" | "minor.latin" | "minor.ru" | "sex.ru"
-                | "age.guard" | "zoo.animals" | "zoo.acts" | "zoo.guard"
+                | "minor.cjk"
+                | "minor.latin"
+                | "minor.ru"
+                | "sex.ru"
+                | "age.guard"
+                | "zoo.animals"
+                | "zoo.acts"
+                | "zoo.guard"
                 | "limits"
         )
     }
@@ -344,11 +497,19 @@ impl Layer2Terms {
 
     /// Total entries, for the startup log and the web panel.
     pub fn len(&self) -> usize {
-        self.sex_substring.len() + self.sex_prefix.len() + self.sex_bounded.len()
-            + self.exceptions.len() + self.term_exceptions.len()
-            + self.minor_cjk.len() + self.minor_latin.len()
-            + self.minor_ru.len() + self.sex_ru.len() + self.age_guard.len()
-            + self.zoo_animals.len() + self.zoo_acts.len() + self.zoo_guard.len()
+        self.sex_substring.len()
+            + self.sex_prefix.len()
+            + self.sex_bounded.len()
+            + self.exceptions.len()
+            + self.term_exceptions.len()
+            + self.minor_cjk.len()
+            + self.minor_latin.len()
+            + self.minor_ru.len()
+            + self.sex_ru.len()
+            + self.age_guard.len()
+            + self.zoo_animals.len()
+            + self.zoo_acts.len()
+            + self.zoo_guard.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -420,8 +581,8 @@ mod tests {
 
     #[test]
     fn limits_are_parsed_and_bounded() {
-        let t = Layer2Terms::parse("[limits]\nunpaired_age_max = 10\nage_guard_window = 32\n")
-            .unwrap();
+        let t =
+            Layer2Terms::parse("[limits]\nunpaired_age_max = 10\nage_guard_window = 32\n").unwrap();
         assert_eq!(t.unpaired_age_max, 10);
         assert_eq!(t.age_guard_window, 32);
 
@@ -486,5 +647,40 @@ mod tests {
         assert_eq!(back.zoo_acts, d.zoo_acts);
         assert_eq!(back.zoo_guard, d.zoo_guard);
         assert_eq!(back.len(), d.len());
+    }
+    #[test]
+    fn every_punctuation_mark_is_a_separator() {
+        // The gap that made an exemption fail silently: brackets around a year
+        // survived normalisation, so `jailbait 2014` did not match
+        // `[ENG] Jailbait (2014).eng.it.srt` and the file stayed blocked while
+        // the entry sat in the list looking correct.
+        assert_eq!(
+            normalize_separators("[ENG] Jailbait (2014).eng.it.srt"),
+            "eng jailbait 2014 eng it srt"
+        );
+        assert_eq!(
+            normalize_separators("Law & Order - Special Victims Unit - S22E10"),
+            "law order special victims unit s22e10"
+        );
+        assert_eq!(normalize_separators("Issue #8 (Hots)"), "issue 8 hots");
+    }
+
+    #[test]
+    fn letters_and_digits_survive_whatever_script_they_are_in() {
+        // Accents and non-Latin script are letters and must not be stripped:
+        // entries legitimately consist of them.
+        assert_eq!(normalize_separators("L'éléphant"), "l éléphant");
+        assert_eq!(
+            normalize_separators("[ANi] 幼女戰記 2 - 01"),
+            "ani 幼女戰記 2 01"
+        );
+        assert_eq!(normalize_separators("Детское  порно"), "детское порно");
+    }
+
+    #[test]
+    fn runs_collapse_and_edges_do_not_leave_spaces() {
+        assert_eq!(normalize_separators("...a---b___c..."), "a b c");
+        assert_eq!(normalize_separators("   "), "");
+        assert_eq!(normalize_separators(""), "");
     }
 }

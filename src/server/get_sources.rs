@@ -13,6 +13,10 @@ use tracing::debug;
 /// Maximum sources returned per response (SPEC.md §6.2.6 SmartSources tiers).
 const MAX_SOURCES_PER_REPLY: usize = 200;
 
+/// ClientID marking an inline IPv6 source. `255.255.255.255` is never a real
+/// client, so the value is unambiguous. Agreed with eMuleQt and eNode-go.
+pub const IPV6_SOURCE_SENTINEL: u32 = 0xFFFF_FFFF;
+
 #[derive(Debug)]
 pub struct GetSourcesRequest {
     pub file_hash: [u8; 16],
@@ -111,13 +115,31 @@ pub fn handle_get_sources(
         return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
     }
 
+    // Whether this requester can parse an inline IPv6 record. Decided once, and
+    // it also decides whether the cache may be used at all.
+    let v6_capable = state.live_cfg.load().network.ipv6_publish_sources && requester.ipv6_capable;
+
     // Fast path: a freshly-cached payload for this hash.
-    if let Some(cached) = state.smart_sources.get(&req.file_hash) {
-        debug!(
-            file_hash = hex::encode(req.file_hash),
-            "getsources answered from SmartSources cache"
-        );
-        return Frame::new(OP_FOUNDSOURCES, cached);
+    //
+    // ⚠ NOT FOR A SENTINEL-CAPABLE REQUESTER. The cache is keyed on the file
+    //   hash alone, and the payload now depends on WHO asked: a v6-capable
+    //   session and a legacy one must receive different bytes for the same
+    //   file. Serving one from a payload built for the other hands a legacy
+    //   client a record 16 bytes longer than it expects, and it mis-parses the
+    //   rest of the packet.
+    //
+    //   Bypassing rather than adding the capability to the key, because the
+    //   cache exists to absorb bursts of identical requests and v6-capable
+    //   sessions are a small minority; a second keyspace would halve the hit
+    //   rate for the common case to serve the rare one.
+    if !v6_capable {
+        if let Some(cached) = state.smart_sources.get(&req.file_hash) {
+            debug!(
+                file_hash = hex::encode(req.file_hash),
+                "getsources answered from SmartSources cache"
+            );
+            return Frame::new(OP_FOUNDSOURCES, cached);
+        }
     }
 
     // Slow path: build the source list from the index.
@@ -161,9 +183,46 @@ pub fn handle_get_sources(
         // by user_hash; if it's currently connected and firewalled, use its low id.
         // If the client isn't found (stale source) we fall back to the real IP —
         // same behavior as before this change.
-        let id = match state.clients.get(&s.user_hash) {
-            Some(handle) if !handle.is_high_id => handle.assigned_id,
-            _ => {
+        // ── IPv6 sentinel ────────────────────────────────────────────────
+        //
+        // Only when ALL of these hold, and each guards a different failure:
+        //
+        //   * the requester can parse it. A classic record is 6 bytes; this one
+        //     is 22 (or more, with the obfuscation fields). Sending it to a
+        //     client that does not know the sentinel makes it read the next
+        //     record from the middle of this one and mis-parse everything after.
+        //   * the source has no usable IPv4 HighID. A HighID peer is directly
+        //     reachable over IPv4 already, so its record stays classic and no
+        //     requester loses anything. Only a firewalled-on-v4 peer gains from
+        //     publishing the v6 path — matching what the other server doing
+        //     this decided, so both produce the same answer for the same source.
+        //   * the address survives the same publishability rules as IPv4.
+        //
+        // A requester that cannot parse the sentinel still gets the LowID for
+        // that same source and reaches it by callback, exactly as before. That
+        // is why gating per requester loses nothing rather than forcing a choice
+        // between the two addresses.
+        let v6 = if v6_capable {
+            state
+                .client_ipv6
+                .get(&s.user_hash)
+                .map(|e| *e.value())
+                .filter(|a| crate::server::login::is_publishable_ipv6(*a))
+                .filter(|_| {
+                    !state
+                        .clients
+                        .get(&s.user_hash)
+                        .map(|h| h.is_high_id)
+                        .unwrap_or(false)
+                })
+        } else {
+            None
+        };
+
+        let id = match (v6, state.clients.get(&s.user_hash)) {
+            (Some(_), _) => IPV6_SOURCE_SENTINEL,
+            (None, Some(handle)) if !handle.is_high_id => handle.assigned_id,
+            (None, _) => {
                 // STALE SOURCE. The client is gone, so there is no low id to
                 // substitute and the stored address goes out verbatim. If that
                 // address is private it means nothing outside one LAN: every
@@ -180,6 +239,12 @@ pub fn handle_get_sources(
         };
         entries.put_u32_le(id);
         entries.put_u16_le(s.port());
+        if let Some(a) = v6 {
+            // ALWAYS LAST, after any obfuscation fields — both existing
+            // implementations read it there, and the position is the only thing
+            // making the record self-delimiting.
+            entries.put_slice(&a.octets());
+        }
         emitted += 1;
     }
 
@@ -193,7 +258,12 @@ pub fn handle_get_sources(
     // this payload technically excludes one specific peer, but in practice
     // the same file is requested by many peers and the ~5s TTL makes the
     // tiny over/under-inclusion harmless — clients re-query constantly.
-    state.smart_sources.put(req.file_hash, payload_vec.clone());
+    //
+    // Only a classic payload is cached, for the reason at the read side: a
+    // sentinel payload stored here would later be served to a legacy client.
+    if !v6_capable {
+        state.smart_sources.put(req.file_hash, payload_vec.clone());
+    }
 
     Frame::new(OP_FOUNDSOURCES, payload_vec)
 }
@@ -278,6 +348,39 @@ mod tests {
     // every source (LowID included) was encoded as its real IP, making LowID
     // peers look like HighID and breaking LowID<->LowID NAT traversal.
     #[test]
+    fn the_sentinel_value_is_the_agreed_one() {
+        // 255.255.255.255 is never a real client, which is what makes it
+        // unambiguous. Both implementations already speaking this use the same
+        // value; changing it would silently break both.
+        assert_eq!(IPV6_SOURCE_SENTINEL, 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn a_link_local_ipv6_is_not_publishable() {
+        // The case that would actually happen: a client behind a router with no
+        // global prefix advertises fe80::… , which is useless to every peer that
+        // receives it and spreads through source exchange like any other junk
+        // address.
+        use crate::server::login::is_publishable_ipv6;
+        use std::net::Ipv6Addr;
+        for bad in [
+            "fe80::1",            // link-local
+            "fd00::1",            // unique local
+            "::1",                // loopback
+            "::",                 // unspecified
+            "ff02::1",            // multicast
+            "::ffff:203.0.113.7", // IPv4 in disguise
+        ] {
+            let a: Ipv6Addr = bad.parse().unwrap();
+            assert!(!is_publishable_ipv6(a), "{bad} must not be published");
+        }
+        for good in ["2001:db8::1", "2a01:4f8::1"] {
+            let a: Ipv6Addr = good.parse().unwrap();
+            assert!(is_publishable_ipv6(a), "{good}");
+        }
+    }
+
+    #[test]
     fn a_stale_private_source_is_not_emitted() {
         // The address of a client that has gone. There is no low id left to
         // substitute, so it would go out verbatim — and outside its own LAN it
@@ -290,7 +393,10 @@ mod tests {
             Ipv4Addr::new(172, 20, 1, 1),
             Ipv4Addr::new(100, 90, 0, 1),
         ] {
-            assert!(!ServerState::is_publishable_source_ip(IpAddr::V4(ip)), "{ip}");
+            assert!(
+                !ServerState::is_publishable_source_ip(IpAddr::V4(ip)),
+                "{ip}"
+            );
         }
         assert!(ServerState::is_publishable_source_ip(IpAddr::V4(
             Ipv4Addr::new(85, 17, 116, 222)
@@ -324,7 +430,10 @@ mod tests {
         let frame = handle_get_sources(
             &state,
             &requester,
-            GetSourcesRequest { file_hash, size: None },
+            GetSourcesRequest {
+                file_hash,
+                size: None,
+            },
         );
 
         // payload: hash(16) count(1) then count*(id(4) port(2))
@@ -342,9 +451,17 @@ mod tests {
             got.insert(port, id);
         }
         // LowID source (port 4001) must carry the assigned low id 42, NOT its IP.
-        assert_eq!(got.get(&4001), Some(&42u32), "LowID source must encode assigned_id");
+        assert_eq!(
+            got.get(&4001),
+            Some(&42u32),
+            "LowID source must encode assigned_id"
+        );
         // HighID source (port 4002) must carry its real IPv4 as the id.
         let expect_high = u32::from_le_bytes(Ipv4Addr::new(198, 51, 100, 7).octets());
-        assert_eq!(got.get(&4002), Some(&expect_high), "HighID source must encode real IP");
+        assert_eq!(
+            got.get(&4002),
+            Some(&expect_high),
+            "HighID source must encode real IP"
+        );
     }
 }

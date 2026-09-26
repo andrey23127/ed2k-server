@@ -38,8 +38,7 @@ const MIN_KEYWORD_LEN: usize = 2;
 /// NOTE: do NOT include file extensions (mp3, avi, mkv…) — users actively
 /// search for them and eMule's type filter sends them as tokens.
 const COMMON_WORDS_SKIP: &[&str] = &[
-    "the", "and", "for", "with", "from", "this", "that",
-    "web", "www", "com", "net", "org",
+    "the", "and", "for", "with", "from", "this", "that", "web", "www", "com", "net", "org",
 ];
 
 /// Word-boundary characters used by the tokenizer.
@@ -47,10 +46,36 @@ fn is_separator(c: char) -> bool {
     c.is_whitespace()
         || matches!(
             c,
-            '_' | '-' | '.' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-                | '!' | '?' | '@' | '#' | '$' | '%' | '^' | '&' | '*'
-                | '+' | '=' | '/' | '\\' | '|' | '<' | '>' | '"' | '\''
-                | '`' | '~'
+            '_' | '-'
+                | '.'
+                | ','
+                | ';'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '!'
+                | '?'
+                | '@'
+                | '#'
+                | '$'
+                | '%'
+                | '^'
+                | '&'
+                | '*'
+                | '+'
+                | '='
+                | '/'
+                | '\\'
+                | '|'
+                | '<'
+                | '>'
+                | '"'
+                | '\''
+                | '`'
+                | '~'
         )
 }
 
@@ -111,6 +136,237 @@ pub fn tokenize(filename: &str) -> Vec<String> {
 /// from a working buffer and remains valid only for the duration of the
 /// callback. This avoids the per-token `String` allocation that
 /// `tokenize` does — used by [`KeywordIndex::add_file`] and `remove_file`.
+/// Latin letters U+00C0..U+024F folded to their ASCII base, one char per code
+/// point; `\0` means "leave alone".
+///
+/// Generated from Unicode canonical decompositions rather than typed by hand.
+/// Multi-letter expansions (æ→ae, ß→ss, þ→th, œ→oe) are folded to their FIRST
+/// letter here: a one-to-one table keeps the lookup a single index, and the
+/// difference only matters for words that are already rare in filenames.
+const FOLD_LATIN: &str = concat!(
+    "aaaaaaaceeeeiiiidnooooo\0ouuuuytsaaaaaaac",
+    "eeeeiiiidnooooo\0ouuuuytyaaaaaaccccccccdd",
+    "ddeeeeeeeeeegggggggghhhhiiiiiiiiii\0\0jjkk",
+    "kllllll\0\0llnnnnnn\0\0\0oooooooorrrrrrssssss",
+    "ssttttttuuuuuuuuuuuuwwyyyzzzzzz\0\0\0\0\0\0\0\0\0",
+    "\0\0\0\0\0\0\0e\0\0f\0\0\0\0\0\0\0\0\0\0\0\0\0oo\0\0\0\0\0\0\0\0\0\0\0\0\0u",
+    "u\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0aaiioouuuuu",
+    "uuuuu\0aaaa\0\0\0\0ggkkoooo\0\0j\0\0\0gg\0\0nnaa\0\0\0\0",
+    "aaaaeeeeiiiioooorrrruuuusstt\0\0hh\0\0\0\0\0\0aa",
+    "eeooooooooyy\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+);
+
+/// Fold one character towards ASCII for indexing and lookup.
+///
+/// ⚠ TWO SEPARATE DECISIONS LIVE HERE, and they are not equally justified.
+///
+///   PRECOMPOSED ACCENTS (NFC) — `café` → `cafe`. This is a COMPATIBILITY fix.
+///   Public servers fold these, measured: a query carrying an NFC accent
+///   returned 153 results against a reference server where the files are spelled
+///   with the plain letter, and 0 here. A client typing what the user typed got
+///   results from a real server and an empty list from this one.
+///
+///   COMBINING MARKS (NFD) — `e`+U+0301 → `e`. This goes BEYOND the reference.
+///   The same measurement showed public servers do NOT fold NFD: the same word
+///   in decomposed form returned 0 there too. Both encodings are genuinely on
+///   the network, so handling it makes this server better rather than merely
+///   equal — but it is an improvement, not a compatibility fix, and if it ever
+///   causes trouble it can be dropped without reopening the first decision.
+///
+/// Mojibake is out of scope. Nothing can repair a name whose bytes were already
+/// decoded with the wrong encoding by whoever published it.
+fn fold_char(c: char) -> Option<char> {
+    let cp = c as u32;
+    // Combining diacritical marks: drop entirely (the NFD half).
+    if (0x0300..=0x036F).contains(&cp) {
+        return None;
+    }
+    if (0x00C0..0x0250).contains(&cp) {
+        let b = FOLD_LATIN.as_bytes()[(cp - 0x00C0) as usize];
+        if b != 0 {
+            return Some(b as char);
+        }
+    }
+    Some(c)
+}
+
+/// Fold and lowercase a whole string for comparison, keeping separators.
+///
+/// `fold_token` is for one token; this is for a filename or a query term that
+/// may contain spaces, and it exists so the search post-filter can compare on
+/// the same footing as the index. Both must use it or a folded lookup is undone
+/// by an unfolded comparison.
+pub fn fold_for_match(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match fold_char(c) {
+            None => {}
+            Some(f) => {
+                for lc in f.to_lowercase() {
+                    out.push(lc);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Lowercase and fold a token. Allocates only when something actually changes.
+fn fold_token(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match fold_char(c) {
+            None => {}
+            Some(f) => {
+                for lc in f.to_lowercase() {
+                    out.push(lc);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Minimum length of a SUB-token. Deliberately higher than `MIN_KEYWORD_LEN`.
+///
+/// Whole words keep the 2-character minimum — eMule sends "HD" and "OS" and
+/// users mean them. Sub-tokens are different: they come from splitting a word
+/// at letter/digit boundaries, and at two characters that produces `01`, `08`,
+/// `e0` and the like out of every episode tag on the network, each with a
+/// posting list the size of the TV corpus. Three is the smallest length at
+/// which `S01E08` still yields `s01` and `e08`, which is what this is for.
+const SUBTOKEN_MIN_LEN: usize = 3;
+
+/// A word split into more runs than this is not sub-tokenised at all.
+///
+/// Real compound tokens have few runs — `s01e08` has four, `kxv7171wjq`
+/// three, a double episode `s01e08e09` six. A word with many runs is almost
+/// always an identifier: a hash, a release id, a CRC tag. Splitting those only
+/// adds single-file postings nobody will query, so past this many runs the word
+/// is left as the one whole token it already is.
+const SUBTOKEN_MAX_RUNS: usize = 6;
+
+/// Letter or digit — the only two classes a run boundary separates. Anything
+/// else has already been cut by `is_separator` before a word reaches here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunClass {
+    Letter,
+    Digit,
+    Other,
+}
+
+fn run_class(c: char) -> RunClass {
+    if c.is_numeric() {
+        RunClass::Digit
+    } else if c.is_alphabetic() {
+        RunClass::Letter
+    } else {
+        RunClass::Other
+    }
+}
+
+/// Visit the sub-tokens of one already-lowercased, already-folded word.
+///
+/// The rule is RUNS PLUS ADJACENT PAIRS:
+///
+/// ```text
+///   s01e08      runs s|01|e|08        pairs s01, 01e, e08     -> s01, 01e, e08
+///   1080p       runs 1080|p           pair  = the word        -> 1080
+///   kxv7171wjq  runs kxv|7171|wjq     pairs kxv7171, 7171wjq  -> all five
+/// ```
+///
+/// ⚠ PLAIN RUN SPLITTING IS NOT ENOUGH. `S01E08` splits into `s`, `01`, `e`,
+///   `08`, and every one of those falls under any sane minimum — so the token
+///   that motivated this whole change, `s01`, would never exist. The pairs are
+///   what produce it. This was only visible by checking the rule against the
+///   example that motivated it (issue #14).
+///
+/// ⚠ THIS IS NOT A SUPERSET OF LUGDUNUM. A query that begins in the middle of a
+///   run — `1x05` against a file named `01x05` — is reached by Lugdunum's
+///   substring filter and by nothing here: the runs are `01`, `x`, `05`, the
+///   pairs `01x`, `x05`, and `1x05` is neither. Clients that care send both
+///   spellings (aMuTorrent emits `1x05` and `01x05` for exactly this reason),
+///   so the gap is absorbed on their side — but that is a property of today's
+///   client population, not a guarantee. If a client stops sending both, this
+///   gap becomes visible immediately.
+///
+/// Whole words are NOT emitted here; the caller already has them. A pair equal
+/// to the whole word is skipped for the same reason.
+fn visit_subtokens<F: FnMut(&str)>(word: &str, visit: &mut F) {
+    // A hex string is an identifier — a CRC tag, an md5, a release hash — and
+    // the run cap alone does not catch it: `deadbeef1234cafe5678` has only four
+    // runs, each long enough to index, and every one would be a single-file
+    // posting that nobody will ever search for. Eight characters is a CRC32,
+    // the shortest of these that turns up in filenames.
+    if word.len() >= 8 && word.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return;
+    }
+    // Find run boundaries as byte offsets. Words are short; a small fixed array
+    // avoids an allocation on the hot publish path.
+    let mut bounds: [usize; SUBTOKEN_MAX_RUNS + 2] = [0; SUBTOKEN_MAX_RUNS + 2];
+    let mut n_runs = 0usize;
+    let mut prev: Option<RunClass> = None;
+    for (i, c) in word.char_indices() {
+        let cls = run_class(c);
+        if cls == RunClass::Other {
+            // Should not happen after is_separator, but a stray symbol makes the
+            // run structure meaningless; leave the word whole.
+            return;
+        }
+        if prev != Some(cls) {
+            if n_runs >= SUBTOKEN_MAX_RUNS {
+                return; // an identifier, not a compound — see SUBTOKEN_MAX_RUNS
+            }
+            bounds[n_runs] = i;
+            n_runs += 1;
+            prev = Some(cls);
+        }
+    }
+    if n_runs < 2 {
+        return; // a single run IS the word
+    }
+    bounds[n_runs] = word.len();
+
+    let emit = |s: &str, visit: &mut F| {
+        if s.chars().count() >= SUBTOKEN_MIN_LEN
+            && s.len() < word.len()
+            && !COMMON_WORDS_SKIP.contains(&s)
+        {
+            visit(s);
+        }
+    };
+    // Runs.
+    for r in 0..n_runs {
+        emit(&word[bounds[r]..bounds[r + 1]], visit);
+    }
+    // Adjacent pairs.
+    for r in 0..n_runs - 1 {
+        emit(&word[bounds[r]..bounds[r + 2]], visit);
+    }
+}
+
+/// Everything the INDEX stores for a filename: whole tokens, plus sub-tokens
+/// when enabled.
+///
+/// ⚠ INDEXING ONLY. Query terms go through `tokenize_search_term`, which stays
+///   whole-token. That asymmetry is the point: a query for `s01` is ONE whole
+///   token that now finds the sub-token `s01` in `s01e08`. Sub-tokenising the
+///   query as well would turn every search for `s01e08` into an intersection of
+///   four postings, three of them enormous, to arrive at the same answer.
+///
+/// ⚠ `add_file` AND `remove_file` MUST BOTH CALL THIS, WITH THE SAME FLAG. A
+///   token added and not removed is a stale id in a posting forever; nothing
+///   ever compacts it out. That is also why `subtokens` is fixed when the index
+///   is built and not hot-reloadable.
+fn index_tokens_into<F: FnMut(&str)>(filename: &str, subtokens: bool, mut visit: F) {
+    tokenize_into(filename, |tok| {
+        visit(tok);
+        if subtokens {
+            visit_subtokens(tok, &mut visit);
+        }
+    });
+}
+
 fn tokenize_into<F: FnMut(&str)>(filename: &str, mut visit: F) {
     // Fast ASCII path: lowercase once into a single buffer, then split.
     // Falls back to per-token Unicode lowercase if non-ASCII is present.
@@ -120,16 +376,26 @@ fn tokenize_into<F: FnMut(&str)>(filename: &str, mut visit: F) {
         // Safe because we just verified ASCII; make_ascii_lowercase is in-place.
         buf.make_ascii_lowercase();
         for tok in buf.split(is_separator) {
-            if tok.len() < MIN_KEYWORD_LEN { continue; }
-            if COMMON_WORDS_SKIP.contains(&tok) { continue; }
+            if tok.len() < MIN_KEYWORD_LEN {
+                continue;
+            }
+            if COMMON_WORDS_SKIP.contains(&tok) {
+                continue;
+            }
             visit(tok);
         }
     } else {
         // Mixed / non-ASCII: do Unicode-aware lowercase per token.
         for raw in filename.split(is_separator) {
-            if raw.len() < MIN_KEYWORD_LEN { continue; }
-            let lc = raw.to_lowercase();
-            if COMMON_WORDS_SKIP.contains(&lc.as_str()) { continue; }
+            if raw.len() < MIN_KEYWORD_LEN {
+                continue;
+            }
+            // Fold before lowercasing, and note that folding can EMPTY a token:
+            // a word written entirely in combining marks leaves nothing behind.
+            let lc = fold_token(raw);
+            if lc.is_empty() || COMMON_WORDS_SKIP.contains(&lc.as_str()) {
+                continue;
+            }
             visit(&lc);
         }
     }
@@ -197,6 +463,10 @@ pub struct KeywordIndex {
     /// clears an id from pending when it re-adds it, so a delete-then-re-add
     /// sequence cannot resurrect the deletion at compact time.
     pending_removals: DashMap<TokenHash, Vec<FileId>>,
+    /// Emit letter/digit sub-tokens alongside whole words (see
+    /// `visit_subtokens`). Fixed at construction: `add_file` and `remove_file`
+    /// must tokenise identically for the life of the index, or postings leak.
+    subtokens: bool,
 }
 
 /// Shrink a DashMap only when it has at least 2x more slots than entries.
@@ -220,10 +490,40 @@ impl KeywordIndex {
         Self::default()
     }
 
+    /// An index that also stores sub-tokens. See `index_tokens_into`.
+    pub fn with_subtokens(subtokens: bool) -> Self {
+        Self {
+            subtokens,
+            ..Self::default()
+        }
+    }
+
+    pub fn subtokens_enabled(&self) -> bool {
+        self.subtokens
+    }
+
+    /// Does any file carry this token? Cheap: two map probes, no posting is
+    /// decoded.
+    ///
+    /// Errs towards "yes". A cold posting whose ids are all pending removal
+    /// still reports true until the next compaction, and a token whose hash
+    /// collides with a real one reports true forever. Both only mean the word
+    /// is treated as known and behaves exactly as before — never that a
+    /// genuinely present word is dropped from a query.
+    pub fn contains_token(&self, token: &str) -> bool {
+        let th = token_hash(token);
+        if let Some(v) = self.hot.get(&th) {
+            if !v.is_empty() {
+                return true;
+            }
+        }
+        self.cold.contains_key(&th)
+    }
+
     /// Index a file by filename. Idempotent — re-adding the same id under a token
     /// is a no-op (it is already in the decoded list).
     pub fn add_file(&self, id: FileId, filename: &str) {
-        tokenize_into(filename, |token| {
+        index_tokens_into(filename, self.subtokens, |token| {
             let th = token_hash(token);
             // Cheap: insert into the small hot Vec. No cold decode/encode — the cost
             // is O(hot posting) regardless of how large the cold posting is. If the
@@ -245,7 +545,8 @@ impl KeywordIndex {
 
     /// Remove a file from all its postings (file eviction / source removal).
     pub fn remove_file(&self, id: FileId, filename: &str) {
-        tokenize_into(filename, |token| {
+        // Same tokeniser, same flag as add_file — see index_tokens_into.
+        index_tokens_into(filename, self.subtokens, |token| {
             let th = token_hash(token);
             // Remove from the hot tier if present (cheap).
             if let Some(mut v) = self.hot.get_mut(&th) {
@@ -279,7 +580,11 @@ impl KeywordIndex {
         match self.pending_removals.get(&th) {
             Some(pend) if !pend.is_empty() => {
                 let p = pend.value();
-                Some(out.into_iter().filter(|id| p.binary_search(id).is_err()).collect())
+                Some(
+                    out.into_iter()
+                        .filter(|id| p.binary_search(id).is_err())
+                        .collect(),
+                )
             }
             _ => Some(out),
         }
@@ -300,9 +605,19 @@ impl KeywordIndex {
                 let (mut i, mut j) = (0usize, 0usize);
                 while i < cv.len() && j < hv.len() {
                     match cv[i].0.cmp(&hv[j].0) {
-                        std::cmp::Ordering::Less => { out.push(cv[i]); i += 1; }
-                        std::cmp::Ordering::Greater => { out.push(hv[j]); j += 1; }
-                        std::cmp::Ordering::Equal => { out.push(cv[i]); i += 1; j += 1; }
+                        std::cmp::Ordering::Less => {
+                            out.push(cv[i]);
+                            i += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            out.push(hv[j]);
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            out.push(cv[i]);
+                            i += 1;
+                            j += 1;
+                        }
                     }
                 }
                 out.extend_from_slice(&cv[i..]);
@@ -336,6 +651,73 @@ impl KeywordIndex {
     /// other token is materialised and intersected. Result is ascending. Token
     /// hashing + collision behaviour unchanged (collisions add false positives that
     /// the caller's filename re-check discards).
+    /// Candidates for a grouped query: intersect the groups, union within each.
+    ///
+    /// `[[a], [b, c]]` means "holds a, AND holds b or c". Every non-boolean
+    /// query produces single-term groups and reduces to the plain intersection.
+    ///
+    /// ⚠ A GROUP THAT MATCHES NOTHING EMPTIES THE RESULT — it must, since the
+    ///   file has to satisfy every group. But an OR group is satisfied by ANY
+    ///   one member, so a branch naming a token no file contains must not empty
+    ///   it. `(S01E05 OR 1x05 OR 1x5)` contains four such branches for any given
+    ///   file, and treating them as required is the bug this replaces.
+    pub fn find_grouped(&self, groups: &[Vec<String>]) -> Vec<FileId> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        // Single-term groups go through the streaming intersection, which avoids
+        // materialising a huge posting list for a common word. Peel them off so
+        // the ordinary query keeps that path unchanged.
+        let singles: Vec<String> = groups
+            .iter()
+            .filter(|g| g.len() == 1)
+            .map(|g| g[0].clone())
+            .collect();
+        let multis: Vec<&Vec<String>> = groups.iter().filter(|g| g.len() > 1).collect();
+
+        if multis.is_empty() {
+            return self.find_intersection(&singles);
+        }
+
+        let mut result = if singles.is_empty() {
+            let mut seed = self.union_of(multis[0]);
+            seed.sort_unstable();
+            seed.dedup();
+            seed
+        } else {
+            self.find_intersection(&singles)
+        };
+        if result.is_empty() {
+            return result;
+        }
+
+        let start = usize::from(singles.is_empty());
+        for g in &multis[start..] {
+            let mut u = self.union_of(g);
+            u.sort_unstable();
+            u.dedup();
+            if u.is_empty() {
+                return Vec::new();
+            }
+            result.retain(|id| u.binary_search(id).is_ok());
+            if result.is_empty() {
+                return result;
+            }
+        }
+        result
+    }
+
+    /// Every file holding at least one of these tokens. Unsorted, may repeat.
+    fn union_of(&self, tokens: &[String]) -> Vec<FileId> {
+        let mut out = Vec::new();
+        for t in tokens {
+            if let Some(v) = self.materialize(token_hash(t)) {
+                out.extend_from_slice(&v);
+            }
+        }
+        out
+    }
+
     pub fn find_intersection(&self, tokens: &[String]) -> Vec<FileId> {
         if tokens.is_empty() {
             return Vec::new();
@@ -348,7 +730,11 @@ impl KeywordIndex {
             .enumerate()
             .min_by_key(|(_, h)| {
                 let n = self.approx_len(**h);
-                if n == 0 { usize::MAX } else { n }
+                if n == 0 {
+                    usize::MAX
+                } else {
+                    n
+                }
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -527,8 +913,15 @@ impl KeywordIndex {
                         }
                         i += 1;
                     }
-                    std::cmp::Ordering::Greater => { merged.push(hv[j]); j += 1; }
-                    std::cmp::Ordering::Equal => { merged.push(cold_ids[i]); i += 1; j += 1; }
+                    std::cmp::Ordering::Greater => {
+                        merged.push(hv[j]);
+                        j += 1;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        merged.push(cold_ids[i]);
+                        i += 1;
+                        j += 1;
+                    }
                 }
             }
             for id in &cold_ids[i..] {
@@ -589,7 +982,10 @@ mod tests {
         );
         // Whatever the indexer would produce for the same text, the search must
         // ask for. This is the property that matters, not the exact list.
-        assert_eq!(tokenize_search_term("Linux Ubuntu"), tokenize("Linux Ubuntu"));
+        assert_eq!(
+            tokenize_search_term("Linux Ubuntu"),
+            tokenize("Linux Ubuntu")
+        );
         assert_eq!(
             tokenize_search_term("Ubuntu-24.04_desktop"),
             tokenize("Ubuntu-24.04_desktop")
@@ -771,7 +1167,11 @@ mod tests {
         idx.remove_file(FileId(4), "beta.bin");
         idx.remove_file(FileId(8), "beta.bin");
         let r = idx.find_intersection(&["beta".into()]);
-        assert_eq!(r, vec![FileId(2), FileId(6)], "remove must preserve sort order");
+        assert_eq!(
+            r,
+            vec![FileId(2), FileId(6)],
+            "remove must preserve sort order"
+        );
         // Removing a non-existent hash is a no-op.
         idx.remove_file(FileId(99), "beta.bin");
         assert_eq!(idx.find_intersection(&["beta".into()]).len(), 2);
@@ -817,8 +1217,11 @@ mod tests {
 
         // The delete must NOT resurface when compact applies the batch.
         idx.compact();
-        assert_eq!(idx.find_intersection(&["linux".to_string()]), vec![a, b],
-            "re-added file was wrongly deleted at compact");
+        assert_eq!(
+            idx.find_intersection(&["linux".to_string()]),
+            vec![a, b],
+            "re-added file was wrongly deleted at compact"
+        );
     }
 
     #[test]
@@ -842,9 +1245,14 @@ mod tests {
         // A new add after compact goes to hot; search merges cold+hot.
         let d = crate::state::file_id::FileId(4096);
         idx.add_file(d, "Linux Fedora.iso");
-        assert_eq!(idx.find_intersection(&["linux".to_string()]), vec![a, b, d, c]
-            .into_iter().collect::<std::collections::BTreeSet<_>>()
-            .into_iter().collect::<Vec<_>>());
+        assert_eq!(
+            idx.find_intersection(&["linux".to_string()]),
+            vec![a, b, d, c]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
 
         // Remove hits whichever tier holds it; b is in cold, d in hot.
         idx.remove_file(b, "Linux Debian.iso");
@@ -862,7 +1270,10 @@ mod tests {
 
         // Multi-token intersection.
         idx.add_file(a, "debian");
-        assert_eq!(idx.find_intersection(&["linux".to_string(), "debian".to_string()]), vec![a]);
+        assert_eq!(
+            idx.find_intersection(&["linux".to_string(), "debian".to_string()]),
+            vec![a]
+        );
     }
 
     #[test]
@@ -890,5 +1301,315 @@ mod tests {
         assert_eq!(r2, vec![FileId(1)]);
         // unknown token -> empty
         assert!(idx.find_intersection(&["windows".into()]).is_empty());
+    }
+    #[test]
+    fn an_accented_query_finds_a_plain_name() {
+        // The compatibility gap: a client sends what the user typed, a public
+        // server folds the accent and returns 153 results, this one returned 0.
+        // Indexing and lookup share `tokenize_into`, so folding either side
+        // folds both — which is the only way the two cannot drift apart.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "Le Chateau dans le Ciel");
+        assert_eq!(
+            idx.find_intersection(&tokenize_search_term("château")),
+            vec![FileId(1)],
+            "an accented query must reach a name spelled without the accent"
+        );
+        assert_eq!(
+            idx.find_intersection(&tokenize_search_term("CHÂTEAU")),
+            vec![FileId(1)]
+        );
+    }
+
+    #[test]
+    fn the_two_unicode_encodings_of_one_word_agree() {
+        // Beyond the reference implementation, deliberately: public servers do
+        // NOT fold the decomposed form, measured. Both encodings are on the
+        // network, so handling it makes this server better rather than equal.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "cafe society");
+        let nfc = "caf\u{e9}"; // é as one code point
+        let nfd = "cafe\u{301}"; // e + combining acute
+        assert_eq!(
+            idx.find_intersection(&tokenize_search_term(nfc)),
+            vec![FileId(1)]
+        );
+        assert_eq!(
+            idx.find_intersection(&tokenize_search_term(nfd)),
+            vec![FileId(1)]
+        );
+    }
+
+    #[test]
+    fn folding_leaves_other_scripts_alone() {
+        // Cyrillic, Greek and CJK carry no Latin-1 accents, and public servers
+        // do not fold their diacritics either. Touching them would change
+        // matching for the majority of this server's non-ASCII traffic to no
+        // purpose.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "детское видео");
+        idx.add_file(FileId(2), "日本語 のファイル");
+        assert_eq!(
+            idx.find_intersection(&tokenize_search_term("детское")),
+            vec![FileId(1)]
+        );
+        assert_eq!(
+            idx.find_intersection(&tokenize_search_term("日本語")),
+            vec![FileId(2)]
+        );
+    }
+
+    #[test]
+    fn a_multi_word_term_is_still_an_intersection() {
+        // The regression that took the server from 3% CPU to 92%: a client
+        // sending the whole query as one node had its words turned into
+        // alternatives, so the candidate set became the union of three common
+        // words across a 1.6M-file index instead of their intersection.
+        //
+        // Results stayed correct — `evaluate` still applied the real condition —
+        // which is exactly why nothing looked wrong except the load.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "ubuntu linux bible");
+        idx.add_file(FileId(2), "ubuntu server guide");
+        idx.add_file(FileId(3), "linux kernel internals");
+
+        // One group per word: all three required.
+        let anded = vec![
+            vec!["ubuntu".to_string()],
+            vec!["linux".to_string()],
+            vec!["bible".to_string()],
+        ];
+        assert_eq!(idx.find_grouped(&anded), vec![FileId(1)]);
+
+        // The same three words in ONE group would be alternatives, which is
+        // both the wrong answer and the expensive one.
+        let ored = vec![vec![
+            "ubuntu".to_string(),
+            "linux".to_string(),
+            "bible".to_string(),
+        ]];
+        let mut got = idx.find_grouped(&ored);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![FileId(1), FileId(2), FileId(3)],
+            "a single group unions — which is why a multi-word term must not \
+             become one"
+        );
+    }
+
+    #[test]
+    fn an_or_group_does_not_demand_every_branch() {
+        // The television search that returned nothing: one file holds exactly
+        // one of the five episode spellings, and the intersection demanded all
+        // five.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "Rick and Morty S01E05 1080p");
+        idx.add_file(FileId(2), "Rick and Morty S01E06 1080p");
+
+        let groups = vec![
+            vec!["morty".to_string()],
+            vec![
+                "s01e05".to_string(),
+                "1x05".to_string(),
+                "01x05".to_string(),
+                "1x5".to_string(),
+            ],
+        ];
+        assert_eq!(idx.find_grouped(&groups), vec![FileId(1)]);
+
+        // A branch naming a token no file holds must not empty the result — it
+        // is an alternative, not a requirement. This is the discriminating case
+        // from the report.
+        let with_ghost = vec![
+            vec!["morty".to_string()],
+            vec!["nonexistent_token_xyzzy".to_string(), "s01e06".to_string()],
+        ];
+        assert_eq!(idx.find_grouped(&with_ghost), vec![FileId(2)]);
+    }
+
+    #[test]
+    fn every_group_still_has_to_be_satisfied() {
+        // Unioning within a group must not turn into unioning across them: AND
+        // is still AND.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "alpha bravo");
+        idx.add_file(FileId(2), "alpha charlie");
+        let groups = vec![
+            vec!["alpha".to_string()],
+            vec!["bravo".to_string(), "delta".to_string()],
+        ];
+        assert_eq!(idx.find_grouped(&groups), vec![FileId(1)]);
+
+        // A group nothing satisfies empties the result.
+        let impossible = vec![
+            vec!["alpha".to_string()],
+            vec!["delta".to_string(), "echo".to_string()],
+        ];
+        assert!(idx.find_grouped(&impossible).is_empty());
+    }
+
+    #[test]
+    fn a_query_with_no_plain_terms_still_works() {
+        // `(a OR b)` alone: no single-term group to seed from, so the seed has
+        // to come from the first union.
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "alpha bravo");
+        idx.add_file(FileId(2), "charlie delta");
+        let groups = vec![vec!["bravo".to_string(), "charlie".to_string()]];
+        let mut got = idx.find_grouped(&groups);
+        got.sort();
+        assert_eq!(got, vec![FileId(1), FileId(2)]);
+    }
+
+    // ─── sub-tokens (issue #14 follow-up) ─────────────────────────────────
+
+    fn subs(word: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        visit_subtokens(word, &mut |t: &str| out.push(t.to_string()));
+        out
+    }
+
+    #[test]
+    fn subtokens_of_an_episode_tag_include_the_season() {
+        // The case that motivated the whole change. Plain run splitting gives
+        // s|01|e|08 and every piece falls under the minimum — s01 would never
+        // exist. The PAIRS are what produce it.
+        assert_eq!(subs("s01e08"), vec!["s01", "01e", "e08"]);
+    }
+
+    #[test]
+    fn subtokens_of_a_resolution_tag() {
+        // The pair "1080p" is the word itself and is not emitted twice.
+        assert_eq!(subs("1080p"), vec!["1080"]);
+    }
+
+    #[test]
+    fn subtokens_of_a_three_run_word() {
+        assert_eq!(
+            subs("kxv7171wjq"),
+            vec!["kxv", "7171", "wjq", "kxv7171", "7171wjq"]
+        );
+    }
+
+    #[test]
+    fn a_single_run_word_has_no_subtokens() {
+        assert!(subs("ubuntu").is_empty());
+        assert!(subs("2026").is_empty());
+    }
+
+    #[test]
+    fn two_character_pieces_are_not_subtokens() {
+        // SUBTOKEN_MIN_LEN is 3 on purpose: "01", "08", "e0" out of every
+        // episode tag would each carry a posting the size of the TV corpus.
+        for t in subs("s01e08") {
+            assert!(t.len() >= 3, "{t} is below SUBTOKEN_MIN_LEN");
+        }
+        assert!(subs("x5").is_empty());
+    }
+
+    #[test]
+    fn an_identifier_with_many_runs_is_left_whole() {
+        // Release ids that alternate letters and digits many times: past
+        // SUBTOKEN_MAX_RUNS the word stays whole.
+        assert!(subs("a1b2c3d4e5").is_empty());
+        // ...while a double-episode tag, six runs, is still split.
+        assert!(!subs("s01e08e09").is_empty());
+    }
+
+    #[test]
+    fn a_hex_identifier_is_left_whole_even_with_few_runs() {
+        // The run cap does NOT catch this one: four long runs. Found by this test
+        // failing against the first version of the rule, whose comment claimed
+        // hashes were covered. They were not.
+        assert!(subs("deadbeef1234cafe5678").is_empty());
+        assert!(subs("3a7f2b9c").is_empty()); // CRC32
+        assert!(subs("d41d8cd98f00b204e9800998ecf8427e").is_empty()); // md5
+                                                                      // Not hex: 's' and 'p' are outside a-f, so these still split.
+        assert!(!subs("s01e08").is_empty());
+        assert!(!subs("1080p").is_empty());
+    }
+
+    #[test]
+    fn the_mid_run_gap_is_real_and_documented() {
+        // NOT a superset of Lugdunum: 1x05 begins in the middle of the run 01 in
+        // 01x05, so no run or pair produces it. Pinned so that nobody "fixes"
+        // the comment without also fixing the behaviour.
+        let got = subs("01x05");
+        assert!(!got.contains(&"1x05".to_string()));
+        assert_eq!(got, vec!["01x", "x05"]);
+    }
+
+    #[test]
+    fn subtokens_make_parts_of_a_word_findable() {
+        let idx = KeywordIndex::with_subtokens(true);
+        idx.add_file(FileId(1), "Some Show S01E08 1080p.mkv");
+        idx.add_file(FileId(2), "Some Show S02E01 720p.mkv");
+
+        assert_eq!(idx.find_intersection(&["s01".into()]), vec![FileId(1)]);
+        assert_eq!(idx.find_intersection(&["e08".into()]), vec![FileId(1)]);
+        assert_eq!(idx.find_intersection(&["1080".into()]), vec![FileId(1)]);
+        assert_eq!(idx.find_intersection(&["720".into()]), vec![FileId(2)]);
+        // Whole words still work exactly as before.
+        assert_eq!(idx.find_intersection(&["s01e08".into()]), vec![FileId(1)]);
+        let mut both = idx.find_intersection(&["show".into()]);
+        both.sort();
+        assert_eq!(both, vec![FileId(1), FileId(2)]);
+        // And combine with them: "<title> s01" is the query this is for.
+        assert_eq!(
+            idx.find_intersection(&["show".into(), "s01".into()]),
+            vec![FileId(1)]
+        );
+    }
+
+    #[test]
+    fn without_the_flag_nothing_changes() {
+        let idx = KeywordIndex::new();
+        idx.add_file(FileId(1), "Some Show S01E08 1080p.mkv");
+        assert!(idx.find_intersection(&["s01".into()]).is_empty());
+        assert!(idx.find_intersection(&["1080".into()]).is_empty());
+        assert_eq!(idx.find_intersection(&["s01e08".into()]), vec![FileId(1)]);
+    }
+
+    #[test]
+    fn remove_file_removes_every_subtoken_it_added() {
+        // The invariant that makes the flag startup-only. A token added and not
+        // removed is a stale id in a posting forever — nothing compacts it out.
+        let idx = KeywordIndex::with_subtokens(true);
+        let name = "Some Show S01E08 kxv7171wjq 1080p.mkv";
+        idx.add_file(FileId(7), name);
+        let mut added = Vec::new();
+        index_tokens_into(name, true, |t| added.push(t.to_string()));
+        assert!(added.len() > 6, "sub-tokens should have been emitted");
+        for t in &added {
+            assert_eq!(idx.find_intersection(&[t.clone()]), vec![FileId(7)], "{t}");
+        }
+
+        idx.remove_file(FileId(7), name);
+        for t in &added {
+            assert!(
+                idx.find_intersection(&[t.clone()]).is_empty(),
+                "{t} still points at a removed file"
+            );
+        }
+        // And through a compaction, where the cold tier is involved.
+        idx.add_file(FileId(8), name);
+        idx.compact();
+        idx.remove_file(FileId(8), name);
+        idx.compact();
+        for t in &added {
+            assert!(
+                idx.find_intersection(&[t.clone()]).is_empty(),
+                "{t} survived compaction after removal"
+            );
+        }
+    }
+
+    #[test]
+    fn query_terms_are_not_sub_tokenised() {
+        // Indexing only. A query for s01e08 stays one whole token; splitting it
+        // would intersect four postings, three enormous, for the same answer.
+        assert_eq!(tokenize_search_term("S01E08"), vec!["s01e08"]);
+        assert_eq!(tokenize_search_term("1080p"), vec!["1080p"]);
     }
 }

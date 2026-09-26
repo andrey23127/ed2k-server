@@ -1,4 +1,4 @@
-# ed2k-server — VPS PUBLIC DEPLOYMENT config
+# ed2k-server v0.9.76 — VPS PUBLIC DEPLOYMENT config
 # Copy to /etc/ed2k-server/config.toml and edit the fields marked CHANGE_ME
 
 [server]
@@ -37,7 +37,6 @@ seed_servers = [
 "185.237.185.226:31031",
 "57.131.35.107:4232",
 "91.119.202.44:4321",
-"193.187.90.12:4661",
 "213.141.198.207:4232",
 "85.17.116.222:6082",
 "212.95.35.240:4232",
@@ -71,6 +70,45 @@ support_crypt = true
 #   weakened, this option must go with it.
 hairpin_lan_clients = false
 
+# ── HighID hello check ──────────────────────────────────────────────────────
+# HighID is decided by a TCP connect to the client's port. That proves something
+# listens there, not that it is THIS client: behind a NAT shared by two eD2k
+# clients (two machines at home, or strangers behind a provider's CGNAT) the
+# forward leads to one of them and the other used to get a HighID that sends
+# every peer to the wrong machine.
+#
+# Both options below re-check HighID clients with a client-to-client OP_HELLO in
+# the BACKGROUND and compare the user hash in the answer. The login is never
+# delayed. Counters on the Status tab, cases in GET /api/highid_mismatches.
+#
+# observe  — count only, nothing changes for the client.
+# downgrade — a port that answers with ANOTHER client's hash marks
+#             (IP, port, login hash); that client's next logins get LowID until
+#             the mark expires or its own hash answers again. The first session
+#             after a mismatch keeps HighID.
+#
+# No answer (silent close, reset, timeout — often just the peer's IP filter)
+# NEVER costs HighID. The hairpin path above is separate and unaffected.
+highid_verify_observe = true
+highid_downgrade_on_wrong_hash = true
+highid_wrong_hash_ttl_secs = 86400      # 24 h
+
+# ── IPv6 ────────────────────────────────────────────────────────────────────
+# Accept clients over IPv6: separate IPv6-only sockets, TCP on tcp_port and UDP
+# on tcp_port + 4. The IPv4 path is unchanged, and a host without IPv6 logs a
+# warning and keeps serving IPv4. Restart to apply.
+ipv6_enabled = true
+listen_ip6 = "::"                       # DO NOT change — :: is correct
+
+# Your VPS public IPv6, announced to clients that speak the extension.
+# Leave empty if the VPS has none.
+this_ip6 = ""                           # e.g. "2001:db8:1234::2"
+
+# Publish a client that is LowID on IPv4 but has a public IPv6 as an IPv6 source,
+# to peers that can parse it (eMuleQt, eNode-go and compatible mods). Clients
+# that do not know the extension never see it. Independent of ipv6_enabled.
+ipv6_publish_sources = true
+
 [limits]
 max_clients = 5000
 soft_limit_files = 5000
@@ -78,6 +116,22 @@ hard_limit_files = 7500
 max_clients_per_ip = 10
 max_string_size = 250
 ping_delay_seconds = 300
+
+# ── Search ──────────────────────────────────────────────────────────────────
+# Results per search, across all pages; best-sourced first. One value for every
+# client (Lugdunum varies it by zlib support and halves it for LowID).
+# Default 200, ceiling 5000.
+max_search_results = 300
+# Candidates examined when ranking one search; must be >= max_search_results.
+# The share of searches that hit it is on the Status tab.
+search_rank_scan = 20000
+# Also index letter/digit pieces of words: S01E08 is found by s01 and e08,
+# 1080p by 1080. Read at STARTUP only. Off = the behaviour before 0.9.76.
+index_subtokens = true
+# Ignore query words no indexed file contains instead of returning nothing
+# (a typo no longer empties the search). A query of only unknown words still
+# returns nothing.
+search_drop_unknown_words = true
 
 [content_filter]
 # BAN LIST: blocked AND counted against the publisher. Material whose publisher

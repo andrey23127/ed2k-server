@@ -8,8 +8,8 @@
 #[allow(dead_code)]
 pub mod file_id;
 pub mod keyword_index;
-pub mod posting_codec;
 pub mod name_interner;
+pub mod posting_codec;
 pub mod smart_sources;
 
 use crate::filter::ContentFilter;
@@ -50,6 +50,17 @@ pub struct ClientHandle {
     pub nick: String,
     pub server_flags: u32,
     pub is_high_id: bool,
+    /// This client can parse an inline IPv6 source record.
+    ///
+    /// Set at login from either signal: the session itself arrived over IPv6, or
+    /// the client sent `CT_MOD_IP_V6`. Read on every source reply to decide
+    /// whether the longer record is safe to send — a client without it must
+    /// receive the classic layout byte for byte, or its parser walks off the end
+    /// of the packet.
+    pub ipv6_capable: bool,
+    /// The client's own public IPv6, if it advertised one and it is usable as a
+    /// source address. `None` for the overwhelming majority.
+    pub ipv6: Option<std::net::Ipv6Addr>,
     pub connected_at: Instant,
     /// ISO-3166-1 alpha-2 country code, "??" if unknown. Set from ip-to-country.csv.
     pub country: String,
@@ -98,7 +109,8 @@ impl ClientHandle {
     /// Milliseconds since the last recorded activity (TCP or UDP).
     pub fn idle_ms(&self) -> u64 {
         Self::now_ms().saturating_sub(
-            self.last_activity_ms.load(std::sync::atomic::Ordering::Relaxed),
+            self.last_activity_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -132,19 +144,36 @@ impl ClientHandle {
 /// of source links) that enum overhead alone is ~1 GB.
 ///
 /// This struct stores the IPv4 address as a raw `u32` (the only family eD2k
-/// peers use as sources) and folds the completeness flag into the top bit of
-/// the port field, giving 16 + 4 + 2 = 22 bytes (24 with alignment). For the
-/// rare IPv6 peer we simply store 0 (it can't be an eD2k source IP anyway), the
-/// same as the old code which `unwrap`ed V4 octets and treated others as 0.
+/// peers use as sources), the port whole, and the completeness flag beside it:
+/// 16 + 4 + 2 + 1 = 23 bytes, which the alignment rounds to the same 24 the
+/// packed version occupied. For the rare IPv6 peer we simply store 0 (it can't
+/// be an eD2k source IP anyway), the same as the old code which `unwrap`ed V4
+/// octets and treated others as 0.
+///
+/// ⚠ THE FLAG USED TO LIVE IN THE PORT'S TOP BIT, AND THAT WAS WRONG. The
+///   comment justifying it said "the top bit is free in every realistic port
+///   value". It is not: ports 32768-65535 are half the range and are exactly
+///   what a client picks when it chooses one at random. Such a peer was
+///   published with its port silently reduced by 32768 — a real client
+///   listening on 39239 was handed to everyone as 6471.
+///
+///   The failure was invisible from here. The source list looked healthy, the
+///   count was right, nothing was logged; downloads from that peer simply never
+///   started, which reads to a user as "sources found but nothing happens".
+///   Found only because a test peer's advertised port and its published port
+///   were compared by hand.
+///
+///   The packing bought nothing. 22 bytes and 23 bytes both round up to 24
+///   under a 4-byte alignment, so the flag was squeezed into the port to save
+///   memory that alignment was going to spend regardless.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Source {
-    pub user_hash: UserHash,   // 16 bytes — needed for dedup and self-filter
-    pub ipv4: u32,             // 4 bytes  — native-endian IPv4 octets, 0 if not V4
-    port_complete: u16,        // 2 bytes  — port in low 15 bits, complete in top bit
+    pub user_hash: UserHash, // 16 bytes — needed for dedup and self-filter
+    pub ipv4: u32,           // 4 bytes  — native-endian IPv4 octets, 0 if not V4
+    port: u16,               // 2 bytes  — the whole port, all 65536 values
+    complete: bool,          // 1 byte   — free: alignment pads to 24 either way
 }
-
-const SRC_COMPLETE_BIT: u16 = 0x8000;
 
 impl Source {
     pub fn new(user_hash: UserHash, ip: IpAddr, port: u16, complete: bool) -> Self {
@@ -152,30 +181,27 @@ impl Source {
             IpAddr::V4(v4) => u32::from_le_bytes(v4.octets()),
             IpAddr::V6(_) => 0,
         };
-        // Ports are 16-bit; eD2k never uses port 0 for a real source, and the
-        // top bit is free in every realistic port value, so steal it for the
-        // completeness flag. (Defensive: mask the port to 15 bits.)
-        let pc = (port & 0x7FFF) | if complete { SRC_COMPLETE_BIT } else { 0 };
-        Source { user_hash, ipv4, port_complete: pc }
+        Source {
+            user_hash,
+            ipv4,
+            port,
+            complete,
+        }
     }
 
     #[inline]
     pub fn port(&self) -> u16 {
-        self.port_complete & 0x7FFF
+        self.port
     }
 
     #[inline]
     pub fn complete(&self) -> bool {
-        self.port_complete & SRC_COMPLETE_BIT != 0
+        self.complete
     }
 
     #[inline]
     pub fn set_complete(&mut self, complete: bool) {
-        if complete {
-            self.port_complete |= SRC_COMPLETE_BIT;
-        } else {
-            self.port_complete &= !SRC_COMPLETE_BIT;
-        }
+        self.complete = complete;
     }
 
     /// IPv4 back as an `IpAddr` for the encode paths that still want one.
@@ -275,6 +301,183 @@ pub const ALIAS_MAX_FILES: usize = 20_000;
 /// stays bounded by ALIAS_MAX_FILES and its TTL regardless.
 pub const ALIAS_MIN_SIZE: u64 = 2 * 1024 * 1024;
 
+/// Counters for `network.highid_verify_observe`: what the identity probe finds
+/// on clients the plain probe already gave HighID. Observation only — nothing
+/// here changes an id.
+///
+/// Held in an `Arc` because the probe runs in a detached task that outlives the
+/// login's borrow of the state.
+pub struct HighIdObserve {
+    /// Answered OP_HELLOANSWER with the user hash that logged in: HighID under
+    /// the stricter rule too.
+    pub verified: std::sync::atomic::AtomicU64,
+    /// Of `verified`: accepted only because the type-marker bytes are ignored
+    /// (see `same_client_hash`). Kept visible so the correction can be seen
+    /// rather than silently absorbed into "verified".
+    pub verified_marker_variant: std::sync::atomic::AtomicU64,
+    /// Answered, but with a DIFFERENT user hash: the port is forwarded to some
+    /// other eD2k client. HighID here points peers at the wrong machine.
+    pub mismatch: std::sync::atomic::AtomicU64,
+    /// Accepted the TCP connection but produced no usable answer. These are the
+    /// clients a Lugdunum-style check would turn into LowID.
+    pub no_answer: std::sync::atomic::AtomicU64,
+    /// Logins given LowID because a wrong-hash mark was active for them
+    /// (`network.highid_downgrade_on_wrong_hash`).
+    pub downgraded: std::sync::atomic::AtomicU64,
+    /// Marks dropped because the port answered with the client's own hash
+    /// again: forwarding fixed, HighID from the next login on.
+    pub marks_cleared: std::sync::atomic::AtomicU64,
+    /// Wrong-hash marks: (address, port, login hash) → expiry. A login matching
+    /// a live mark gets LowID. Small — a handful an hour — and bounded by
+    /// `MAX_MARKS` regardless.
+    pub wrong_hash_marks: DashMap<(IpAddr, u16, UserHash), std::time::Instant>,
+    /// Not probed because the concurrency cap was full.
+    pub skipped_busy: std::sync::atomic::AtomicU64,
+    /// `no_answer` broken down by the probe's own reason string, which is what
+    /// tells "port leads nowhere useful" from "our timeout is too short".
+    pub reasons: DashMap<&'static str, u64>,
+    /// Caps concurrent background probes.
+    pub permits: std::sync::Arc<tokio::sync::Semaphore>,
+    /// The most recent mismatches, newest last, bounded. Kept so the admin UI
+    /// can check each one against who is connected NOW: an answering hash that
+    /// is logged in to us from the same address is a second client behind the
+    /// same NAT, which the counters alone cannot show.
+    pub recent_mismatches: std::sync::Mutex<std::collections::VecDeque<HighIdMismatch>>,
+}
+
+/// One "port answered with a different user hash".
+#[derive(Clone, Debug)]
+pub struct HighIdMismatch {
+    /// Seconds since the Unix epoch.
+    pub at: u64,
+    pub ip: IpAddr,
+    pub port: u16,
+    /// The hash that logged in and was given HighID.
+    pub login_hash: UserHash,
+    /// The hash of whoever actually answered on that address and port.
+    pub answered_hash: UserHash,
+    /// Whether a mark was set (or renewed) for it, so the client's next logins
+    /// get LowID — verdict mode — rather than the case only being counted.
+    pub marked: bool,
+}
+
+impl HighIdObserve {
+    /// Enough for steady-state logins; a reconnect storm after a restart is
+    /// exactly when this should shed load rather than add it.
+    pub const MAX_CONCURRENT: usize = 64;
+    /// Mismatches kept for inspection. Around 20 a hour on a 10k-client server,
+    /// so a thousand covers roughly two days; each entry is a few dozen bytes.
+    pub const RECENT_MISMATCHES: usize = 1000;
+    /// Wrong-hash marks kept at most. Tens a day are expected; the cap only
+    /// matters if something floods mismatches, and then new marks are dropped
+    /// (the client keeps HighID, the old behaviour) rather than memory grown.
+    pub const MAX_MARKS: usize = 10_000;
+
+    /// Is there a live wrong-hash mark for this login? Expired marks are
+    /// removed on the way.
+    pub fn is_marked(&self, ip: IpAddr, port: u16, hash: &UserHash) -> bool {
+        let key = (ip, port, *hash);
+        let now = std::time::Instant::now();
+        match self.wrong_hash_marks.get(&key).map(|e| *e.value()) {
+            Some(exp) if exp > now => true,
+            Some(_) => {
+                self.wrong_hash_marks.remove_if(&key, |_, exp| *exp <= now);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Set or renew a mark. Returns false when the table is full even after
+    /// dropping expired marks.
+    pub fn mark(&self, ip: IpAddr, port: u16, hash: UserHash, ttl: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        let key = (ip, port, hash);
+        if !self.wrong_hash_marks.contains_key(&key)
+            && self.wrong_hash_marks.len() >= Self::MAX_MARKS
+        {
+            self.wrong_hash_marks.retain(|_, exp| *exp > now);
+            if self.wrong_hash_marks.len() >= Self::MAX_MARKS {
+                return false;
+            }
+        }
+        self.wrong_hash_marks.insert(key, now + ttl);
+        true
+    }
+
+    /// Drop a mark; true if there was one.
+    pub fn unmark(&self, ip: IpAddr, port: u16, hash: &UserHash) -> bool {
+        self.wrong_hash_marks.remove(&(ip, port, *hash)).is_some()
+    }
+
+    /// Live marks now.
+    pub fn marks_active(&self) -> usize {
+        let now = std::time::Instant::now();
+        self.wrong_hash_marks
+            .iter()
+            .filter(|e| *e.value() > now)
+            .count()
+    }
+
+    /// Classify the recent mismatches against who is connected now:
+    /// `(same_ip, other_ip, not_connected, total)`.
+    ///
+    /// "same_ip" — the hash that answered is logged in to us from the very
+    /// address we probed: a second client behind the same NAT holds the port.
+    /// That is the case in which the HighID we gave is provably wrong.
+    pub fn classify_mismatches(
+        &self,
+        clients: &DashMap<UserHash, ClientHandle>,
+    ) -> (u64, u64, u64, u64) {
+        // Copied out first so the mutex is not held while probing the map.
+        let recent: Vec<HighIdMismatch> = self
+            .recent_mismatches
+            .lock()
+            .map(|q| q.iter().cloned().collect())
+            .unwrap_or_default();
+        let (mut same, mut other, mut none) = (0u64, 0u64, 0u64);
+        for m in &recent {
+            match clients.get(&m.answered_hash) {
+                Some(c) if c.ip == m.ip => same += 1,
+                Some(_) => other += 1,
+                None => none += 1,
+            }
+        }
+        (same, other, none, recent.len() as u64)
+    }
+
+    pub fn record_mismatch(&self, m: HighIdMismatch) {
+        if let Ok(mut q) = self.recent_mismatches.lock() {
+            if q.len() >= Self::RECENT_MISMATCHES {
+                q.pop_front();
+            }
+            q.push_back(m);
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            verified: std::sync::atomic::AtomicU64::new(0),
+            verified_marker_variant: std::sync::atomic::AtomicU64::new(0),
+            mismatch: std::sync::atomic::AtomicU64::new(0),
+            no_answer: std::sync::atomic::AtomicU64::new(0),
+            downgraded: std::sync::atomic::AtomicU64::new(0),
+            marks_cleared: std::sync::atomic::AtomicU64::new(0),
+            wrong_hash_marks: DashMap::new(),
+            skipped_busy: std::sync::atomic::AtomicU64::new(0),
+            reasons: DashMap::new(),
+            permits: std::sync::Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT)),
+            recent_mismatches: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+}
+
+impl Default for HighIdObserve {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct ServerState {
     pub clients: DashMap<UserHash, ClientHandle>,
     /// FileId slab (Stage 3): the single authoritative file store. Holds every
@@ -297,6 +500,18 @@ pub struct ServerState {
     pub user_files: DashMap<UserHash, std::collections::HashSet<file_id::FileId>>,
     pub keyword_index: KeywordIndex,
     pub smart_sources: SmartSourcesCache,
+    /// IPv6 address of a publisher, keyed by user hash.
+    ///
+    /// ⚠ A SIDE TABLE, not a field on `Source`, and the reason is arithmetic.
+    ///   `Source` is 24 bytes packed and exists roughly 33 million times on the
+    ///   reference profile; adding 16 bytes to it costs about half a gigabyte
+    ///   whether or not any of those sources has an IPv6. Here the cost is
+    ///   proportional to the number of v6-capable publishers, which is small and
+    ///   will stay small for years.
+    ///
+    /// Keyed by user hash rather than by FileId for the same reason: one entry
+    /// per client, not per published file.
+    pub client_ipv6: DashMap<UserHash, std::net::Ipv6Addr>,
     pub filter: Arc<ContentFilter>,
     next_low_id: AtomicU32,
     pub total_sessions: AtomicU32,
@@ -478,6 +693,25 @@ pub struct ServerState {
     /// Per-reason counter of blocked connection attempts.
     /// Keys: "ipfilter", "csam", "max_connections_per_ip", "rate_limit", "bot".
     pub block_stats: DashMap<String, u64>,
+
+    /// Searches that exhausted `limits.search_rank_scan` before running out of
+    /// candidates, and were therefore ranked over a prefix of the candidate set
+    /// rather than over all of it.
+    ///
+    /// Worth watching rather than merely logging: if this is a large share of
+    /// searches, the cap is deciding results often enough that keeping source
+    /// counts in the posting lists — so ranking needs no scan at all — starts to
+    /// pay for its cost on every publish. If it stays near zero, it does not.
+    pub search_rank_capped: std::sync::atomic::AtomicU64,
+    /// Total searches served, as the denominator for the above.
+    pub search_total: std::sync::atomic::AtomicU64,
+    /// Searches in which at least one word was dropped as unknown to the index
+    /// (see `limits.search_drop_unknown_words`). Each of these returned
+    /// something where it used to return nothing.
+    pub search_words_dropped: std::sync::atomic::AtomicU64,
+
+    /// See `network.highid_verify_observe`.
+    pub highid_observe: std::sync::Arc<HighIdObserve>,
 }
 
 /// Sliding-window query tracker per client IP.
@@ -539,6 +773,8 @@ impl ServerState {
             natt_capable: udp != 0,
             nick: "test".into(),
             server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
             is_high_id: high_id,
             connected_at: std::time::Instant::now(),
             country: "??".into(),
@@ -546,9 +782,9 @@ impl ServerState {
             shared_files: 0,
             csam_attempts: 0,
             tx: Some(tx),
-            last_activity_ms: std::sync::Arc::new(
-                std::sync::atomic::AtomicU64::new(ClientHandle::now_ms()),
-            ),
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                ClientHandle::now_ms(),
+            )),
         };
         self.index_client_id(handle.assigned_id, user_hash);
         self.clients.insert(user_hash, handle);
@@ -689,7 +925,10 @@ impl ServerState {
             .insert(user_hash, std::time::Instant::now())
             .is_none();
         if was_new {
-            *self.block_stats.entry("publisher_ban".to_string()).or_insert(0) += 1;
+            *self
+                .block_stats
+                .entry("publisher_ban".to_string())
+                .or_insert(0) += 1;
         }
     }
 
@@ -702,7 +941,10 @@ impl ServerState {
             .insert(user_hash, std::time::Instant::now())
             .is_none();
         if was_new {
-            *self.block_stats.entry("publisher_ban".to_string()).or_insert(0) += 1;
+            *self
+                .block_stats
+                .entry("publisher_ban".to_string())
+                .or_insert(0) += 1;
         }
         was_new
     }
@@ -722,7 +964,9 @@ impl ServerState {
             user_files: DashMap::new(),
             file_slab: file_id::FileSlab::new(),
             name_interner: name_interner::NameInterner::new(),
-            keyword_index: KeywordIndex::new(),
+            // Fixed for the life of the index — see LimitsConfig::index_subtokens.
+            keyword_index: KeywordIndex::with_subtokens(cfg.limits.index_subtokens),
+            client_ipv6: DashMap::new(),
             smart_sources: SmartSourcesCache::new(),
             filter,
             next_low_id: AtomicU32::new(1),
@@ -756,7 +1000,46 @@ impl ServerState {
             review_watermark: std::sync::Mutex::new(None),
             csam_files_by_user: DashMap::new(),
             block_stats: DashMap::new(),
+            search_rank_capped: std::sync::atomic::AtomicU64::new(0),
+            search_total: std::sync::atomic::AtomicU64::new(0),
+            search_words_dropped: std::sync::atomic::AtomicU64::new(0),
+            highid_observe: std::sync::Arc::new(HighIdObserve::new()),
         }
+    }
+
+    /// Ranking ran out of examination budget on this search.
+    #[inline]
+    pub fn note_search_rank_capped(&self) {
+        self.search_rank_capped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One search served, capped or not.
+    #[inline]
+    pub fn note_search(&self) {
+        self.search_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A search had at least one word dropped as unknown.
+    #[inline]
+    pub fn note_search_words_dropped(&self) {
+        self.search_words_dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn search_words_dropped_count(&self) -> u64 {
+        self.search_words_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// (searches that hit the ranking scan cap, searches served).
+    pub fn search_rank_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.search_rank_capped.load(Relaxed),
+            self.search_total.load(Relaxed),
+        )
     }
 
     pub fn allocate_low_id(&self) -> u32 {
@@ -768,12 +1051,17 @@ impl ServerState {
         id
     }
 
-    pub fn client_count(&self) -> usize { self.clients.len() }
-    pub fn file_count(&self)  -> usize { self.file_slab.live_count() }
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+    pub fn file_count(&self) -> usize {
+        self.file_slab.live_count()
+    }
 
     /// Count LowID clients (behind NAT, not reachable directly).
     pub fn lowid_count(&self) -> usize {
-        self.lowid_count_cached.load(std::sync::atomic::Ordering::Relaxed) as usize
+        self.lowid_count_cached
+            .load(std::sync::atomic::Ordering::Relaxed) as usize
     }
 
     /// Create a (Sender, Receiver) pair and store the Sender in the ClientHandle.
@@ -822,7 +1110,16 @@ impl ServerState {
                     // as unreachable as one behind RFC1918.
                     && !(v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
             }
-            IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
+            // ⚠ ONE RULE, ONE PLACE. This used to test only loopback,
+            //   unspecified and multicast, while `is_publishable_ipv6` — which
+            //   decides whether to record a client's address in the first place
+            //   — additionally rejected link-local and unique-local. Two
+            //   functions answering the same question differently is how an
+            //   address gets filtered on one path and published on the other;
+            //   `fe80::…` was the case that would actually happen, since a
+            //   client behind a router with no global prefix advertises exactly
+            //   that.
+            IpAddr::V6(v6) => crate::server::login::is_publishable_ipv6(v6),
         }
     }
 
@@ -842,7 +1139,8 @@ impl ServerState {
         // (with this first source) if the hash is new; otherwise we add/refresh
         // the source on the existing record. Both take one shard lock.
         let (file_id, newly_added) =
-            self.file_slab.get_or_insert(hash, size, name_arc.clone(), src);
+            self.file_slab
+                .get_or_insert(hash, size, name_arc.clone(), src);
         if !newly_added {
             // Records the source and, in the same shard lock, tells us whether
             // this publisher used a different name than the one already stored.
@@ -857,7 +1155,10 @@ impl ServerState {
         }
         // Maintain reverse index user → set of FileIds this user sources.
         // HashSet semantics dedup re-publishes of the same file by the same user.
-        self.user_files.entry(publisher_hash).or_default().insert(file_id);
+        self.user_files
+            .entry(publisher_hash)
+            .or_default()
+            .insert(file_id);
     }
 
     /// Record that `hash` has now been published under two different names.
@@ -914,16 +1215,22 @@ impl ServerState {
         if !known && self.file_aliases.len() >= ALIAS_MAX_FILES {
             return;
         }
-        let mut e = self.file_aliases.entry(hash).or_insert_with(|| AliasRecord {
-            names: vec![std::sync::Arc::clone(stored)],
-            seen: 0,
-            size,
-            last_seen: Instant::now(),
-        });
+        let mut e = self
+            .file_aliases
+            .entry(hash)
+            .or_insert_with(|| AliasRecord {
+                names: vec![std::sync::Arc::clone(stored)],
+                seen: 0,
+                size,
+                last_seen: Instant::now(),
+            });
         e.seen = e.seen.saturating_add(1);
         e.last_seen = Instant::now();
         if e.names.len() < ALIAS_MAX_NAMES
-            && !e.names.iter().any(|n| std::sync::Arc::ptr_eq(n, published_as))
+            && !e
+                .names
+                .iter()
+                .any(|n| std::sync::Arc::ptr_eq(n, published_as))
         {
             e.names.push(std::sync::Arc::clone(published_as));
         }
@@ -944,8 +1251,7 @@ impl ServerState {
             None => return,
         };
         // (file_id, name) for files that lost their last source — to evict.
-        let mut empty: Vec<(file_id::FileId, Arc<str>)> =
-            Vec::with_capacity(file_ids.len() / 4);
+        let mut empty: Vec<(file_id::FileId, Arc<str>)> = Vec::with_capacity(file_ids.len() / 4);
         for fid in &file_ids {
             // Drop this user's source from the record (one shard lock). Returns
             // true when the file is now sourceless and should be evicted.
@@ -1002,6 +1308,8 @@ impl ServerState {
             natt_capable: udp_port != 0,
             nick,
             server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
             is_high_id: false,
             connected_at: std::time::Instant::now(),
             country,
@@ -1023,7 +1331,9 @@ impl ServerState {
         for e in self.file_slab.iter_records_for_report() {
             let n = e.0 as u64;
             total_sources += n;
-            if n > max_sources { max_sources = n; }
+            if n > max_sources {
+                max_sources = n;
+            }
             name_bytes += e.1 as u64;
         }
         // Sum of all user_files set sizes (reverse-index real size).
@@ -1042,7 +1352,10 @@ impl ServerState {
             ("slab_slots".into(), self.file_slab.slot_count() as u64),
             // Dead slots quarantined for reuse. slab_slots − files − slab_free
             // ≈ slots freed within the last quarantine window (not yet reusable).
-            ("slab_free".into(), self.file_slab.free_pending_count() as u64),
+            (
+                "slab_free".into(),
+                self.file_slab.free_pending_count() as u64,
+            ),
             ("files_name_bytes".into(), name_bytes),
             ("files_sources_total".into(), total_sources),
             ("files_sources_max".into(), max_sources),
@@ -1051,17 +1364,43 @@ impl ServerState {
             ("user_files_entries_total".into(), uf_entries),
             ("keyword_keys".into(), kw_keys),
             ("keyword_postings_total".into(), kw_postings),
-            ("obf_decode_cache".into(), self.obf_decode_cache.len() as u64),
-            ("incoming_seed_challenges".into(), self.incoming_seed_challenges.len() as u64),
+            (
+                "obf_decode_cache".into(),
+                self.obf_decode_cache.len() as u64,
+            ),
+            (
+                "incoming_seed_challenges".into(),
+                self.incoming_seed_challenges.len() as u64,
+            ),
             ("banned_bots".into(), self.banned_bots.len() as u64),
-            ("banned_publishers".into(), self.banned_publishers.len() as u64),
-            ("csam_files_by_user".into(), self.csam_files_by_user.len() as u64),
-            ("csam_blocked_hashes".into(), self.csam_blocked_hashes.len() as u64),
+            (
+                "banned_publishers".into(),
+                self.banned_publishers.len() as u64,
+            ),
+            (
+                "csam_files_by_user".into(),
+                self.csam_files_by_user.len() as u64,
+            ),
+            (
+                "csam_blocked_hashes".into(),
+                self.csam_blocked_hashes.len() as u64,
+            ),
             ("csam_unique_ips".into(), self.csam_unique_ips.len() as u64),
-            ("server_list".into(),
-                self.server_list.try_read().map(|g| g.len() as u64).unwrap_or(0)),
-            ("verified_servers".into(), self.verified_servers.len() as u64),
-            ("recent_client_ips".into(), self.recent_client_ips.len() as u64),
+            (
+                "server_list".into(),
+                self.server_list
+                    .try_read()
+                    .map(|g| g.len() as u64)
+                    .unwrap_or(0),
+            ),
+            (
+                "verified_servers".into(),
+                self.verified_servers.len() as u64,
+            ),
+            (
+                "recent_client_ips".into(),
+                self.recent_client_ips.len() as u64,
+            ),
             ("bot_query_log".into(), self.bot_query_log.len() as u64),
             ("bot_detections".into(), self.bot_detections.len() as u64),
         ]
@@ -1139,11 +1478,7 @@ impl ServerState {
             client_strings +=
                 (c.nick.capacity() + c.country.capacity() + c.software.capacity()) as u64;
         }
-        let clients_slots = dm_slots(
-            self.clients.capacity(),
-            UHASH,
-            size_of::<ClientHandle>(),
-        );
+        let clients_slots = dm_slots(self.clients.capacity(), UHASH, size_of::<ClientHandle>());
 
         // ── filters (loaded once, large) ──────────────────────────────────────
         let ipfilter_bytes = self
@@ -1183,8 +1518,16 @@ impl ServerState {
         misc += dm_slots(self.banned_bots.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
         misc += dm_slots(self.bot_query_log.capacity(), IPV4, size_of::<BotTracker>());
-        misc += dm_slots(self.bot_detections.capacity(), IPV4, size_of::<BotDetection>());
-        misc += dm_slots(self.udp_sockets.capacity(), 2, size_of::<Arc<tokio::net::UdpSocket>>());
+        misc += dm_slots(
+            self.bot_detections.capacity(),
+            IPV4,
+            size_of::<BotDetection>(),
+        );
+        misc += dm_slots(
+            self.udp_sockets.capacity(),
+            2,
+            size_of::<Arc<tokio::net::UdpSocket>>(),
+        );
 
         // ── totals ────────────────────────────────────────────────────────────
         let slab_total = slab_records + slab_next + slab_buckets + slab_spilled_src;
@@ -1238,8 +1581,13 @@ impl ServerState {
             // grand total
             (
                 "GRAND_TOTAL_tracked".into(),
-                slab_total + kw_total + names_total + uf_total
-                    + clients_total + filters_total + other_total,
+                slab_total
+                    + kw_total
+                    + names_total
+                    + uf_total
+                    + clients_total
+                    + filters_total
+                    + other_total,
             ),
         ]
     }
@@ -1305,6 +1653,8 @@ mod callback_tests {
             natt_capable: false,
             nick: format!("client{id}"),
             server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
             is_high_id: high,
             connected_at: Instant::now(),
             country: "??".to_string(),
@@ -1312,9 +1662,9 @@ mod callback_tests {
             shared_files: 0,
             csam_attempts: 0,
             tx: None,
-            last_activity_ms: std::sync::Arc::new(
-                std::sync::atomic::AtomicU64::new(ClientHandle::now_ms()),
-            ),
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                ClientHandle::now_ms(),
+            )),
         }
     }
 
@@ -1332,7 +1682,9 @@ mod callback_tests {
 
         // The connection task for the LowID client would read from rx and
         // forward to the wire. Here we just check the channel actually got it.
-        let received = rx.try_recv().expect("LowID's rx should receive the callback frame");
+        let received = rx
+            .try_recv()
+            .expect("LowID's rx should receive the callback frame");
         assert_eq!(received.opcode, 0x35);
         assert_eq!(received.payload, vec![0xAA, 0xBB, 0xCC, 0xDD, 0x12, 0x34]);
     }
@@ -1366,8 +1718,12 @@ mod user_files_index_tests {
         Arc::new(ServerState::new(filter, cfg))
     }
 
-    fn fhash(n: u8) -> FileHash { [n; 16] }
-    fn uhash(n: u8) -> UserHash { [n; 16] }
+    fn fhash(n: u8) -> FileHash {
+        [n; 16]
+    }
+    fn uhash(n: u8) -> UserHash {
+        [n; 16]
+    }
 
     #[test]
     fn only_files_inside_the_counting_window_count() {
@@ -1381,11 +1737,20 @@ mod user_files_index_tests {
         let u = uhash(9);
         for i in 0..10u8 {
             let banned = s.record_csam_file_for_user(
-                u, fhash(i), "test.mp4", 1024,
-                crate::filter::Layer::L1Jargon, "t", 3,
-                Duration::from_secs(0), retention,
+                u,
+                fhash(i),
+                "test.mp4",
+                1024,
+                crate::filter::Layer::L1Jargon,
+                "t",
+                3,
+                Duration::from_secs(0),
+                retention,
             );
-            assert!(!banned, "nothing may count when the counting window is zero");
+            assert!(
+                !banned,
+                "nothing may count when the counting window is zero"
+            );
         }
         // The records are still THERE — retention is a separate window and the
         // review exports read these same records. Only the COUNT is windowed.
@@ -1396,13 +1761,27 @@ mod user_files_index_tests {
         let v = uhash(8);
         for i in 0..3u8 {
             assert!(!s.record_csam_file_for_user(
-                v, fhash(i), "test.mp4", 1024,
-                crate::filter::Layer::L1Jargon, "t", 3, retention, retention,
+                v,
+                fhash(i),
+                "test.mp4",
+                1024,
+                crate::filter::Layer::L1Jargon,
+                "t",
+                3,
+                retention,
+                retention,
             ));
         }
         assert!(s.record_csam_file_for_user(
-            v, fhash(3), "test.mp4", 1024,
-            crate::filter::Layer::L1Jargon, "t", 3, retention, retention,
+            v,
+            fhash(3),
+            "test.mp4",
+            1024,
+            crate::filter::Layer::L1Jargon,
+            "t",
+            3,
+            retention,
+            retention,
         ));
     }
 
@@ -1471,12 +1850,64 @@ mod user_files_index_tests {
         let ttl = Duration::from_secs(3600);
         // threshold = 3 = MAX tolerated distinct files. Files 1-3 are filtered
         // but must NOT ban (headroom for false positives).
-        assert!(!s.record_csam_file_for_user(u, fhash(10), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "1st file");
-        assert!(!s.record_csam_file_for_user(u, fhash(11), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "2nd file");
-        assert!(!s.record_csam_file_for_user(u, fhash(12), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "3rd file (at threshold)");
+        assert!(
+            !s.record_csam_file_for_user(
+                u,
+                fhash(10),
+                "test.mp4",
+                1024,
+                crate::filter::Layer::L4Extra,
+                "t",
+                3,
+                ttl,
+                ttl
+            ),
+            "1st file"
+        );
+        assert!(
+            !s.record_csam_file_for_user(
+                u,
+                fhash(11),
+                "test.mp4",
+                1024,
+                crate::filter::Layer::L4Extra,
+                "t",
+                3,
+                ttl,
+                ttl
+            ),
+            "2nd file"
+        );
+        assert!(
+            !s.record_csam_file_for_user(
+                u,
+                fhash(12),
+                "test.mp4",
+                1024,
+                crate::filter::Layer::L4Extra,
+                "t",
+                3,
+                ttl,
+                ttl
+            ),
+            "3rd file (at threshold)"
+        );
         assert!(!s.is_publisher_banned(&u, ttl), "not banned at threshold");
         // The 4th DISTINCT file EXCEEDS the threshold → ban.
-        assert!(s.record_csam_file_for_user(u, fhash(13), "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl), "4th distinct file");
+        assert!(
+            s.record_csam_file_for_user(
+                u,
+                fhash(13),
+                "test.mp4",
+                1024,
+                crate::filter::Layer::L4Extra,
+                "t",
+                3,
+                ttl,
+                ttl
+            ),
+            "4th distinct file"
+        );
         s.ban_publisher(u);
         assert!(s.is_publisher_banned(&u, ttl), "banned above threshold");
     }
@@ -1495,11 +1926,24 @@ mod user_files_index_tests {
         let fp_file = fhash(99);
         for _ in 0..50 {
             assert!(
-                !s.record_csam_file_for_user(u, fp_file, "test.mp4", 1024, crate::filter::Layer::L4Extra, "t", 3, ttl, ttl),
+                !s.record_csam_file_for_user(
+                    u,
+                    fp_file,
+                    "test.mp4",
+                    1024,
+                    crate::filter::Layer::L4Extra,
+                    "t",
+                    3,
+                    ttl,
+                    ttl
+                ),
                 "republishing the same file must never reach the threshold"
             );
         }
-        assert!(!s.is_publisher_banned(&u, ttl), "single distinct file = never banned");
+        assert!(
+            !s.is_publisher_banned(&u, ttl),
+            "single distinct file = never banned"
+        );
     }
 
     #[test]
@@ -1534,7 +1978,10 @@ mod user_files_index_tests {
             s.add_file_with_source(fhash(10), 100, "f1.bin".into(), src);
         }
         let count = s.user_files.get(&u1).map(|e| e.len()).unwrap_or(0);
-        assert_eq!(count, 1, "republishing the same hash must not inflate the user index");
+        assert_eq!(
+            count, 1,
+            "republishing the same hash must not inflate the user index"
+        );
     }
 
     #[test]
@@ -1545,10 +1992,15 @@ mod user_files_index_tests {
         s.add_file_with_source(fhash(10), 100, "f1.bin".into(), src);
         s.add_file_with_source(fhash(11), 200, "f2.bin".into(), src);
         s.remove_sources_of(&u1);
-        assert!(s.user_files.get(&u1).is_none(),
-                "user_files entry must be deleted when user logs out");
-        assert_eq!(s.file_slab.live_count(), 0,
-                "files with no remaining sources must be removed from the global index");
+        assert!(
+            s.user_files.get(&u1).is_none(),
+            "user_files entry must be deleted when user logs out"
+        );
+        assert_eq!(
+            s.file_slab.live_count(),
+            0,
+            "files with no remaining sources must be removed from the global index"
+        );
     }
 
     #[test]
@@ -1571,8 +2023,10 @@ mod user_files_index_tests {
         s.file_slab.tombstone_by_hash(&fhash(11));
         // Now purge the evicted ids from the reverse index
         s.purge_ids_from_user_files(&[id10, id11]);
-        assert!(s.user_files.get(&u1).is_none(),
-                "user_files must not retain hashes for orphan-evicted files");
+        assert!(
+            s.user_files.get(&u1).is_none(),
+            "user_files must not retain hashes for orphan-evicted files"
+        );
     }
 
     #[test]
@@ -1600,9 +2054,16 @@ mod user_files_index_tests {
         s.add_file_with_source(fhash(20), 500, "shared.bin".into(), src2);
         assert_eq!(s.file_slab.live_count(), 1);
         s.remove_sources_of(&u1);
-        assert_eq!(s.file_slab.live_count(), 1, "file must remain — u2 still sources it");
+        assert_eq!(
+            s.file_slab.live_count(),
+            1,
+            "file must remain — u2 still sources it"
+        );
         let remaining_count = s.user_files.get(&u2).map(|e| e.len()).unwrap_or(0);
-        assert_eq!(remaining_count, 1, "u2's user_files entry must still list the file");
+        assert_eq!(
+            remaining_count, 1,
+            "u2's user_files entry must still list the file"
+        );
     }
 
     #[test]
@@ -1631,7 +2092,10 @@ mod user_files_index_tests {
             );
         }
         for ip in [Ipv4Addr::new(85, 17, 116, 222), Ipv4Addr::new(1, 2, 3, 4)] {
-            assert!(ServerState::is_publishable_source_ip(IpAddr::V4(ip)), "{ip}");
+            assert!(
+                ServerState::is_publishable_source_ip(IpAddr::V4(ip)),
+                "{ip}"
+            );
         }
         // 100.64.0.0/10 only — the rest of 100/8 is ordinary public space.
         assert!(ServerState::is_publishable_source_ip(IpAddr::V4(
@@ -1662,7 +2126,11 @@ mod user_files_index_tests {
             ),
         );
         let rec = state.file_slab.get_by_hash(&hash).expect("file registered");
-        assert_eq!(rec.sources.len(), 1, "source must be kept for searchability");
+        assert_eq!(
+            rec.sources.len(),
+            1,
+            "source must be kept for searchability"
+        );
         assert!(
             !state
                 .keyword_index
@@ -1671,5 +2139,46 @@ mod user_files_index_tests {
             "file must be findable"
         );
     }
+    #[test]
+    fn the_whole_port_range_survives_a_round_trip() {
+        // The bug this guards cost a real peer its downloads: the completeness
+        // flag lived in the port's top bit, so every port from 32768 up was
+        // published 32768 too low. A client listening on 39239 was handed to
+        // the network as 6471, and nothing anywhere reported a problem.
+        use std::net::{IpAddr, Ipv4Addr};
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        for port in [1u16, 4662, 32767, 32768, 39239, 49152, 65535] {
+            for complete in [false, true] {
+                let s = Source::new([1u8; 16], ip, port, complete);
+                assert_eq!(s.port(), port, "port {port} did not survive");
+                assert_eq!(s.complete(), complete, "flag lost for port {port}");
+            }
+        }
+    }
 
+    #[test]
+    fn unpacking_the_flag_did_not_cost_memory() {
+        // The packing was justified as saving a byte. Alignment was going to
+        // spend it either way: 22 and 23 both round to 24. If this ever fails,
+        // the trade-off has changed and the decision deserves revisiting —
+        // 33 million sources make every byte here worth half a gigabyte.
+        assert_eq!(std::mem::size_of::<Source>(), 24);
+    }
+
+    #[test]
+    fn setting_the_flag_leaves_the_port_alone() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let mut s = Source::new(
+            [2u8; 16],
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)),
+            65535,
+            false,
+        );
+        s.set_complete(true);
+        assert_eq!(s.port(), 65535);
+        assert!(s.complete());
+        s.set_complete(false);
+        assert_eq!(s.port(), 65535);
+        assert!(!s.complete());
+    }
 }

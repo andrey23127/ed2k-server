@@ -111,13 +111,25 @@ pub fn handle_holepunch_request(
     // we need and DROP the guard immediately: holding a `clients` guard while
     // calling state.clients.get(requester) below could deadlock if the two keys
     // land on the same shard. So extract-then-drop.
-    let target_data = state
-        .client_by_assigned_id(target_id)
-        .map(|t| (t.ip, t.port, t.udp_port, t.user_hash, t.is_high_id, t.is_alive()));
+    let target_data = state.client_by_assigned_id(target_id).map(|t| {
+        (
+            t.ip,
+            t.port,
+            t.udp_port,
+            t.user_hash,
+            t.is_high_id,
+            t.is_alive(),
+        )
+    });
 
     let Some((t_ip, t_tcp, t_udp, t_hash, t_high, t_alive)) = target_data else {
         debug!(requester_id, target_id, "holepunch: target not connected");
-        send_fail(state, requester_user_hash, target_id, FAIL_TARGET_NOT_CONNECTED);
+        send_fail(
+            state,
+            requester_user_hash,
+            target_id,
+            FAIL_TARGET_NOT_CONNECTED,
+        );
         return Some(FAIL_TARGET_NOT_CONNECTED);
     };
 
@@ -134,9 +146,20 @@ pub fn handle_holepunch_request(
     // signal (no timeout needed). Send FAIL so the requester abandons this stale
     // source cleanly and re-asks once the target's session is healthy again.
     if !t_alive {
-        debug!(requester_id, target_id, "holepunch: target session dead (channel closed), refusing");
-        send_fail(state, requester_user_hash, target_id, FAIL_TARGET_NOT_CONNECTED);
-        *state.block_stats.entry("holepunch_target_dead".to_string()).or_insert(0) += 1;
+        debug!(
+            requester_id,
+            target_id, "holepunch: target session dead (channel closed), refusing"
+        );
+        send_fail(
+            state,
+            requester_user_hash,
+            target_id,
+            FAIL_TARGET_NOT_CONNECTED,
+        );
+        *state
+            .block_stats
+            .entry("holepunch_target_dead".to_string())
+            .or_insert(0) += 1;
         return Some(FAIL_TARGET_NOT_CONNECTED);
     }
 
@@ -150,7 +173,10 @@ pub fn handle_holepunch_request(
     // The target must have announced a UDP port (i.e. it is also a modified
     // client). A stock LowID client cannot participate as a target.
     if t_udp == 0 {
-        debug!(target_id, "holepunch: target has no known UDP port (stock client?)");
+        debug!(
+            target_id,
+            "holepunch: target has no known UDP port (stock client?)"
+        );
         send_fail(state, requester_user_hash, target_id, FAIL_TARGET_NO_UDP);
         return Some(FAIL_TARGET_NO_UDP);
     }
@@ -168,11 +194,17 @@ pub fn handle_holepunch_request(
     let requester_udp_eff = observed_udp_port(state, requester_ip, requester_udp_port);
 
     let to_requester = build_info(
-        t_ip, t_tcp, t_udp_eff, &t_hash,
+        t_ip,
+        t_tcp,
+        t_udp_eff,
+        &t_hash,
         if requester_is_initiator { 0 } else { 1 },
     );
     let to_target = build_info(
-        requester_ip, requester_tcp_port, requester_udp_eff, requester_user_hash,
+        requester_ip,
+        requester_tcp_port,
+        requester_udp_eff,
+        requester_user_hash,
         if requester_is_initiator { 1 } else { 0 },
     );
 
@@ -196,7 +228,10 @@ pub fn handle_holepunch_request(
         target_id, target_ip = %t_ip,
         "holepunch coordinated (INFO sent to both sides)"
     );
-    *state.block_stats.entry("holepunch_coordinated".to_string()).or_insert(0) += 1;
+    *state
+        .block_stats
+        .entry("holepunch_coordinated".to_string())
+        .or_insert(0) += 1;
     None
 }
 
@@ -247,7 +282,12 @@ pub fn schedule_info_retries(
             tokio::time::sleep(Duration::from_millis(at - elapsed)).await;
             elapsed = at;
             // Stop early if the requester has disconnected; no point re-coordinating.
-            if !state.clients.get(&requester_user_hash).map(|c| c.is_alive()).unwrap_or(false) {
+            if !state
+                .clients
+                .get(&requester_user_hash)
+                .map(|c| c.is_alive())
+                .unwrap_or(false)
+            {
                 break;
             }
             let _ = handle_holepunch_request(
@@ -289,7 +329,10 @@ fn send_fail(state: &ServerState, requester_user_hash: &[u8; 16], target_id: u32
     if let Some(me) = state.clients.get(requester_user_hash) {
         me.send_frame(Frame::new(OP_LOWID_HOLEPUNCH_FAIL, p.to_vec()));
     } else {
-        warn!(target_id, reason, "holepunch fail: requester vanished before reply");
+        warn!(
+            target_id,
+            reason, "holepunch fail: requester vanished before reply"
+        );
     }
 }
 
@@ -301,16 +344,14 @@ mod tests {
     #[test]
     fn info_payload_format() {
         let hash = [7u8; 16];
-        let frame = build_info(
-            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0,
-        );
+        let frame = build_info(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0);
         assert_eq!(frame.opcode, OP_LOWID_HOLEPUNCH_INFO);
         assert_eq!(frame.payload.len(), 25);
-        assert_eq!(&frame.payload[0..4], &[1, 2, 3, 4]);        // ip
-        assert_eq!(&frame.payload[4..6], &[0x36, 0x12]);        // 4662 LE
-        assert_eq!(&frame.payload[6..8], &[0x40, 0x12]);        // 4672 LE
-        assert_eq!(&frame.payload[8..24], &hash);              // user hash
-        assert_eq!(frame.payload[24], 0);                      // role
+        assert_eq!(&frame.payload[0..4], &[1, 2, 3, 4]); // ip
+        assert_eq!(&frame.payload[4..6], &[0x36, 0x12]); // 4662 LE
+        assert_eq!(&frame.payload[6..8], &[0x40, 0x12]); // 4672 LE
+        assert_eq!(&frame.payload[8..24], &hash); // user hash
+        assert_eq!(frame.payload[24], 0); // role
     }
 
     #[test]
@@ -320,8 +361,12 @@ mod tests {
         // Register the requester so send_fail can reach it.
         state.register_test_client(req_hash, 100, false, 0);
         let reason = handle_holepunch_request(
-            &state, &req_hash, 100,
-            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 4662, 4672,
+            &state,
+            &req_hash,
+            100,
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            4662,
+            4672,
             /*target_id*/ 999, // not connected
         );
         assert_eq!(reason, Some(FAIL_TARGET_NOT_CONNECTED));
@@ -335,8 +380,13 @@ mod tests {
         state.register_test_client(req, 100, false, 4672);
         state.register_test_client(tgt, 200, false, 0); // LowID, no UDP announced
         let reason = handle_holepunch_request(
-            &state, &req, 100,
-            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 4662, 4672, 200,
+            &state,
+            &req,
+            100,
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            4662,
+            4672,
+            200,
         );
         assert_eq!(reason, Some(FAIL_TARGET_NO_UDP));
     }
@@ -349,8 +399,13 @@ mod tests {
         state.register_test_client(req, 100, false, 4672);
         state.register_test_client(tgt, 200, false, 5672); // target announced UDP
         let reason = handle_holepunch_request(
-            &state, &req, 100,
-            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 4662, 4672, 200,
+            &state,
+            &req,
+            100,
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            4662,
+            4672,
+            200,
         );
         assert_eq!(reason, None, "should coordinate successfully");
     }
@@ -368,10 +423,18 @@ mod tests {
         state.register_test_client(req, 100, false, 0);
         state.register_test_client(tgt, 200, false, 5672);
         let reason = handle_holepunch_request(
-            &state, &req, 100,
-            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 4662, 4672, 200,
+            &state,
+            &req,
+            100,
+            IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)),
+            4662,
+            4672,
+            200,
         );
-        assert_eq!(reason, None, "target reachable via login-announced UDP port");
+        assert_eq!(
+            reason, None,
+            "target reachable via login-announced UDP port"
+        );
     }
 
     #[test]
@@ -381,7 +444,10 @@ mod tests {
         // No observation yet → falls back to announced.
         assert_eq!(observed_udp_port(&state, ip, 4672), 4672);
         // Record a fresh external port → it wins over the announced one.
-        state.observed_udp_ports.insert(Ipv4Addr::new(9, 9, 9, 9), (51000, std::time::Instant::now()));
+        state.observed_udp_ports.insert(
+            Ipv4Addr::new(9, 9, 9, 9),
+            (51000, std::time::Instant::now()),
+        );
         assert_eq!(observed_udp_port(&state, ip, 4672), 51000);
     }
 
@@ -393,10 +459,14 @@ mod tests {
         let stale = std::time::Instant::now()
             .checked_sub(OBSERVED_UDP_FRESH + Duration::from_secs(1))
             .unwrap_or_else(std::time::Instant::now);
-        state.observed_udp_ports.insert(Ipv4Addr::new(9, 9, 9, 10), (51000, stale));
+        state
+            .observed_udp_ports
+            .insert(Ipv4Addr::new(9, 9, 9, 10), (51000, stale));
         assert_eq!(observed_udp_port(&state, ip, 4672), 4672);
         // A zero observed port is meaningless → fall back.
-        state.observed_udp_ports.insert(Ipv4Addr::new(9, 9, 9, 10), (0, std::time::Instant::now()));
+        state
+            .observed_udp_ports
+            .insert(Ipv4Addr::new(9, 9, 9, 10), (0, std::time::Instant::now()));
         assert_eq!(observed_udp_port(&state, ip, 4672), 4672);
     }
 }

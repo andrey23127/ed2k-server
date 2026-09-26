@@ -197,9 +197,9 @@ impl Encoder<Frame> for Ed2kCodec {
                     if compressed.len() < item.payload.len() {
                         let length = (compressed.len() + 1) as u32;
                         dst.reserve(HEADER_LEN + compressed.len());
-                        dst.put_u8(PROTO_PACKED);          // 0xD4
+                        dst.put_u8(PROTO_PACKED); // 0xD4
                         dst.put_u32_le(length);
-                        dst.put_u8(item.opcode);            // opcode stays plain
+                        dst.put_u8(item.opcode); // opcode stays plain
                         dst.put_slice(&compressed);
                         return Ok(());
                     }
@@ -247,7 +247,11 @@ mod tests {
             .unwrap();
         // Wire form must be the packed 0xD4 marker and much smaller.
         assert_eq!(buf[0], PROTO_PACKED, "large frame should use 0xD4");
-        assert!(buf.len() < 500, "compressed frame should be small, got {}", buf.len());
+        assert!(
+            buf.len() < 500,
+            "compressed frame should be small, got {}",
+            buf.len()
+        );
         // Decoder transparently decompresses back to the original payload.
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame.opcode, 0x33);
@@ -273,7 +277,10 @@ mod tests {
             .encode(Frame::new(0x33, payload.clone()), &mut buf)
             .unwrap();
         // Should fall back to plain 0xE3 since compression didn't help.
-        assert_eq!(buf[0], PROTO_EDONKEY, "incompressible frame should stay plain");
+        assert_eq!(
+            buf[0], PROTO_EDONKEY,
+            "incompressible frame should stay plain"
+        );
         let frame = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(frame.payload, payload);
     }
@@ -318,7 +325,10 @@ mod tests {
         // Header claims a 0x38-byte payload but only a few bytes follow.
         let mut buf = BytesMut::from(&b"\xE3\x40\x00\x00\x00\x38\x01\x02\x03"[..]);
         let res = codec.decode_eof(&mut buf).unwrap();
-        assert!(res.is_none(), "partial tail at EOF must be a clean close, not an error");
+        assert!(
+            res.is_none(),
+            "partial tail at EOF must be a clean close, not an error"
+        );
     }
 
     #[test]

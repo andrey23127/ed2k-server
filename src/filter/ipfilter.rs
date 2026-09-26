@@ -140,7 +140,12 @@ impl IpFilter {
                         it.next();
                         it.next();
                         let desc = it.next().unwrap_or("").trim().to_string();
-                        rows.push(HitRow { start: s, end: e, count, desc });
+                        rows.push(HitRow {
+                            start: s,
+                            end: e,
+                            count,
+                            desc,
+                        });
                     }
                 }
             }
@@ -151,10 +156,15 @@ impl IpFilter {
 
     /// Total number of block hits recorded across all ranges (for a summary).
     pub fn total_hits(&self) -> u64 {
-        self.hits.iter().map(|h| h.load(Ordering::Relaxed) as u64).sum()
+        self.hits
+            .iter()
+            .map(|h| h.load(Ordering::Relaxed) as u64)
+            .sum()
     }
 
-    pub fn len(&self) -> usize   { self.ranges.len() }
+    pub fn len(&self) -> usize {
+        self.ranges.len()
+    }
 
     /// Heap bytes held by the filter (for /api/memsize): the sorted range list
     /// plus the parallel per-range hit counters. Counted by capacity.
@@ -162,7 +172,9 @@ impl IpFilter {
         (self.ranges.capacity() * std::mem::size_of::<(u32, u32)>()) as u64
             + (self.hits.capacity() * std::mem::size_of::<AtomicU32>()) as u64
     }
-    pub fn is_empty(&self) -> bool { self.ranges.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
 }
 
 /// Parse one line. Returns None on malformed input (silently skipped).
@@ -187,11 +199,7 @@ pub(crate) fn parse_line(line: &str) -> Option<(u32, u32)> {
     if let Some(dash) = line.find(" - ") {
         let start_raw = line[..dash].trim();
         let rest = &line[dash + 3..];
-        let end_raw = rest
-            .find(" , ")
-            .map(|c| &rest[..c])
-            .unwrap_or(rest)
-            .trim();
+        let end_raw = rest.find(" , ").map(|c| &rest[..c]).unwrap_or(rest).trim();
         if let (Some(a), Some(b)) = (ip_to_u32(start_raw), ip_to_u32(end_raw)) {
             return Some((a, b));
         }
@@ -263,7 +271,10 @@ mod tests {
         assert_eq!(parse_line(messy), Some((0x01020304, 0x01020309)));
 
         // Zero-padded octets, either format.
-        assert_eq!(parse_line("X:001.002.003.004-001.002.003.009"), parse_line(messy));
+        assert_eq!(
+            parse_line("X:001.002.003.004-001.002.003.009"),
+            parse_line(messy)
+        );
 
         // Nonsense stays nonsense.
         assert_eq!(parse_line("this is not a range"), None);
@@ -290,8 +301,14 @@ mod tests {
     fn blocked_and_allowed() {
         let mut f = IpFilter::default();
         f.ranges = vec![
-            (u32::from(Ipv4Addr::new(10, 0, 0, 0)),   u32::from(Ipv4Addr::new(10, 0, 0, 255))),
-            (u32::from(Ipv4Addr::new(192, 168, 1, 0)), u32::from(Ipv4Addr::new(192, 168, 1, 255))),
+            (
+                u32::from(Ipv4Addr::new(10, 0, 0, 0)),
+                u32::from(Ipv4Addr::new(10, 0, 0, 255)),
+            ),
+            (
+                u32::from(Ipv4Addr::new(192, 168, 1, 0)),
+                u32::from(Ipv4Addr::new(192, 168, 1, 255)),
+            ),
         ];
         assert!(f.is_blocked("10.0.0.100".parse().unwrap()));
         assert!(f.is_blocked("10.0.0.0".parse().unwrap()));
@@ -328,8 +345,16 @@ mod tests {
     fn hit_report_counts_and_resolves_descriptions() {
         use std::io::Write;
         let mut f = tempfile::NamedTempFile::new().unwrap();
-        writeln!(f, "001.000.000.000 - 001.000.000.255 , 000 , cloudflare:AS13335").unwrap();
-        writeln!(f, "010.000.000.000 - 010.255.255.255 , 000 , Botnet on Example, Inc.").unwrap();
+        writeln!(
+            f,
+            "001.000.000.000 - 001.000.000.255 , 000 , cloudflare:AS13335"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "010.000.000.000 - 010.255.255.255 , 000 , Botnet on Example, Inc."
+        )
+        .unwrap();
         writeln!(f, "020.000.000.000 - 020.000.000.255 , 000 , never hit").unwrap();
         f.flush().unwrap();
         let filter = IpFilter::load(f.path());

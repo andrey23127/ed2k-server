@@ -182,7 +182,9 @@ pub struct LogThrottle {
 
 impl LogThrottle {
     fn new() -> Self {
-        Self { seen: dashmap::DashMap::new() }
+        Self {
+            seen: dashmap::DashMap::new(),
+        }
     }
 
     /// `None` → suppress this occurrence. `Some(n)` → log it, where `n` is how many

@@ -212,16 +212,18 @@ fn find_flexible(hay: &str, term: &str, from: usize) -> Option<(usize, usize)> {
     // The byte walk below assumes ASCII. Terms in other scripts (CJK) never
     // carry a separator anyway, so they take the plain path.
     if !term.contains(' ') || !term.is_ascii() {
-        return hay[from..].find(term).map(|p| (from + p, from + p + term.len()));
+        return hay[from..]
+            .find(term)
+            .map(|p| (from + p, from + p + term.len()));
     }
     let hb = hay.as_bytes();
     let mut start = from;
     'outer: while start < hb.len() {
         // Anchor on the first character to keep this linear enough.
         let first = term.as_bytes()[0];
-        match hay[start..].find(first as char) {
-            Some(p) => start += p,
-            None => return None,
+        {
+            let p = hay[start..].find(first as char)?;
+            start += p
         }
         let mut h = start;
         let mut t = 0;
@@ -356,8 +358,8 @@ mod tests {
         assert!(matches_terms("a shrt clip.mp4", &t).is_some());
         assert!(matches_terms("[shrt] file.mkv", &t).is_some());
         assert!(matches_terms("file.shrt.video.mkv", &t).is_some()); // dots are boundaries
-        assert!(matches_terms("xx-shrt-xx.mp4", &t).is_some());       // hyphens are boundaries
-        // Letters bind → must NOT match (substring of a longer ordinary word).
+        assert!(matches_terms("xx-shrt-xx.mp4", &t).is_some()); // hyphens are boundaries
+                                                                // Letters bind → must NOT match (substring of a longer ordinary word).
         assert!(matches_terms("ashrtb album.mp3", &t).is_none());
         assert!(matches_terms("shrtly.mp4", &t).is_none());
         assert!(matches_terms("ashrt.mp4", &t).is_none());
@@ -413,7 +415,7 @@ mod tests {
         let t = vec!["shrt marker".to_string()];
         assert!(matches_terms("ashrt-marker.mp4", &t).is_none());
         assert!(matches_terms("shrt-markerish.mp4", &t).is_some()); // long term: tail free
-        // And a right anchor still applies to the end of the whole term.
+                                                                    // And a right anchor still applies to the end of the whole term.
         let anchored = vec!["shrt marker$".to_string()];
         assert!(matches_terms("shrt-markers of the world.pdf", &anchored).is_none());
         assert!(matches_terms("shrt-marker - vixen.mp4", &anchored).is_some());
@@ -471,7 +473,10 @@ mod tests {
 
         // The reported term is the list entry verbatim, `$` and all, so the
         // operator can grep for the line that fired.
-        assert_eq!(matches_terms("art of zoo - vixen.mp4", &anchored), Some("art of zoo$"));
+        assert_eq!(
+            matches_terms("art of zoo - vixen.mp4", &anchored),
+            Some("art of zoo$")
+        );
 
         // `$` also tightens the right side of a SHORT term from letters to all
         // word characters.

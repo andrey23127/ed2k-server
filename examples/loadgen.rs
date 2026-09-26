@@ -63,8 +63,18 @@ const COUNTRIES: &[&str] = &[
 /// Client software strings (weighted toward eMule by repetition), as they would
 /// be stored uninterned per ClientHandle.
 const SOFTWARE: &[&str] = &[
-    "eMule", "eMule", "eMule", "eMule", "eMule", "aMule", "aMule", "Shareaza",
-    "mldonkey", "StulleMule", "eMule MorphXT", "xMule",
+    "eMule",
+    "eMule",
+    "eMule",
+    "eMule",
+    "eMule",
+    "aMule",
+    "aMule",
+    "Shareaza",
+    "mldonkey",
+    "StulleMule",
+    "eMule MorphXT",
+    "xMule",
 ];
 
 /// Build a name for a given distinct-name index, drawing `KW_PER_FILE` tokens

@@ -149,7 +149,14 @@ impl<'a> PostingCursor<'a> {
     pub fn new(data: &'a [u8]) -> Option<Self> {
         let mut pos = 0usize;
         let count = read_varint(data, &mut pos)? as usize;
-        let mut c = Self { data, pos, remaining: count, acc: 0, cur: None, started: false };
+        let mut c = Self {
+            data,
+            pos,
+            remaining: count,
+            acc: 0,
+            cur: None,
+            started: false,
+        };
         c.bump();
         Some(c)
     }
@@ -162,7 +169,9 @@ impl<'a> PostingCursor<'a> {
 
     /// The current head value without consuming it.
     #[inline]
-    pub fn peek(&self) -> Option<FileId> { self.cur }
+    pub fn peek(&self) -> Option<FileId> {
+        self.cur
+    }
 
     /// Advance to the next value, updating `peek()`. Sets head to None at end or on a
     /// malformed tail.
@@ -256,7 +265,16 @@ mod tests {
     #[test]
     fn boundary_values() {
         // Values straddling every varint width boundary.
-        round_trip(&[0x7F, 0x80, 0x3FFF, 0x4000, 0x1F_FFFF, 0x20_0000, 0x0FFF_FFFF, 0x1000_0000]);
+        round_trip(&[
+            0x7F,
+            0x80,
+            0x3FFF,
+            0x4000,
+            0x1F_FFFF,
+            0x20_0000,
+            0x0FFF_FFFF,
+            0x1000_0000,
+        ]);
     }
 
     #[test]
@@ -290,7 +308,10 @@ mod tests {
         round_trip(&v);
         // Dense +1 gaps must pack to ~1 byte each (plus count + first).
         let blob = encode(&ids(&v));
-        assert!(blob.len() < v.len() * 2, "dense list should be ~1 byte/entry");
+        assert!(
+            blob.len() < v.len() * 2,
+            "dense list should be ~1 byte/entry"
+        );
     }
 
     // ----- corruption / robustness -----
@@ -301,7 +322,7 @@ mod tests {
         for cut in 0..blob.len() {
             // Any prefix shorter than the whole thing must not decode successfully
             // (it is either truncated mid-varint or missing postings).
-            assert!(decode(&blob[..cut]).is_none(), "prefix len {cut} decoded", );
+            assert!(decode(&blob[..cut]).is_none(), "prefix len {cut} decoded",);
         }
     }
 
@@ -354,7 +375,18 @@ mod tests {
         let v = ids(&[10, 64, 65, 200, 1000, 1_000_000, (9u32 << 26) | 1]);
         let blob = encode(&v);
         let mut cur = PostingCursor::new(&blob).unwrap();
-        let targets = ids(&[9, 10, 11, 64, 66, 200, 999, 1000, 1_000_001, (9u32 << 26) | 1]);
+        let targets = ids(&[
+            9,
+            10,
+            11,
+            64,
+            66,
+            200,
+            999,
+            1000,
+            1_000_001,
+            (9u32 << 26) | 1,
+        ]);
         for t in &targets {
             let expected = v.binary_search(t).is_ok();
             assert_eq!(cur.contains(*t), expected, "contains mismatch for {}", t.0);
@@ -378,7 +410,11 @@ mod tests {
         let blob_b = encode(&b);
         let mut cur = PostingCursor::new(&blob_b).unwrap();
         let got: Vec<FileId> = a.iter().copied().filter(|x| cur.contains(*x)).collect();
-        let want: Vec<FileId> = a.iter().copied().filter(|x| b.binary_search(x).is_ok()).collect();
+        let want: Vec<FileId> = a
+            .iter()
+            .copied()
+            .filter(|x| b.binary_search(x).is_ok())
+            .collect();
         assert_eq!(got, want);
     }
 
@@ -387,7 +423,9 @@ mod tests {
         // Deterministic LCG — no rand dependency. Many random ascending lists.
         let mut seed: u64 = 0x1234_5678_9abc_def0;
         let mut next = || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as u32
         };
         for _ in 0..2000 {

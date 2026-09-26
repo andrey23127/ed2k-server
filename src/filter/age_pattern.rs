@@ -368,6 +368,8 @@ const SPANISH_YO_FOLLOWERS: &[&str] = &[
     "vivo", "sali", "salí", "canto", "estoy", "puedo", "pienso", "creo", "nací", "naci", "amo",
     "sigo", "vengo", "bajo", "pierdo", "enamoré", "enamore", "pido", "también", "tambien",
     "quisiera", "diré", "dire", "seré", "sere", "quise", "se", "que", "ya", "sé", "sin",
+    // Added 08.09.2026 from a review window: "08 Yo llevo un tango en el alma".
+    "llevo", "llevaba", "canté", "cante", "hice", "fui",
 ];
 
 /// Is this "yo" the Spanish pronoun rather than an age suffix?
@@ -405,7 +407,21 @@ fn spanish_pronoun_yo(s: &str, num_start: usize, after_suffix: usize) -> bool {
         t.ends_with(['-', '\u{2013}', '\u{2014}'])
             && t[..t.len() - t.chars().next_back().map_or(0, char::len_utf8)].ends_with([' ', '\t'])
     };
-    let is_track_number = prefix.chars().all(|c| !c.is_alphanumeric()) || after_artist_dash;
+    // A leading track number does not stop the NEXT number being one too.
+    //
+    // "01 01 Yo soy el tango.mp3.mp3" is a real name from a review window: the
+    // file is numbered twice, and the second number sits behind digits rather
+    // than behind nothing. The all-non-alphanumeric test read that as
+    // mid-name and refused the guard, so an Argentine tango was blocked as
+    // "age 1".
+    //
+    // ⚠ DIGITS ONLY. Letters before the number still mean mid-name, which is
+    //   what keeps this from reaching material — "niña rusa 12 yo no llores"
+    //   must stay blocked, and it has letters in the prefix.
+    let only_numbering = prefix
+        .chars()
+        .all(|c| c.is_ascii_digit() || !c.is_alphanumeric());
+    let is_track_number = only_numbering || after_artist_dash;
     if !is_track_number {
         return false;
     }
@@ -1011,6 +1027,14 @@ mod tests {
         // POSITION. The same words mid-name are not a track number, and this is
         // what keeps the guard from reaching real material.
         assert!(contains_minor_age_token("niña rusa 12 yo no llores.wmv").is_some());
+        // Numbered twice, which happens with re-encoded music. The guard must
+        // still apply to the second number: "01 01 Yo soy el tango" is a tango.
+        assert!(contains_minor_age_token("01 01 yo soy el tango.mp3.mp3").is_none());
+        assert!(contains_minor_age_token("08 yo llevo un tango en el alma.mp3").is_none());
+        // ...but letters before the number still mean mid-name.
+        assert!(contains_minor_age_token("niña rusa 12 yo no llores.wmv").is_some());
+        assert!(contains_minor_age_token("carol 5yo no limits.mp4").is_some());
+
         // A hyphen with no space in front of it is how these filenames join
         // words, not an artist separator. Both of these are real names.
         assert!(contains_minor_age_token("carol-5yo no limits fun.mp4").is_some());

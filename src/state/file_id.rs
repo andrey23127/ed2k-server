@@ -20,8 +20,8 @@
 
 use crate::state::{FileHash, Source};
 use smallvec::{smallvec, SmallVec};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Source storage for a file. Stage 4 (memory): inlined as `SmallVec<[Source; 1]>`
@@ -398,7 +398,10 @@ impl FileSlab {
     pub fn hash_of(&self, id: FileId) -> Option<FileHash> {
         let shard = self.shards.get(id_shard(id))?;
         let recs = shard.read().unwrap();
-        recs.records.get(id_index(id)).filter(|r| r.alive).map(|r| r.hash)
+        recs.records
+            .get(id_index(id))
+            .filter(|r| r.alive)
+            .map(|r| r.hash)
     }
 
     /// Insert a new file or return the existing id. Returns (id, was_new).
@@ -561,8 +564,8 @@ impl FileSlab {
         for s in &self.shards {
             let sh = s.read().unwrap();
             records += sh.records.capacity() as u64 * rec_sz;
-            next    += sh.next.capacity() as u64 * 4;      // Vec<u32>
-            buckets += sh.buckets.capacity() as u64 * 4;   // Vec<u32>
+            next += sh.next.capacity() as u64 * 4; // Vec<u32>
+            buckets += sh.buckets.capacity() as u64 * 4; // Vec<u32>
             for r in sh.records.iter() {
                 // spilled_capacity() is 0 while the SmallVec is inline
                 if r.sources.spilled() {
@@ -644,11 +647,19 @@ impl FileSlab {
     }
 
     pub fn add_or_refresh_source(&self, hash: &FileHash, src: Source) -> bool {
-        let id = match self.id_of(hash) { Some(i) => i, None => return false };
-        let shard = match self.shards.get(id_shard(id)) { Some(s) => s, None => return false };
+        let id = match self.id_of(hash) {
+            Some(i) => i,
+            None => return false,
+        };
+        let shard = match self.shards.get(id_shard(id)) {
+            Some(s) => s,
+            None => return false,
+        };
         let mut sh = shard.write().unwrap();
         if let Some(r) = sh.records.get_mut(id_index(id)) {
-            if !r.alive { return false; }
+            if !r.alive {
+                return false;
+            }
             r.last_seen = self.now_secs();
             if let Some(existing) = r.sources.iter_mut().find(|s| s.user_hash == src.user_hash) {
                 existing.set_complete(src.complete());
@@ -664,10 +675,15 @@ impl FileSlab {
     /// true if the file is now sourceless (an orphan the caller should evict).
     /// Replaces the per-file body of `remove_sources_of`.
     pub fn remove_user_source(&self, id: FileId, user_hash: &FileHash) -> bool {
-        let shard = match self.shards.get(id_shard(id)) { Some(s) => s, None => return false };
+        let shard = match self.shards.get(id_shard(id)) {
+            Some(s) => s,
+            None => return false,
+        };
         let mut sh = shard.write().unwrap();
         if let Some(r) = sh.records.get_mut(id_index(id)) {
-            if !r.alive { return false; }
+            if !r.alive {
+                return false;
+            }
             r.sources.retain(|s| &s.user_hash != user_hash);
             return r.sources.is_empty();
         }
@@ -805,7 +821,10 @@ mod tests {
         let via_with = slab
             .with_record(id, |r| (r.hash, r.size, r.sources.len()))
             .expect("live record");
-        assert_eq!(via_with, (via_get.hash, via_get.size, via_get.sources.len()));
+        assert_eq!(
+            via_with,
+            (via_get.hash, via_get.size, via_get.sources.len())
+        );
 
         // By hash, one lock instead of two, and it hands back the id.
         let (rid, size) = slab
@@ -837,7 +856,10 @@ mod tests {
 
         // Returning true always is equivalent to for_each_live.
         let mut all = 0;
-        slab.for_each_live_while(|_, _| { all += 1; true });
+        slab.for_each_live_while(|_, _| {
+            all += 1;
+            true
+        });
         assert_eq!(all, 20);
     }
 
@@ -997,7 +1019,11 @@ mod tests {
             if i == 3 {
                 continue;
             }
-            assert_eq!(slab.id_of(h), Some(*id), "chain corrupted after middle unlink");
+            assert_eq!(
+                slab.id_of(h),
+                Some(*id),
+                "chain corrupted after middle unlink"
+            );
         }
     }
 

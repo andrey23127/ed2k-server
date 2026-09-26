@@ -6,10 +6,10 @@
 //! filter.
 
 mod age_pattern;
-pub mod layer2_terms;
-mod jargon;
-pub mod ipfilter;
 pub mod geoip;
+pub mod ipfilter;
+mod jargon;
+pub mod layer2_terms;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -150,9 +150,7 @@ impl ContentFilter {
             hash_blocklist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             extra_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
             jargon_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
-            layer2_terms: arc_swap::ArcSwap::from_pointee(
-                layer2_terms::Layer2Terms::default(),
-            ),
+            layer2_terms: arc_swap::ArcSwap::from_pointee(layer2_terms::Layer2Terms::default()),
             hash_filter_set: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             hash_whitelist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
         }
@@ -406,7 +404,13 @@ impl ContentFilter {
             // round-trip to be the explanation.
             let bytes: Option<Vec<u8>> = s
                 .chars()
-                .map(|c| if (c as u32) < 0x100 { Some(c as u8) } else { None })
+                .map(|c| {
+                    if (c as u32) < 0x100 {
+                        Some(c as u8)
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             let decoded = String::from_utf8(bytes?).ok()?;
             (decoded != s).then_some(decoded)
@@ -695,7 +699,10 @@ mod tests {
         let f = ContentFilter::new();
         // Sanitized example from real-world capture pattern
         let result = f.check(&zh(), "[movie] 8yo girl xxx.mp4");
-        assert!(matches!(result, FilterResult::Block(Layer::L2AgePattern, _)));
+        assert!(matches!(
+            result,
+            FilterResult::Block(Layer::L2AgePattern, _)
+        ));
     }
 
     #[test]
@@ -758,10 +765,16 @@ mod tests {
         // can match it — the bytes are no longer that character.
         let f = ContentFilter::new().with_extra_terms(["幼女".to_string()]);
         let mangled = "Ã¥Â¹Â¼Ã¥Â¥Â³ test.avi";
-        assert!(mangled.find('幼').is_none(), "the marker really is not there");
+        assert!(
+            mangled.find('幼').is_none(),
+            "the marker really is not there"
+        );
         match f.check(&zh(), mangled) {
             FilterResult::Block(Layer::L4Extra, reason) => {
-                assert!(reason.contains("mojibake"), "reason should say how it matched");
+                assert!(
+                    reason.contains("mojibake"),
+                    "reason should say how it matched"
+                );
             }
             other => panic!("recovered form must match: {other:?}"),
         }
@@ -864,7 +877,10 @@ mod tests {
         // L4 used to bypass the length rules entirely by calling str::contains.
         let f = ContentFilter::new().with_extra_terms(["brosis".to_string()]);
         assert!(matches!(
-            f.check(&zh(), "Cystic fibrosis transmembrane conductance regulator.pdf"),
+            f.check(
+                &zh(),
+                "Cystic fibrosis transmembrane conductance regulator.pdf"
+            ),
             FilterResult::Allow
         ));
         assert!(matches!(

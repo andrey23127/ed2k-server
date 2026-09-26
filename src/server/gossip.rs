@@ -59,8 +59,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 
-const OP_SERVER_LIST_REQ:  u8 = 0xA0;
-const OP_SERVER_LIST_RES:  u8 = 0xA1;
+const OP_SERVER_LIST_REQ: u8 = 0xA0;
+const OP_SERVER_LIST_RES: u8 = 0xA1;
 const OP_GLOB_SERVSTATREQ: u8 = 0x96;
 const OP_SERVER_LIST_REQ2: u8 = 0xA4; // explicit "send me server list"
 
@@ -80,7 +80,9 @@ pub use parse_seed_fn as parse_seed;
 
 pub fn parse_seed_fn(s: &str) -> Option<SocketAddrV4> {
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     let ip: Ipv4Addr = parts[0].parse().ok()?;
     let port: u16 = parts[1].parse().ok()?;
     Some(SocketAddrV4::new(ip, port))
@@ -102,11 +104,20 @@ pub fn spawn_gossip(
         debug!("no seed servers configured — skipping gossip");
         return;
     }
-    info!(seeds = seeds.len(), "starting gossip — full handshake per seed");
+    info!(
+        seeds = seeds.len(),
+        "starting gossip — full handshake per seed"
+    );
 
     for seed in seeds {
-        spawn_seed(seed, Arc::clone(&state), our_ip, our_tcp_port,
-                   Arc::clone(&main_udp_sock), seckey);
+        spawn_seed(
+            seed,
+            Arc::clone(&state),
+            our_ip,
+            our_tcp_port,
+            Arc::clone(&main_udp_sock),
+            seckey,
+        );
     }
 }
 
@@ -126,7 +137,14 @@ pub fn spawn_seed(
     main_udp_sock: Arc<UdpSocket>,
     seckey: [u8; 16],
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(seed_loop(seed, state, our_ip, our_tcp_port, main_udp_sock, seckey))
+    tokio::spawn(seed_loop(
+        seed,
+        state,
+        our_ip,
+        our_tcp_port,
+        main_udp_sock,
+        seckey,
+    ))
 }
 
 /// Per-seed loop: do the full 3-phase handshake, then sleep, then repeat.
@@ -194,7 +212,7 @@ async fn handshake_with_seed(
     seckey: &[u8; 16],
 ) -> std::io::Result<(usize, usize)> {
     let seed_tcp = seed.port();
-    let seed_plain_port = seed_tcp + 4;   // TCP+4 = serv_to_serv_sock
+    let seed_plain_port = seed_tcp + 4; // TCP+4 = serv_to_serv_sock
     let seed_obfping_port = seed_tcp + 12; // TCP+12 = obfpingport
     let seed_obfgossip_port = seed_tcp + 14; // TCP+14 = udpsockobf
 
@@ -260,7 +278,9 @@ async fn handshake_with_seed(
         }
 
         // Stash BEFORE sending so the main handler can decode the reply.
-        state.our_sent_random_parts.insert(*seed.ip(), (random_part, std::time::Instant::now()));
+        state
+            .our_sent_random_parts
+            .insert(*seed.ip(), (random_part, std::time::Instant::now()));
         let ping_dst = SocketAddrV4::new(*seed.ip(), seed_obfping_port);
         obf_sock.send_to(&ping, ping_dst).await?;
         info!(
@@ -303,20 +323,24 @@ async fn handshake_with_seed(
         // Ensure the verified seed is in server_list (obf-only seeds are advertised
         // by nobody, so they'd otherwise never be handed out — see the legacy path).
         {
-            let is_client = state.clients.iter().any(|e| {
-                matches!(e.ip, std::net::IpAddr::V4(v4) if v4 == *seed.ip())
-            });
+            let is_client = state
+                .clients
+                .iter()
+                .any(|e| matches!(e.ip, std::net::IpAddr::V4(v4) if v4 == *seed.ip()));
             if !is_client {
                 let mut list = state.server_list.write().await;
                 if !list.contains(seed) {
                     list.push(*seed);
-                    state.server_list_added_at
+                    state
+                        .server_list_added_at
                         .insert(*seed.ip(), std::time::Instant::now());
                     info!(seed = %seed, "added verified obf-only seed to server_list");
                 }
                 // The obf handshake proves this exact ip:port is a server (we
                 // initiated to it), so the pair is verified for hand-out too.
-                state.verified_sockets.insert(*seed, std::time::Instant::now());
+                state
+                    .verified_sockets
+                    .insert(*seed, std::time::Instant::now());
             }
         }
 
@@ -331,17 +355,15 @@ async fn handshake_with_seed(
         plain_a0.extend_from_slice(&our_ip.octets());
         plain_a0.extend_from_slice(&our_tcp_port.to_le_bytes());
         plain_a0.extend_from_slice(&challenge2.to_le_bytes());
-        let obf_a0 = server_obfuscation::encode_with_obfbyte(
-            &plain_a0, seed_serverkey, rand_u32(), 0x6b,
-        );
+        let obf_a0 =
+            server_obfuscation::encode_with_obfbyte(&plain_a0, seed_serverkey, rand_u32(), 0x6b);
         obf_sock.send_to(&obf_a0, gossip_dst).await?;
 
         let mut plain_a4 = Vec::with_capacity(2);
         plain_a4.push(PROTO_EDONKEY);
         plain_a4.push(OP_SERVER_LIST_REQ2);
-        let obf_a4 = server_obfuscation::encode_with_obfbyte(
-            &plain_a4, seed_serverkey, rand_u32(), 0x6b,
-        );
+        let obf_a4 =
+            server_obfuscation::encode_with_obfbyte(&plain_a4, seed_serverkey, rand_u32(), 0x6b);
         obf_sock.send_to(&obf_a4, gossip_dst).await?;
 
         // obf 0x97 only if the seed has probed us (we must echo its challenge).
@@ -377,7 +399,10 @@ async fn handshake_with_seed(
             plain_97.extend_from_slice(&our_server_key_for_seed.to_le_bytes());
             plain_97.extend_from_slice(&our_ip.octets());
             let obf_97 = server_obfuscation::encode_with_obfbyte(
-                &plain_97, seed_serverkey, rand_u32(), 0x6b,
+                &plain_97,
+                seed_serverkey,
+                rand_u32(),
+                0x6b,
             );
             obf_sock.send_to(&obf_97, gossip_dst).await?;
         }
@@ -422,7 +447,9 @@ async fn handshake_with_seed(
 
     // Stash our random_part — udp.rs will need it to decode incoming
     // obfuscated frames from this seed (it encrypts replies with this value).
-    state.our_sent_random_parts.insert(*seed.ip(), (random_part, std::time::Instant::now()));
+    state
+        .our_sent_random_parts
+        .insert(*seed.ip(), (random_part, std::time::Instant::now()));
 
     // Wait for OBF reply. Reply arrives on our ephemeral socket from seed:4673.
     let mut buf = vec![0u8; 4096];
@@ -465,9 +492,10 @@ async fn handshake_with_seed(
     // ServerKey. Add it here, mirroring merge_server_list's "skip current client
     // IPs" hygiene; the `contains` guard makes this idempotent across cycles.
     {
-        let is_client = state.clients.iter().any(|e| {
-            matches!(e.ip, std::net::IpAddr::V4(v4) if v4 == *seed.ip())
-        });
+        let is_client = state
+            .clients
+            .iter()
+            .any(|e| matches!(e.ip, std::net::IpAddr::V4(v4) if v4 == *seed.ip()));
         if !is_client {
             let mut list = state.server_list.write().await;
             if !list.contains(seed) {
@@ -503,9 +531,8 @@ async fn handshake_with_seed(
     // and silently drops it (no error response on the wire). This was the
     // root cause of "server_count=0" for every seed despite the OBF handshake
     // succeeding — phase 3 frames reached the seed but failed decryption.
-    let obf_a0 = server_obfuscation::encode_with_obfbyte(
-        &plain_a0, seed_serverkey, rand_u32(), 0x6b,
-    );
+    let obf_a0 =
+        server_obfuscation::encode_with_obfbyte(&plain_a0, seed_serverkey, rand_u32(), 0x6b);
     eph_sock.send_to(&obf_a0, gossip_dst).await?;
 
     // 0xA4 — explicit "send me your server list NOW". Some Lugdunum versions
@@ -513,9 +540,8 @@ async fn handshake_with_seed(
     let mut plain_a4 = Vec::with_capacity(2);
     plain_a4.push(PROTO_EDONKEY);
     plain_a4.push(OP_SERVER_LIST_REQ2);
-    let obf_a4 = server_obfuscation::encode_with_obfbyte(
-        &plain_a4, seed_serverkey, rand_u32(), 0x6b,
-    );
+    let obf_a4 =
+        server_obfuscation::encode_with_obfbyte(&plain_a4, seed_serverkey, rand_u32(), 0x6b);
     eph_sock.send_to(&obf_a4, gossip_dst).await?;
 
     // 0x97 GLOBSERVSTATRES with extended 44-byte trailer (containing our
@@ -539,54 +565,52 @@ async fn handshake_with_seed(
     if let Some(chal_ref) = state.incoming_seed_challenges.get(seed.ip()) {
         let challenge_97 = *chal_ref;
         drop(chal_ref);
-        let users    = state.client_count() as u32;
-    let files    = state.file_count() as u32;
-    let lowid    = state.lowid_count() as u32;
-    let max_conn = 50_000u32;       // matches DEFAULT_MAX_CLIENTS
-    let soft     = 7_500u32;
-    let hard     = 7_500u32;
-    let pingflg: u32 = 0x0000_17FB;
+        let users = state.client_count() as u32;
+        let files = state.file_count() as u32;
+        let lowid = state.lowid_count() as u32;
+        let max_conn = 50_000u32; // matches DEFAULT_MAX_CLIENTS
+        let soft = 7_500u32;
+        let hard = 7_500u32;
+        let pingflg: u32 = 0x0000_17FB;
 
-    // ServerKey: IPObfuscate(our_seckey, seed_ip) — what seed will use to
-    // encrypt obf traffic back to us. Our :4675 decoder computes the same
-    // value from sender's IP, so the keys match.
-    let seed_ip_le = u32::from_le_bytes(seed.ip().octets());
-    let our_server_key_for_seed = crate::proto::server_obfuscation::ip_obfuscate(
-        seckey, seed_ip_le,
-    );
+        // ServerKey: IPObfuscate(our_seckey, seed_ip) — what seed will use to
+        // encrypt obf traffic back to us. Our :4675 decoder computes the same
+        // value from sender's IP, so the keys match.
+        let seed_ip_le = u32::from_le_bytes(seed.ip().octets());
+        let our_server_key_for_seed =
+            crate::proto::server_obfuscation::ip_obfuscate(seckey, seed_ip_le);
 
-    let mut plain_97 = Vec::with_capacity(46);
-    plain_97.push(PROTO_EDONKEY);
-    plain_97.push(0x97);
-    plain_97.extend_from_slice(&challenge_97.to_le_bytes());
-    plain_97.extend_from_slice(&users.to_le_bytes());
-    plain_97.extend_from_slice(&files.to_le_bytes());
-    plain_97.extend_from_slice(&max_conn.to_le_bytes());
-    plain_97.extend_from_slice(&soft.to_le_bytes());
-    plain_97.extend_from_slice(&hard.to_le_bytes());
-    plain_97.extend_from_slice(&pingflg.to_le_bytes());
-    plain_97.extend_from_slice(&lowid.to_le_bytes());
-    // Extended trailer: portUDPobf + portTCPobf + ServerKey + our_ip
-    // portUDPobf = TCP+14; portTCPobf = tcp_port (obf auto-detected on the MAIN
-    // TCP listener). NOT TCP+12 — that's the obf-PING UDP port (no TCP listener).
-    plain_97.extend_from_slice(&our_tcp_port.wrapping_add(14).to_le_bytes());
-    plain_97.extend_from_slice(&our_tcp_port.to_le_bytes());
-    plain_97.extend_from_slice(&our_server_key_for_seed.to_le_bytes());
-    plain_97.extend_from_slice(&our_ip.octets());
+        let mut plain_97 = Vec::with_capacity(46);
+        plain_97.push(PROTO_EDONKEY);
+        plain_97.push(0x97);
+        plain_97.extend_from_slice(&challenge_97.to_le_bytes());
+        plain_97.extend_from_slice(&users.to_le_bytes());
+        plain_97.extend_from_slice(&files.to_le_bytes());
+        plain_97.extend_from_slice(&max_conn.to_le_bytes());
+        plain_97.extend_from_slice(&soft.to_le_bytes());
+        plain_97.extend_from_slice(&hard.to_le_bytes());
+        plain_97.extend_from_slice(&pingflg.to_le_bytes());
+        plain_97.extend_from_slice(&lowid.to_le_bytes());
+        // Extended trailer: portUDPobf + portTCPobf + ServerKey + our_ip
+        // portUDPobf = TCP+14; portTCPobf = tcp_port (obf auto-detected on the MAIN
+        // TCP listener). NOT TCP+12 — that's the obf-PING UDP port (no TCP listener).
+        plain_97.extend_from_slice(&our_tcp_port.wrapping_add(14).to_le_bytes());
+        plain_97.extend_from_slice(&our_tcp_port.to_le_bytes());
+        plain_97.extend_from_slice(&our_server_key_for_seed.to_le_bytes());
+        plain_97.extend_from_slice(&our_ip.octets());
 
-    let obf_97 = server_obfuscation::encode_with_obfbyte(
-        &plain_97, seed_serverkey, rand_u32(), 0x6b,
-    );
-    eph_sock.send_to(&obf_97, gossip_dst).await?;
+        let obf_97 =
+            server_obfuscation::encode_with_obfbyte(&plain_97, seed_serverkey, rand_u32(), 0x6b);
+        eph_sock.send_to(&obf_97, gossip_dst).await?;
 
-    info!(
-        seed = %seed.ip(),
-        dst_port = seed_obfgossip_port,
-        eph_port,
-        server_key = format!("0x{:08x}", seed_serverkey),
-        echoed_chal = format!("0x{:08x}", challenge_97),
-        "gossip phase 3: obfuscated 0xA0+0xA4+0x97 sent to udpsockobf"
-    );
+        info!(
+            seed = %seed.ip(),
+            dst_port = seed_obfgossip_port,
+            eph_port,
+            server_key = format!("0x{:08x}", seed_serverkey),
+            echoed_chal = format!("0x{:08x}", challenge_97),
+            "gossip phase 3: obfuscated 0xA0+0xA4+0x97 sent to udpsockobf"
+        );
     } else {
         debug!(
             seed = %seed.ip(),
@@ -601,10 +625,9 @@ async fn handshake_with_seed(
     let mut count = 0usize;
     let mut packets_received = 0usize;
     let deadline = tokio::time::Instant::now() + REPLY_TIMEOUT;
-    while let Ok(Ok((n, from))) = tokio::time::timeout_at(
-        deadline,
-        eph_sock.recv_from(&mut buf),
-    ).await {
+    while let Ok(Ok((n, from))) =
+        tokio::time::timeout_at(deadline, eph_sock.recv_from(&mut buf)).await
+    {
         packets_received += 1;
         let hex_prefix: String = buf[..n.min(24)]
             .iter()
@@ -622,16 +645,24 @@ async fn handshake_with_seed(
         // 0xa5 (TCP+12 obfpingport), and 0x00 (default encode()).
         let decoded = server_obfuscation::decode_with_obfbyte(&buf[..n], random_part, 0x6b)
             .map(|m| ("random_part+0x6b", m))
-            .or_else(|| server_obfuscation::decode(&buf[..n], random_part)
-                .map(|m| ("random_part+0x00", m)))
-            .or_else(|| server_obfuscation::decode_with_obfbyte(&buf[..n], random_part, 0xa5)
-                .map(|m| ("random_part+0xa5", m)))
-            .or_else(|| server_obfuscation::decode_with_obfbyte(&buf[..n], seed_serverkey, 0x6b)
-                .map(|m| ("seed_key+0x6b", m)))
-            .or_else(|| server_obfuscation::decode(&buf[..n], seed_serverkey)
-                .map(|m| ("seed_key+0x00", m)))
-            .or_else(|| server_obfuscation::decode_with_obfbyte(&buf[..n], seed_serverkey, 0xa5)
-                .map(|m| ("seed_key+0xa5", m)));
+            .or_else(|| {
+                server_obfuscation::decode(&buf[..n], random_part).map(|m| ("random_part+0x00", m))
+            })
+            .or_else(|| {
+                server_obfuscation::decode_with_obfbyte(&buf[..n], random_part, 0xa5)
+                    .map(|m| ("random_part+0xa5", m))
+            })
+            .or_else(|| {
+                server_obfuscation::decode_with_obfbyte(&buf[..n], seed_serverkey, 0x6b)
+                    .map(|m| ("seed_key+0x6b", m))
+            })
+            .or_else(|| {
+                server_obfuscation::decode(&buf[..n], seed_serverkey).map(|m| ("seed_key+0x00", m))
+            })
+            .or_else(|| {
+                server_obfuscation::decode_with_obfbyte(&buf[..n], seed_serverkey, 0xa5)
+                    .map(|m| ("seed_key+0xa5", m))
+            });
 
         if let Some((method, inner)) = decoded {
             info!(seed = %seed.ip(), method, msg_len = inner.len(),
@@ -670,16 +701,22 @@ fn build_globservstatreq(challenge: u32) -> Vec<u8> {
 
 /// Parse SERVER_LIST_RES (0xA1): proto(1) + opcode(1) + count(1) + (ip(4) port(2 LE))[count]
 pub fn parse_server_list_res(data: &[u8]) -> Option<Vec<SocketAddrV4>> {
-    if data.len() < 3 { return None; }
-    if data[0] != PROTO_EDONKEY || data[1] != OP_SERVER_LIST_RES { return None; }
+    if data.len() < 3 {
+        return None;
+    }
+    if data[0] != PROTO_EDONKEY || data[1] != OP_SERVER_LIST_RES {
+        return None;
+    }
     let count = data[2] as usize;
-    if data.len() < 3 + count * 6 { return None; }
+    if data.len() < 3 + count * 6 {
+        return None;
+    }
 
     let mut servers = Vec::with_capacity(count);
     let mut pos = 3;
     for _ in 0..count {
-        let ip = Ipv4Addr::new(data[pos], data[pos+1], data[pos+2], data[pos+3]);
-        let port = u16::from_le_bytes([data[pos+4], data[pos+5]]);
+        let ip = Ipv4Addr::new(data[pos], data[pos + 1], data[pos + 2], data[pos + 3]);
+        let port = u16::from_le_bytes([data[pos + 4], data[pos + 5]]);
         pos += 6;
         if port > 0 && !ip.is_unspecified() && !ip.is_loopback() {
             servers.push(SocketAddrV4::new(ip, port));
@@ -692,7 +729,9 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
     const CLIENT_BLOCK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
     // Purge stale entries from recent_client_ips (older than 30 minutes).
-    state.recent_client_ips.retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
+    state
+        .recent_client_ips
+        .retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
 
     // Build the full set of IPs to block: currently connected clients +
     // recently seen clients (within TTL). This catches mldonkey that registered
@@ -702,7 +741,9 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
         let mut set = std::collections::HashSet::new();
         // Currently connected
         for e in state.clients.iter() {
-            if let std::net::IpAddr::V4(v4) = e.ip { set.insert(v4); }
+            if let std::net::IpAddr::V4(v4) = e.ip {
+                set.insert(v4);
+            }
         }
         // Recently connected (within TTL)
         for e in state.recent_client_ips.iter() {
@@ -733,8 +774,11 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
     for addr in new_list {
         let ip = *addr.ip();
         // Drop private, loopback, multicast, broadcast, and client IPs.
-        if ip.is_private() || ip.is_loopback() || ip.is_unspecified()
-            || ip.is_multicast() || ip.is_broadcast()
+        if ip.is_private()
+            || ip.is_loopback()
+            || ip.is_unspecified()
+            || ip.is_multicast()
+            || ip.is_broadcast()
             || blocked_ips.contains(&ip)
         {
             continue;
@@ -747,12 +791,16 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
         }
         if !existing.contains(&addr) {
             list.push(addr);
-            state.server_list_added_at.insert(*addr.ip(), std::time::Instant::now());
+            state
+                .server_list_added_at
+                .insert(*addr.ip(), std::time::Instant::now());
         }
     }
     if self_dropped > 0 {
-        info!(self_dropped,
-              "merge_server_list: ignored peer entries claiming to be us (phantom ports)");
+        info!(
+            self_dropped,
+            "merge_server_list: ignored peer entries claiming to be us (phantom ports)"
+        );
     }
     let added = list.len() - before;
     if added > 0 {
@@ -868,7 +916,9 @@ fn rand_u32() -> u32 {
         s ^= s << 13;
         s ^= s >> 17;
         s ^= s << 5;
-        if s == 0 { s = 0x0BAD_F00D; }
+        if s == 0 {
+            s = 0x0BAD_F00D;
+        }
         c.set(s);
         s
     })
@@ -882,7 +932,7 @@ mod tests {
     fn parse_seed_works() {
         assert_eq!(
             parse_seed("1.2.3.4:5687"),
-            Some(SocketAddrV4::new(Ipv4Addr::new(1,2,3,4), 5687))
+            Some(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 5687))
         );
         assert_eq!(parse_seed("not-an-ip"), None);
         assert_eq!(parse_seed("1.2.3.4"), None);
@@ -893,14 +943,14 @@ mod tests {
         // count=2, two servers
         let mut data = vec![PROTO_EDONKEY, OP_SERVER_LIST_RES, 2];
         // server 1: 1.2.3.4:5687
-        data.extend_from_slice(&[1,2,3,4]);
+        data.extend_from_slice(&[1, 2, 3, 4]);
         data.extend_from_slice(&5687u16.to_le_bytes());
         // server 2: 10.20.30.40:4661
-        data.extend_from_slice(&[10,20,30,40]);
+        data.extend_from_slice(&[10, 20, 30, 40]);
         data.extend_from_slice(&4661u16.to_le_bytes());
         let r = parse_server_list_res(&data).unwrap();
         assert_eq!(r.len(), 2);
-        assert_eq!(r[0], SocketAddrV4::new(Ipv4Addr::new(1,2,3,4), 5687));
-        assert_eq!(r[1], SocketAddrV4::new(Ipv4Addr::new(10,20,30,40), 4661));
+        assert_eq!(r[0], SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 5687));
+        assert_eq!(r[1], SocketAddrV4::new(Ipv4Addr::new(10, 20, 30, 40), 4661));
     }
 }

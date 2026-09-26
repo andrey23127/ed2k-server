@@ -11,10 +11,10 @@
 //! so it must stay cheap: most work bails out early when the window is small,
 //! and the expensive variance computation only runs once per 5 seconds per IP.
 
+use crate::state::{BotDetection, BotTracker, ServerState};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use crate::state::{BotDetection, BotTracker, ServerState};
 
 const WINDOW: Duration = Duration::from_secs(60);
 /// A normal eMule client does a few searches per minute. Above 200 is suspicious.
@@ -39,7 +39,9 @@ pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
     while let Some(t) = times.front() {
         if now.duration_since(*t) > WINDOW {
             times.pop_front();
-        } else { break; }
+        } else {
+            break;
+        }
     }
     let n = times.len();
     // Early bail-out: not enough samples → can't tell if it's a bot yet.
@@ -47,7 +49,10 @@ pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
         return;
     }
     // Cheap rate check first — most non-bot IPs fail this and we skip everything below.
-    let window_secs = now.duration_since(*times.front().unwrap()).as_secs_f64().max(0.001);
+    let window_secs = now
+        .duration_since(*times.front().unwrap())
+        .as_secs_f64()
+        .max(0.001);
     let qpm = (n as f64 / window_secs) * 60.0;
     if qpm < RATE_THRESHOLD {
         return;
@@ -62,10 +67,12 @@ pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
     }
 
     // Compute interval stddev only now that we know this IP is rate-suspicious.
-    let intervals: Vec<f64> = times.iter().zip(times.iter().skip(1))
+    let intervals: Vec<f64> = times
+        .iter()
+        .zip(times.iter().skip(1))
         .map(|(a, b)| b.duration_since(*a).as_secs_f64() * 1000.0)
         .collect();
-    drop(times);  // release the per-IP mutex before we touch other DashMaps
+    drop(times); // release the per-IP mutex before we touch other DashMaps
     let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
     let var = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
     let stddev_ms = var.sqrt();
@@ -77,13 +84,18 @@ pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
     }
     // OR if high-rate (>200) AND uniform timing.
     else if qpm > RATE_THRESHOLD && stddev_ms < STDDEV_THRESHOLD_MS {
-        reason = format!("{:.0} qpm + uniform timing ({:.0}ms stddev)", qpm, stddev_ms);
+        reason = format!(
+            "{:.0} qpm + uniform timing ({:.0}ms stddev)",
+            qpm, stddev_ms
+        );
     }
     if reason.is_empty() {
         return;
     }
 
-    let country = state.country_db.try_read()
+    let country = state
+        .country_db
+        .try_read()
         .ok()
         .and_then(|db| db.lookup(ip).map(|(c, _)| c))
         .unwrap_or_else(|| "??".to_string());
@@ -100,15 +112,18 @@ pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
     // active flood, and a rotated IP gets flagged + banned the same way.
     state.ban_bot(ip);
 
-    state.bot_detections.insert(ip, BotDetection {
-        first_seen,
-        last_seen: SystemTime::now(),
-        query_count: prev_count + 1,
-        queries_per_minute: qpm,
-        interval_stddev_ms: stddev_ms,
-        country,
-        reason: reason.clone(),
-    });
+    state.bot_detections.insert(
+        ip,
+        BotDetection {
+            first_seen,
+            last_seen: SystemTime::now(),
+            query_count: prev_count + 1,
+            queries_per_minute: qpm,
+            interval_stddev_ms: stddev_ms,
+            country,
+            reason: reason.clone(),
+        },
+    );
 
     // Count UNIQUE detection events (gated by DETECTION_COOLDOWN above), not every packet.
     *state.block_stats.entry("bot".to_string()).or_insert(0) += 1;

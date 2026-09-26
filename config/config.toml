@@ -41,6 +41,19 @@ max_frame_size = 1_000_000
 login_timeout_ms = 2000
 support_crypt = true
 
+# HighID hello check (live): re-check HighID clients with OP_HELLO in the
+# background. observe = count only; downgrade = a port answering with ANOTHER
+# client's hash gives that client LowID on its next logins. See README.
+highid_verify_observe = false
+highid_downgrade_on_wrong_hash = false
+highid_wrong_hash_ttl_secs = 86400
+
+# IPv6 (off for local testing). ipv6_enabled/listen_ip6 need a restart.
+ipv6_enabled = false
+listen_ip6 = "::"
+this_ip6 = ""
+ipv6_publish_sources = false
+
 [limits]
 max_clients = 1000
 soft_limit_files = 1000
@@ -48,6 +61,14 @@ hard_limit_files = 4000
 max_clients_per_ip = 10
 max_string_size = 250
 ping_delay_seconds = 300
+# Results per search, best-sourced first (live).
+max_search_results = 200
+# Candidates examined per search while ranking (live).
+search_rank_scan = 20000
+# Index letter/digit pieces of words: S01E08 -> s01, e08 (restart; off = old behaviour).
+index_subtokens = false
+# Ignore query words no indexed file contains instead of returning nothing (live).
+search_drop_unknown_words = true
 
 [content_filter]
 # Layer 3 hash blocklist(s). Obtain from authoritative sources (NCMEC/IWF/C3P);

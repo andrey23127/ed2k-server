@@ -4,9 +4,22 @@
 //! If successful → HighID (client is reachable, assigned_id = IPv4 as u32).
 //! If timeout/refused → LowID (client is behind NAT, assigned_id from pool).
 //!
-//! The server sends OP_HELLO (eD2k client-to-client opcode 0x01 with prefix
-//! 0x10) during the test, then closes. The client ignores it but the TCP
-//! handshake itself proves reachability.
+//! ⚠ TWO PROBES LIVE HERE AND THEY ARE NOT THE SAME CHECK.
+//!
+//!   `probe` — a bare TCP connect. NOTHING IS SENT. This decides HighID for
+//!   every ordinary login. An earlier version of this comment said the server
+//!   sends OP_HELLO here; it does not, and that sentence cost a day of doubting
+//!   a correct measurement.
+//!
+//!   `probe_identity` — OP_HELLO, then waits for OP_HELLOANSWER and compares
+//!   the user hash. This is what a stock Lugdunum does for EVERY login: measured,
+//!   it reports "No answer from your NNNN port" and gives LowID to a port that
+//!   accepts the connection but does not answer the hello, where `probe` here
+//!   gives HighID. Used for the verdict on the hairpin path; on every HighID
+//!   login, in the background, for counting when `network.highid_verify_observe`
+//!   is on, and to set wrong-hash marks when
+//!   `network.highid_downgrade_on_wrong_hash` is on — there ONLY a different
+//!   answering hash costs HighID (on the next login), no answer never does.
 //!
 //! This is the standard eD2k callback reachability check (server connects back
 //! to the client to learn whether it has an open port); it is NOT a backdoor.
@@ -120,8 +133,11 @@ impl ClientCrypt {
     }
 }
 
-/// Probe the client's advertised (ip, port).
-/// Returns true if the client is routable (HighID).
+/// Probe the client's advertised (ip, port) with a bare TCP connect.
+/// Returns true if something accepted the connection (HighID).
+///
+/// Nothing is written to the socket. This proves a port is open, not that an
+/// eD2k client is behind it — see the module note and `probe_identity`.
 pub async fn probe(ip: IpAddr, port: u16, timeout_ms: u64) -> bool {
     // Private / loopback / link-local are always LowID — no point probing.
     if !is_routable(ip) {
@@ -134,12 +150,7 @@ pub async fn probe(ip: IpAddr, port: u16, timeout_ms: u64) -> bool {
     }
 
     let addr = SocketAddr::new(ip, port);
-    match tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        TcpStream::connect(addr),
-    )
-    .await
-    {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await {
         Ok(Ok(_stream)) => {
             // Connected — HighID. Stream is immediately dropped; the client
             // will see a brief incoming connection which it handles gracefully.
@@ -180,6 +191,10 @@ pub async fn probe(ip: IpAddr, port: u16, timeout_ms: u64) -> bool {
 /// Returns `Ok(true)` on a verified match, `Ok(false)` on a mismatch, and
 /// `Err(reason)` when the exchange could not be completed at all — the caller
 /// decides how to treat "no answer", which is not the same as "wrong host".
+///
+/// A thin wrapper over `probe_identity_hash`: the exchange is identical, only
+/// the comparison happens here. The hairpin verdict path calls this and sees
+/// exactly the results it always did.
 pub async fn probe_identity(
     ip: IpAddr,
     port: u16,
@@ -190,6 +205,56 @@ pub async fn probe_identity(
     timeout_ms: u64,
     obfuscate: bool,
 ) -> Result<bool, &'static str> {
+    probe_identity_hash(
+        ip,
+        port,
+        expected_user_hash,
+        our_user_hash,
+        our_id,
+        our_port,
+        timeout_ms,
+        obfuscate,
+    )
+    .await
+    .map(|answered| same_client_hash(&answered, expected_user_hash))
+}
+
+/// Are these two user hashes the same client, allowing for its type marker?
+///
+/// Bytes 5 and 14 of an eD2k user hash are not identity: they mark the
+/// software. eMule writes 0x0E/0x6F, old eMule 0x0D/0x6E, MLDonkey 'M'/'L'
+/// (see `DbgGetHashTypeString` in eMule's OtherFunctions.cpp). The other
+/// fourteen bytes are the identity.
+///
+/// ⚠ SOME CLIENTS USE A DIFFERENT MARKER AT LOGIN AND IN THE HELLO. Measured on
+///   the live server: of 88 "port answered with a different hash" cases, 59 —
+///   eleven clients, every one of them — were identical in fourteen bytes and
+///   differed only here, eMule's 0E/6F in the login and MLDonkey's 4D/4C in the
+///   hello. Same machine. Compared byte for byte they read as a different host
+///   behind the port, and that inflated the count threefold. Two distinct
+///   clients agreeing in 112 random bits is not a case to design for.
+pub fn same_client_hash(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    (0..16).all(|i| i == 5 || i == 14 || a[i] == b[i])
+}
+
+/// The same exchange, returning the user hash the peer ANSWERED WITH.
+///
+/// For diagnosing a mismatch: "wrong host" alone does not say whether the port
+/// leads to another client behind the same NAT (which will usually be connected
+/// to us from the same address) or to something else entirely.
+///
+/// `expected_user_hash` is still required: it keys the obfuscated handshake,
+/// which is derived from the hash of the peer we believe we are calling.
+pub async fn probe_identity_hash(
+    ip: IpAddr,
+    port: u16,
+    expected_user_hash: &[u8; 16],
+    our_user_hash: &[u8; 16],
+    our_id: u32,
+    our_port: u16,
+    timeout_ms: u64,
+    obfuscate: bool,
+) -> Result<[u8; 16], &'static str> {
     let addr = SocketAddr::new(ip, port);
     let deadline = Duration::from_millis(timeout_ms);
     // Every stage is timed and logged. The first round of diagnosing this path
@@ -404,7 +469,9 @@ pub async fn probe_identity(
                 if let Some(c) = crypt.as_mut() {
                     c.recv.apply(&mut buf);
                 }
-                return Ok(&buf[skip..] == expected_user_hash.as_slice());
+                let mut answered = [0u8; 16];
+                answered.copy_from_slice(&buf[skip..skip + 16]);
+                return Ok(answered);
             }
             None => {
                 skipped_bytes += remaining;
@@ -547,7 +614,19 @@ fn is_routable(ip: IpAddr) -> bool {
                 && !v4.is_unspecified()
                 && !v4.is_broadcast()
         }
-        IpAddr::V6(_) => true,
+        // ⚠ FALSE, and not because IPv6 is unroutable. An eD2k client id IS a
+        //   32-bit IPv4 address — there is no HighID an IPv6-only peer could be
+        //   given. Returning true here made the probe run, and a peer that
+        //   answered it got `high_id_from_ip` = None, fell through to
+        //   `allocate_low_id()`, and ended up holding a LOW id while flagged as
+        //   HighID. Every consumer of that flag then drew the wrong conclusion:
+        //   source replies published it as directly reachable, and the sentinel
+        //   rule (which fires only for non-HighID sources) skipped the one peer
+        //   it exists for.
+        //
+        //   An IPv6 peer is LowID on v4 by construction and reachable through
+        //   the inline v6 source record instead.
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -579,7 +658,11 @@ mod tests {
         let a = server_pseudo_user_hash(&[7u8; 16]);
         let b = server_pseudo_user_hash(&[7u8; 16]);
         assert_eq!(a, b, "must be stable across restarts");
-        assert_ne!(a, server_pseudo_user_hash(&[8u8; 16]), "must differ per server");
+        assert_ne!(
+            a,
+            server_pseudo_user_hash(&[8u8; 16]),
+            "must differ per server"
+        );
         assert_ne!(a, [7u8; 16]);
         assert_eq!(a[5], 0x0E, "eMule-family marker byte");
         assert_eq!(a[14], 0x6F, "eMule-family marker byte");
@@ -692,7 +775,11 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..3 {
             let ttype = f[at];
-            assert_eq!(ttype & 0x80, 0x80, "hello tags use the single-byte name form");
+            assert_eq!(
+                ttype & 0x80,
+                0x80,
+                "hello tags use the single-byte name form"
+            );
             let id = f[at + 1];
             seen.push(id);
             at += 2;

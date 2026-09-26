@@ -11,6 +11,8 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
   (search, get-sources, server pings, server-to-server gossip) — UDP is the bulk
   of real-world traffic.
 - Inverted keyword index with boolean search trees and numeric size filters.
+  Results are ranked by source count, the result cap is configurable, and a
+  query word no indexed file contains no longer empties the search.
 - Memory-optimized in-memory index (sharded slab, intrusive hash index, name
   interning, jemalloc tuning) — roughly **half the RAM** of the Lugdunum
   reference at the same scale.
@@ -20,6 +22,11 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
 - Server-to-server **gossip** with obfuscation; mldonkey/junk-server filtering
   via verification.
 - **NAT traversal (NAT-T)** hole-punch coordination for LowID↔LowID transfers.
+- **IPv6** (opt-in): clients can connect over IPv6, and a client that is LowID on
+  IPv4 but has a public IPv6 is published as an IPv6 source to peers that can
+  parse it — see *IPv6* below.
+- HighID verified by a client-to-client hello, not only a TCP connect: a port
+  forwarded to a *different* client behind the same NAT no longer earns HighID.
 - IP filtering in eMule **guarding.p2p** format, with per-range hit statistics.
 - GeoIP country stats, bot/scanner detection, CSAM-publisher banning.
 - Built-in **admin web panel** (status, clients, peers, filters, blocks,
@@ -252,6 +259,13 @@ a watched file) or needs a **restart**.
 | `login_timeout_ms` | Login handshake timeout | restart |
 | `support_crypt` | Advertise protocol obfuscation support | restart |
 | `hairpin_lan_clients` | Let a client on the server's own network reach HighID (see below). Off by default | live |
+| `highid_verify_observe` | **Observe only.** After a client gets HighID from the plain TCP probe, also send OP_HELLO in the background and count whether it answers with the user hash that logged in. Nothing changes for the client. Counters on the Status tab, cases in `/api/highid_mismatches`. Default off | live |
+| `highid_downgrade_on_wrong_hash` | **Verdict.** The same background check, acted on: a port that answers with a *different* client's user hash marks (IP, port, login hash), and that client's next logins get LowID while the mark lasts (see below). Default off | live |
+| `highid_wrong_hash_ttl_secs` | How long a wrong-hash mark lasts. Default 86400 (a day) | live |
+| `ipv6_enabled` | Accept clients over IPv6 on the same TCP port, plus an IPv6 UDP socket on `tcp_port + 4`. Separate IPv6-only sockets, so the IPv4 path is unchanged; a host without IPv6 logs a warning and serves IPv4 only. Default off | restart |
+| `listen_ip6` | Bind address for the IPv6 sockets. Default `::` | restart |
+| `this_ip6` | The server's public IPv6, announced in `OP_SERVERIDENT` when `ipv6_publish_sources` is on. Empty = not announced | live |
+| `ipv6_publish_sources` | Publish IPv6 sources to clients that can parse them, and advertise the extension in `OP_IDCHANGE` and UDP pings. Independent of `ipv6_enabled`. Default off | live |
 
 > **UDP ports are derived from `tcp_port`, not configured.** The eD2k protocol
 > fixes the whole UDP block relative to the TCP port, and seed servers compute a
@@ -288,6 +302,33 @@ a watched file) or needs a **restart**.
 > Off by default because a server in a datacentre may see private addresses from
 > a management network that has nothing to do with its public address.
 
+> **HighID hello check (`highid_verify_observe`, `highid_downgrade_on_wrong_hash`).**
+> HighID is decided by a TCP connect to the client's address and port. That
+> proves *something* is listening there, not that it is this client. Behind a
+> NAT shared by two eD2k clients — two machines at home, or strangers behind a
+> provider's CGNAT where one of them has the port open — both claim the default
+> port, the forward leads to one of them, and the other one used to get a HighID
+> every peer is sent to the wrong machine by.
+>
+> With either option on, a client that passed the connect is also sent a
+> client-to-client `OP_HELLO` in the background, and the user hash in its
+> answer is compared with the one that logged in (the two client-type marker
+> bytes are ignored: some clients send MLDonkey's in the hello and eMule's at
+> login). The login is **never delayed** — a synchronous check was tried, and
+> clients whose login is still pending mostly do not answer in time.
+>
+> In verdict mode a *different* hash marks (IP, port, login hash) for
+> `highid_wrong_hash_ttl_secs`, and that client's next logins get LowID
+> immediately, which lets it be reached through server callback. Its first
+> session keeps the HighID. Every later login re-checks in the background: its
+> own hash again (forwarding fixed) clears the mark, a wrong hash renews it.
+>
+> **No answer never costs HighID.** A silent close or a reset is what eMule's IP
+> filter does to us, a timeout proves nothing, and Lugdunum-style "no answer →
+> LowID" would take HighID from clients that are in fact reachable. Only a
+> positive answer from another client counts. The hairpin path above is
+> separate and unchanged.
+
 ### `[limits]`
 | Key | Meaning | Apply |
 |---|---|---|
@@ -296,6 +337,10 @@ a watched file) or needs a **restart**.
 | `soft_limit_files`, `hard_limit_files` | Per-client offered-file limits | restart |
 | `max_string_size` | Max accepted string length | restart |
 | `ping_delay_seconds` | Server keep-alive ping interval | restart |
+| `max_search_results` | Results returned per search, across all pages; best-sourced first. Default 200, ceiling 5000. One value for every client — unlike Lugdunum, which varies it by zlib support and halves it for LowID | live |
+| `search_rank_scan` | Candidates examined when ranking one search. Past it, ranking covers only what was seen; the share of searches that hit it is shown on the Status tab. Default 20000, must be ≥ `max_search_results` | live |
+| `index_subtokens` | Also index letter/digit pieces of each word, so `S01E08` is found by `s01` and `e08`, `1080p` by `1080`. Changes what searches return, so off by default. Read once at startup: the index must split names the same way for its whole life. **Not a superset of Lugdunum**: a query that starts mid-run (`1x05` against `01x05`) is still not found | restart |
+| `search_drop_unknown_words` | Ignore query words that no indexed file contains instead of returning nothing because of them (a typo no longer empties the search). A query of only unknown words still returns nothing; OR branches and negated words are never rewritten. Default on | live |
 
 ### `[content_filter]`
 | Key | Meaning | Apply |
@@ -583,6 +628,53 @@ symptom is identical to a successful connection, which makes it easy to misdiagn
 
 ---
 
+## IPv6
+
+Off by default; two independent switches in `[network]`:
+
+- `ipv6_enabled` — **accept** clients over IPv6. A separate IPv6-only TCP
+  listener on `tcp_port` and UDP socket on `tcp_port + 4`; the IPv4 sockets are
+  untouched.
+- `ipv6_publish_sources` — **publish** IPv6 sources to peers that can parse
+  them. Kept separate because it changes what other peers receive.
+
+An eD2k client id is a 32-bit IPv4 address, so there is no such thing as an
+IPv6 HighID. A client connected over IPv6 is LowID on IPv4 by construction and
+is never probed. What IPv6 adds is a second way to reach a LowID client: its
+IPv6 address, handed to peers as a source.
+
+### Wire contract
+
+Agreed with the two other implementations that speak it, eMuleQt and eNode-go.
+Every element is ignored by a client that does not know it.
+
+| Direction | Element | Value | Meaning |
+|---|---|---|---|
+| client → server | login tag `CT_MOD_IP_V6` | `0xAE`, 16 raw bytes | the client's public IPv6 |
+| client → server | `CT_SERVER_FLAGS` bit | `0x1000` | client can parse IPv6 sources |
+| server → client | `OP_IDCHANGE` flags / UDP ping flags bit | `0x4000` | server speaks the extension |
+| server → client | `OP_SERVERIDENT` tag `ST_IPV6` | `0xAE`, 16 raw bytes | the server's IPv6 (`this_ip6`) |
+| server → client | `OP_SERVERIDENT` tag `ST_IPV6_STATUS` | `0xAB`, u8 | `0x01` address held, `0x02` treated as reachable |
+| server → client | source record in `OP_FOUNDSOURCES` / UDP answer | id `0xFFFFFFFF`, port, then 16 bytes | an IPv6 source |
+
+The client-flag bit (`0x1000`) and the server-flag bit (`0x4000`) are different
+numbers on purpose; they must not be "unified".
+
+Rules the server applies:
+
+- The address a session actually arrived from is preferred over the one the
+  tag claims: an observed address over an asserted one.
+- Only a globally usable IPv6 is published — never link-local, unique-local,
+  loopback, multicast or IPv4-mapped.
+- An IPv6 record is sent only for a source that is LowID on IPv4 (a HighID
+  source is reachable already), and only to a requester that can parse it: a
+  TCP client that sent the tag or connected over IPv6, or a UDP query that
+  arrived over IPv6.
+- Answers carrying IPv6 records bypass the source cache, which is shared with
+  clients that cannot parse them.
+
+---
+
 ## Server lists & IP filter
 
 - **Seed servers** (`server.seed_servers`): get a current list from
@@ -621,7 +713,15 @@ ssh -N -L 8080:127.0.0.1:8080 user@your-vps
 
 The panel shows live status, connected clients, peers/servers, filter info and
 per-range IP-filter hits, blocks, and memory metrics (RSS plus the non-evictable
-in-use bytes and per-file cost).
+in-use bytes and per-file cost). The Status tab also carries search counters
+(ranking cap hits, unknown words dropped), IPv6 clients and publishers, and the
+HighID hello-check counters.
+
+`GET /api/highid_mismatches` exports the recent wrong-hash cases of the HighID
+check (the last 1000) with a summary: which answering clients are connected
+from the same address, repeated addresses and hashes, and whether a mark was
+set. `?anonymize=1` replaces each address with its /24 plus a per-process salted
+tag, so repeats stay visible and the export can be shared.
 
 ---
 

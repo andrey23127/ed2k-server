@@ -67,6 +67,48 @@ fn main() -> Result<()> {
 /// names nobody references any more.
 ///
 /// Entirely synchronous and unbounded in the index size, which is why the caller
+/// Bind a TCP listener that serves IPv6 **only**.
+///
+/// ⚠ `IPV6_V6ONLY` MUST BE SET, and the failure without it is not obvious. On
+///   Linux `net.ipv6.bindv6only` defaults to 0, which means a socket bound to
+///   `[::]` also claims the IPv4 wildcard on that port. We already hold
+///   `0.0.0.0:6082`, so the v6 bind fails with EADDRINUSE — and because the
+///   failure is deliberately non-fatal, the server comes up looking healthy,
+///   logs one warning, and serves no IPv6 at all. That is exactly what happened
+///   the first time this ran.
+///
+///   Setting the flag also keeps the promise made elsewhere in this file: IPv4
+///   peers arrive on the IPv4 listener and are never seen as `::ffff:a.b.c.d`
+///   by anything downstream.
+fn bind_v6_only(addr: &str) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sa: std::net::SocketAddr = addr
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+    let sock = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    sock.set_only_v6(true)?;
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&sa.into())?;
+    sock.listen(1024)?;
+    TcpListener::from_std(std::net::TcpListener::from(sock))
+}
+
+/// Collapse an IPv4-mapped IPv6 peer address to plain IPv4.
+///
+/// `::ffff:203.0.113.7` and `203.0.113.7` are the same host, and the rest of the
+/// server must never see them as two. Returns everything else untouched — a
+/// genuine IPv6 address stays IPv6.
+fn normalize_peer(peer: std::net::SocketAddr) -> std::net::SocketAddr {
+    match peer {
+        std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
+            None => peer,
+        },
+        v4 => v4,
+    }
+}
+
 /// runs it via `spawn_blocking` rather than on a runtime worker.
 ///
 /// Each phase is timed separately. The three have very different shapes — the
@@ -112,8 +154,12 @@ fn orphan_sweep(state: &ed2k_server::state::ServerState) {
         // be reused. Heavy fields (name/sources) are already cleared on
         // tombstone, so the per-record residue is just the small packed header.
         state.user_files.shrink_to_fit();
-        info!(removed, remaining, evict_ms = t1.elapsed().as_millis(),
-              "orphan file cleanup: evicted files with no sources, purged reverse index");
+        info!(
+            removed,
+            remaining,
+            evict_ms = t1.elapsed().as_millis(),
+            "orphan file cleanup: evicted files with no sources, purged reverse index"
+        );
     }
 
     // Drain the keyword-index hot tier into the compressed cold store.
@@ -160,8 +206,8 @@ fn orphan_sweep(state: &ed2k_server::state::ServerState) {
 
 async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // Set up tracing per config.log.level (env RUST_LOG overrides if set).
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&cfg.log.level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log.level));
     // Per-layer filters, deliberately: the console layer honours log.level (or
     // RUST_LOG), while the in-memory ring keeps WARN+ regardless. Operators run
     // with logging turned down or off to save disk, and the health panel must
@@ -346,6 +392,42 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     info!(addr = %bind_addr, "TCP listener ready");
 
+    // Optional IPv6 listener, on the SAME port.
+    //
+    // A separate socket rather than a dual-stack one, deliberately. A dual-stack
+    // socket delivers IPv4 peers as ::ffff:a.b.c.d and every one of them then
+    // depends on the normalisation below being right; two sockets keep the IPv4
+    // path byte-identical to what it was, and IPv6 is additive. It also means a
+    // failure to bind v6 cannot take the v4 listener down with it.
+    //
+    // No new port number: a different address family on the same port is not a
+    // conflict, and clients find the server by address, not by port.
+    let listener6 = if cfg.network.ipv6_enabled {
+        let a6 = format!("[{}]:{}", cfg.network.listen_ip6, cfg.network.tcp_port);
+        match bind_v6_only(&a6) {
+            Ok(l) => {
+                info!(addr = %a6, "IPv6 TCP listener ready");
+                Some(l)
+            }
+            Err(e) => {
+                // Not fatal — a host without IPv6, or one where the address is
+                // not yet configured, must still serve IPv4.
+                //
+                // But loud. The first time this failed it produced one warning
+                // among thousands of startup lines while the admin UI happily
+                // reported IPv6-capable clients (counted from a login tag, not
+                // from any v6 session), so everything looked configured and
+                // nothing was listening. `error!` puts it in the Health panel's
+                // recent-errors list where it will actually be seen.
+                error!(addr = %a6, error = %e,
+                       "IPv6 listener could NOT bind — the server is serving IPv4 only");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Start UDP listener (SPEC.md §3.8, §3.10)
     // Bind first so we can share the socket with gossip (must come from port 4665).
     // Resolve the server-to-server obfuscation secret ONCE — all UDP
@@ -374,16 +456,20 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             if !cfg_ip.is_empty() && cfg_ip != "0.0.0.0" {
                 cfg_ip
             } else {
-                std::fs::read_to_string("/proc/net/fib_trie").ok()
+                std::fs::read_to_string("/proc/net/fib_trie")
+                    .ok()
                     .and_then(|s| {
                         let lines: Vec<&str> = s.lines().collect();
                         for i in 1..lines.len() {
                             if lines[i].contains("LOCAL") || lines[i].contains("32 HOST") {
                                 if let Some(prev) = lines.get(i.saturating_sub(1)) {
-                                    let ip_str = prev.trim().split_whitespace().next().unwrap_or("");
+                                    let ip_str = prev.split_whitespace().next().unwrap_or("");
                                     if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
-                                        if !ip.is_loopback() && !ip.is_private()
-                                            && !ip.is_unspecified() && !ip.is_multicast() {
+                                        if !ip.is_loopback()
+                                            && !ip.is_private()
+                                            && !ip.is_unspecified()
+                                            && !ip.is_multicast()
+                                        {
                                             return Some(ip.to_string());
                                         }
                                     }
@@ -423,8 +509,11 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // any non-0xE3 first byte and tries IPObfuscate(seckey, sender_ip).
     {
         let port_4669 = cfg.network.tcp_port.wrapping_add(8);
-        match UdpServer::bind_on_port(Arc::clone(&cfg), Arc::clone(&state), port_4669, seckey).await {
-            Ok(srv) => { tokio::spawn(async move { srv.run().await }); }
+        match UdpServer::bind_on_port(Arc::clone(&cfg), Arc::clone(&state), port_4669, seckey).await
+        {
+            Ok(srv) => {
+                tokio::spawn(async move { srv.run().await });
+            }
             Err(e) => warn!(port = port_4669, error = %e, "could not bind port_4669"),
         }
 
@@ -433,21 +522,55 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         // them, and we never appear in server.met. This is the single most
         // important port for server discovery.
         let port_s2s_obf = cfg.network.tcp_port.wrapping_add(12);
-        match UdpServer::bind_on_port(Arc::clone(&cfg), Arc::clone(&state), port_s2s_obf, seckey).await {
-            Ok(srv) => { tokio::spawn(async move { srv.run().await }); }
-            Err(e) => warn!(port = port_s2s_obf, error = %e, "could not bind server-to-server obf port"),
+        match UdpServer::bind_on_port(Arc::clone(&cfg), Arc::clone(&state), port_s2s_obf, seckey)
+            .await
+        {
+            Ok(srv) => {
+                tokio::spawn(async move { srv.run().await });
+            }
+            Err(e) => {
+                warn!(port = port_s2s_obf, error = %e, "could not bind server-to-server obf port")
+            }
         }
 
         let port_obf = cfg.network.tcp_port.wrapping_add(14);
-        match UdpServer::bind_on_port(Arc::clone(&cfg), Arc::clone(&state), port_obf, seckey).await {
-            Ok(srv) => { tokio::spawn(async move { srv.run().await }); }
+        match UdpServer::bind_on_port(Arc::clone(&cfg), Arc::clone(&state), port_obf, seckey).await
+        {
+            Ok(srv) => {
+                tokio::spawn(async move { srv.run().await });
+            }
             Err(e) => warn!(port = port_obf, error = %e, "could not bind portUDPobf"),
+        }
+    }
+
+    // IPv6 UDP listener, on the main UDP port.
+    //
+    // Without this the IPv6 story is half a story: a client reaches the server
+    // over TCP but its searches, source queries and keepalives are UDP, and
+    // those would arrive nowhere. It is also what makes the sentinel gate on
+    // that path reachable at all — that gate keys on the query's address
+    // family, and with no v6 socket no query ever has one.
+    //
+    // Only the main port. The three auxiliary ports exist for server-to-server
+    // traffic and for Lugdunum-compatible client channels, both of which carry
+    // 4-byte addresses in their payloads and have nowhere to put a v6 one.
+    if cfg.network.ipv6_enabled {
+        let p6 = cfg.network.udp_port();
+        match UdpServer::bind_v6(Arc::clone(&cfg), Arc::clone(&state), p6, seckey).await {
+            Ok(srv) => {
+                tokio::spawn(async move { srv.run().await });
+            }
+            Err(e) => warn!(port = p6, error = %e,
+                            "IPv6 UDP listener could not bind — continuing with IPv4 only"),
         }
     }
 
     // Keepalive: ping all clients every ping_delay_seconds (SPEC.md §3.7)
     spawn_keepalive(Arc::clone(&state), cfg.limits.ping_delay_seconds);
-    info!(interval_s = cfg.limits.ping_delay_seconds, "keepalive started");
+    info!(
+        interval_s = cfg.limits.ping_delay_seconds,
+        "keepalive started"
+    );
 
     // Periodic server_list cleanup. Three filters applied every 60 seconds:
     //  1. Remove IPs that are currently connected as clients.
@@ -480,7 +603,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                state_clean.recent_client_ips.retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
+                state_clean
+                    .recent_client_ips
+                    .retain(|_, ts| ts.elapsed() < CLIENT_BLOCK_TTL);
 
                 // Maps that had no eviction at all until 0.9.71.
                 //
@@ -491,7 +616,11 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // "recent" means — re-counting a file after that is correct, not
                 // a leak, since the stats are about activity in the window.
                 let pub_ttl = std::time::Duration::from_secs(
-                    state_clean.live_cfg.load().content_filter.publisher_blacklist_seconds,
+                    state_clean
+                        .live_cfg
+                        .load()
+                        .content_filter
+                        .publisher_blacklist_seconds,
                 );
                 state_clean
                     .csam_blocked_hashes
@@ -505,16 +634,19 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 state_clean
                     .our_sent_random_parts
                     .retain(|_, (_, sent)| sent.elapsed() < PEER_STATE_TTL);
-                state_clean.verified_servers.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
+                state_clean
+                    .verified_servers
+                    .retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
                 // Same TTL for the ip:port-keyed set that gates hand-out, so a server
                 // that stops answering pings stops being advertised (and a phantom
                 // port, which never answers, is never verified in the first place).
-                state_clean.verified_sockets.retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
+                state_clean
+                    .verified_sockets
+                    .retain(|_, ts| ts.elapsed() < VERIFIED_TTL);
                 // Drop log-throttle entries for peers that have gone quiet, so the
                 // map tracks only currently-noisy addresses rather than every IP
                 // ever seen.
-                ed2k_server::health::throttle()
-                    .sweep(std::time::Duration::from_secs(3600));
+                ed2k_server::health::throttle().sweep(std::time::Duration::from_secs(3600));
                 // observed_udp_ports remembers each client's externally-seen UDP port
                 // for NAT-T coordination. It is re-inserted with a fresh timestamp on
                 // every UDP packet from that IP, so an entry older than 30 min means
@@ -551,7 +683,12 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // grow.
                 {
                     let pub_ttl = std::time::Duration::from_secs(
-                        state_clean.live_cfg.load().content_filter.publisher_blacklist_seconds);
+                        state_clean
+                            .live_cfg
+                            .load()
+                            .content_filter
+                            .publisher_blacklist_seconds,
+                    );
                     state_clean
                         .banned_publishers
                         .retain(|_, since| since.elapsed() < pub_ttl);
@@ -585,7 +722,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 let blocked: std::collections::HashSet<std::net::Ipv4Addr> = {
                     let mut set = std::collections::HashSet::new();
                     for e in state_clean.clients.iter() {
-                        if let std::net::IpAddr::V4(v4) = e.ip { set.insert(v4); }
+                        if let std::net::IpAddr::V4(v4) = e.ip {
+                            set.insert(v4);
+                        }
                     }
                     for e in state_clean.recent_client_ips.iter() {
                         set.insert(*e.key());
@@ -609,9 +748,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     // handshake, so the leak stays closed: unverified client IPs
                     // are still dropped here, unverified non-clients fall to
                     // filter 3.
-                    if !verified && blocked.contains(&ip) { return false; }
+                    if !verified && blocked.contains(&ip) {
+                        return false;
+                    }
                     // Filter 3: unverified entries past their grace period.
-                    let added = state_clean.server_list_added_at.get(&ip)
+                    let added = state_clean
+                        .server_list_added_at
+                        .get(&ip)
                         .map(|e| *e.value())
                         .unwrap_or(now);
                     let in_list_for = now.duration_since(added);
@@ -622,8 +765,11 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 });
                 let purged = before - list.len();
                 if purged > 0 {
-                    info!(purged, total = list.len(),
-                          "periodic cleanup: removed IPs (clients or unverified)");
+                    info!(
+                        purged,
+                        total = list.len(),
+                        "periodic cleanup: removed IPs (clients or unverified)"
+                    );
                 }
             }
         });
@@ -761,9 +907,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         {
             let path = std::path::PathBuf::from(path);
             tokio::spawn(async move {
-                let mut last_mtime = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 tick.tick().await;
                 loop {
@@ -807,9 +951,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         {
             let path = std::path::PathBuf::from(path);
             tokio::spawn(async move {
-                let mut last_mtime = std::fs::metadata(&path)
-                    .and_then(|m| m.modified())
-                    .ok();
+                let mut last_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 tick.tick().await;
                 loop {
@@ -972,9 +1114,8 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             .map(std::path::PathBuf::from);
         if let Some(path) = path {
             tokio::spawn(async move {
-                let mtime = |p: &std::path::Path| {
-                    std::fs::metadata(p).and_then(|m| m.modified()).ok()
-                };
+                let mtime =
+                    |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
                 let mut last_mtime = mtime(&path);
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 tick.tick().await;
@@ -1015,7 +1156,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         let state_probe = Arc::clone(&state);
         let udp_sock_probe = Arc::clone(&udp_socket);
         tokio::spawn(async move {
-            const PROBE_BATCH: usize = 50;  // probe up to 50 unverified entries per minute
+            const PROBE_BATCH: usize = 50; // probe up to 50 unverified entries per minute
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.tick().await;
             loop {
@@ -1026,7 +1167,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 };
                 let mut probed = 0usize;
                 for addr in list_snapshot {
-                    if probed >= PROBE_BATCH { break; }
+                    if probed >= PROBE_BATCH {
+                        break;
+                    }
                     let ip = *addr.ip();
                     if state_probe.verified_servers.contains_key(&ip)
                         || state_probe.seed_server_keys.contains_key(&ip)
@@ -1049,7 +1192,10 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     }
                 }
                 if probed > 0 {
-                    info!(probed, "verification probe: sent 0x96 to unverified server_list entries");
+                    info!(
+                        probed,
+                        "verification probe: sent 0x96 to unverified server_list entries"
+                    );
                 }
             }
         });
@@ -1067,7 +1213,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         }
         S.with(|c| {
             let mut s = c.get();
-            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
             c.set(s);
             s as u16
         })
@@ -1097,18 +1245,24 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         }
 
         let state_reload = Arc::clone(&state);
-        let cfg_reload   = Arc::clone(&cfg);
-        let flag_reload  = Arc::clone(&reload_flag);
-        let admin_flag   = Arc::clone(&admin_reload_flag);
+        let cfg_reload = Arc::clone(&cfg);
+        let flag_reload = Arc::clone(&reload_flag);
+        let admin_flag = Arc::clone(&admin_reload_flag);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 // Either SIGHUP or the admin /api/reload endpoint trips a reload.
                 let sighup = flag_reload.swap(false, std::sync::atomic::Ordering::Relaxed);
                 let webreq = admin_flag.swap(false, std::sync::atomic::Ordering::Relaxed);
-                if !sighup && !webreq { continue; }
+                if !sighup && !webreq {
+                    continue;
+                }
 
-                info!(via_sighup = sighup, via_web = webreq, "reload triggered — reloading content filter");
+                info!(
+                    via_sighup = sighup,
+                    via_web = webreq,
+                    "reload triggered — reloading content filter"
+                );
 
                 // Reload hash blocklists — hot-swapped LIVE (L3 is an ArcSwap
                 // since v0.9.46). Union all configured files, then swap. Uses
@@ -1185,9 +1339,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // /api/reload) and the standalone mtime watcher call
                 // reload_extra_terms; either applies without a restart.
                 if let Some(path) = &cfg_reload.content_filter.extra_terms_file {
-                    match ed2k_server::filter::ContentFilter::load_terms_file(
-                        std::path::Path::new(path),
-                    ) {
+                    match ed2k_server::filter::ContentFilter::load_terms_file(std::path::Path::new(
+                        path,
+                    )) {
                         Ok(terms) => {
                             let n = terms.len();
                             state_reload.filter.reload_extra_terms(terms);
@@ -1199,9 +1353,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Reload L1 jargon list live, same as L4.
                 if let Some(path) = &cfg_reload.content_filter.jargon_terms_file {
-                    match ed2k_server::filter::ContentFilter::load_terms_file(
-                        std::path::Path::new(path),
-                    ) {
+                    match ed2k_server::filter::ContentFilter::load_terms_file(std::path::Path::new(
+                        path,
+                    )) {
                         Ok(terms) => {
                             let n = terms.len();
                             state_reload.filter.reload_jargon_terms(terms);
@@ -1213,9 +1367,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Hash whitelist (false-positive overrides).
                 if let Some(path) = &cfg_reload.content_filter.whitelist_hashes_file {
-                    match ed2k_server::filter::ContentFilter::load_hash_file(
-                        std::path::Path::new(path),
-                    ) {
+                    match ed2k_server::filter::ContentFilter::load_hash_file(std::path::Path::new(
+                        path,
+                    )) {
                         Ok(h) => {
                             let n = h.len();
                             state_reload.filter.reload_hash_whitelist(h);
@@ -1237,7 +1391,11 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let new_filter = IpFilter::load(path);
                     let ranges = new_filter.len();
                     *state_reload.ip_filter.write().await = new_filter;
-                    info!(ranges, path = &cfg_reload.storage.ipfilter_path, "IP filter reloaded");
+                    info!(
+                        ranges,
+                        path = &cfg_reload.storage.ipfilter_path,
+                        "IP filter reloaded"
+                    );
                 }
 
                 // Hot-reload the country database.
@@ -1260,11 +1418,16 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let ranges = new_db.range_count();
                     if ranges > 0 {
                         *state_reload.country_db.write().await = new_db;
-                        info!(ranges, path = &cfg_reload.storage.country_db_path,
-                              "GeoIP database reloaded");
+                        info!(
+                            ranges,
+                            path = &cfg_reload.storage.country_db_path,
+                            "GeoIP database reloaded"
+                        );
                     } else {
-                        warn!(path = &cfg_reload.storage.country_db_path,
-                              "GeoIP reload produced no ranges; keeping current table");
+                        warn!(
+                            path = &cfg_reload.storage.country_db_path,
+                            "GeoIP reload produced no ranges; keeping current table"
+                        );
                     }
                 }
             }
@@ -1355,7 +1518,10 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     {
         let configured_seeds = cfg.server.seed_servers.len();
         if configured_seeds > 0 {
-            info!(seeds = configured_seeds, "starting gossip with seed servers");
+            info!(
+                seeds = configured_seeds,
+                "starting gossip with seed servers"
+            );
         }
 
         // Plain bootstrap + keepalive on TCP+4 channel, under a supervisor that
@@ -1397,11 +1563,8 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         .iter()
                         .filter_map(|s| parse_seed(s))
                         .collect();
-                    let our_ip_live: Ipv4Addr = live
-                        .server
-                        .this_ip
-                        .parse()
-                        .unwrap_or(Ipv4Addr::UNSPECIFIED);
+                    let our_ip_live: Ipv4Addr =
+                        live.server.this_ip.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
                     drop(live);
 
                     // A REAL change to the configured list clears the give-up set:
@@ -1439,7 +1602,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         if given_up.contains(&addr) {
                             continue;
                         }
-                        if !running.contains_key(&addr) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = running.entry(addr) {
                             let h = ed2k_server::server::gossip::spawn_seed(
                                 addr,
                                 Arc::clone(&state_seed),
@@ -1448,7 +1611,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                                 Arc::clone(&sock_seed),
                                 seckey,
                             );
-                            running.insert(addr, h);
+                            e.insert(h);
                             info!(seed = %addr, "gossip: seed loop started");
                         }
                     }
@@ -1463,8 +1626,24 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         // gossip — splitting the work across two tasks broke that.
     }
 
+    // ─── Accept loop ────────────────────────────────────────────────────
+    //
+    // Two listeners, ONE handler. `serve_accepted` holds everything that used
+    // to be inline here, and both families call it — so an IPv6 client goes
+    // through byte-identical login, filtering, publication and idle handling.
+    // Adding a second copy of this code was the obvious way to add IPv6 and the
+    // wrong one: the content filter runs inside `handle_connection`, and a
+    // parallel path is exactly how a layer quietly stops being applied to half
+    // the traffic.
     loop {
-        match listener.accept().await {
+        let accepted = match listener6.as_ref() {
+            Some(l6) => tokio::select! {
+                r = listener.accept() => r,
+                r = l6.accept() => r,
+            },
+            None => listener.accept().await,
+        };
+        match accepted {
             Ok((stream, peer)) => {
                 // Enable TCP keepalive on the accepted socket. NAT-T LowID
                 // sources are silent on TCP for long stretches (they only share
@@ -1529,6 +1708,17 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 }
                 let cfg = Arc::clone(&cfg);
                 let state = Arc::clone(&state);
+                // Normalise an IPv4-mapped IPv6 address (::ffff:a.b.c.d) to a
+                // plain IPv4 one.
+                //
+                // ⚠ NOT cosmetic. Everything downstream keys on this address:
+                //   the source records handed to peers, the ban list, the bot
+                //   detector, the per-IP rate limits, the HighID probe. A legacy
+                //   IPv4 peer arriving on a dual-stack listener must be
+                //   indistinguishable from one arriving on the IPv4 listener, or
+                //   it gets a second identity and every one of those bookkeeping
+                //   structures counts it twice.
+                let peer = normalize_peer(peer);
                 tokio::spawn(async move {
                     // Bound the setup phase (TCP accept → obfuscation
                     // handshake → first frame). Without this, make_stream's
@@ -1545,7 +1735,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let crypt_stream = match tokio::time::timeout(
                         setup_timeout,
                         make_stream(stream, cfg.network.support_crypt),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(s)) => s,
                         Ok(Err(e)) => {
                             tracing::debug!(ip = %peer.ip(), error = %e,
@@ -1563,7 +1755,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     }
                 });
             }
-            Err(e) => { error!(error = %e, "accept failed"); }
+            Err(e) => {
+                error!(error = %e, "accept failed");
+            }
         }
     }
 }

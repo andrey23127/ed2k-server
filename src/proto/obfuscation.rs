@@ -15,20 +15,17 @@
 
 use num_bigint::BigUint;
 
-
 // ─── DH-768 parameters ───────────────────────────────────────────────────────
 
 /// 768-bit safe prime used for DH key exchange (SPEC.md §A.4).
 /// Same constant across all eD2k implementations.
 pub const DH_PRIME: [u8; 96] = [
-    0xF2, 0xBF, 0x52, 0xC5, 0x5F, 0x58, 0x7A, 0xDD, 0x53, 0x71, 0xA9, 0x36,
-    0xE8, 0x86, 0xEB, 0x3C, 0x62, 0x17, 0xA3, 0x3E, 0xC3, 0x4C, 0xB4, 0x0D,
-    0xC7, 0x3A, 0x41, 0xA6, 0x43, 0xAF, 0xFC, 0xE7, 0x21, 0xFC, 0x28, 0x63,
-    0x66, 0x53, 0x5B, 0xDB, 0xCE, 0x25, 0x9F, 0x22, 0x86, 0xDA, 0x4A, 0x91,
-    0xB2, 0x07, 0xCB, 0xAA, 0x52, 0x55, 0xD4, 0xF6, 0x1C, 0xCE, 0xAE, 0xD4,
-    0x5A, 0xD5, 0xE0, 0x74, 0x7D, 0xF7, 0x78, 0x18, 0x28, 0x10, 0x5F, 0x34,
-    0x0F, 0x76, 0x23, 0x87, 0xF8, 0x8B, 0x28, 0x91, 0x42, 0xFB, 0x42, 0x68,
-    0x8F, 0x05, 0x15, 0x0F, 0x54, 0x8B, 0x5F, 0x43, 0x6A, 0xF7, 0x0D, 0xF3,
+    0xF2, 0xBF, 0x52, 0xC5, 0x5F, 0x58, 0x7A, 0xDD, 0x53, 0x71, 0xA9, 0x36, 0xE8, 0x86, 0xEB, 0x3C,
+    0x62, 0x17, 0xA3, 0x3E, 0xC3, 0x4C, 0xB4, 0x0D, 0xC7, 0x3A, 0x41, 0xA6, 0x43, 0xAF, 0xFC, 0xE7,
+    0x21, 0xFC, 0x28, 0x63, 0x66, 0x53, 0x5B, 0xDB, 0xCE, 0x25, 0x9F, 0x22, 0x86, 0xDA, 0x4A, 0x91,
+    0xB2, 0x07, 0xCB, 0xAA, 0x52, 0x55, 0xD4, 0xF6, 0x1C, 0xCE, 0xAE, 0xD4, 0x5A, 0xD5, 0xE0, 0x74,
+    0x7D, 0xF7, 0x78, 0x18, 0x28, 0x10, 0x5F, 0x34, 0x0F, 0x76, 0x23, 0x87, 0xF8, 0x8B, 0x28, 0x91,
+    0x42, 0xFB, 0x42, 0x68, 0x8F, 0x05, 0x15, 0x0F, 0x54, 0x8B, 0x5F, 0x43, 0x6A, 0xF7, 0x0D, 0xF3,
 ];
 
 const DH_G: u64 = 2;
@@ -36,8 +33,8 @@ pub const DH_PRIME_SIZE: usize = 96;
 /// Private exponent size: 16 bytes = 128 bits (eNode-go: CryptDhaSize = 16)
 const DH_PRIVATE_SIZE: usize = 16;
 
-pub(crate) const MAGIC_VALUE_SERVER: u8    = 203;  // 0xCB
-pub(crate) const MAGIC_VALUE_REQUESTER: u8 = 34;   // 0x22
+pub(crate) const MAGIC_VALUE_SERVER: u8 = 203; // 0xCB
+pub(crate) const MAGIC_VALUE_REQUESTER: u8 = 34; // 0x22
 pub(crate) const MAGIC_SYNC: u32 = 0x835E_6FC4;
 
 const EM_OBFUSCATE: u8 = 0;
@@ -60,13 +57,19 @@ impl Rc4 {
     /// of keystream (standard eD2k anti-weak-key measure).
     pub fn new(key: &[u8], drop_1024: bool) -> Self {
         let mut s = [0u8; 256];
-        for i in 0..256 { s[i] = i as u8; }
+        for i in 0..256 {
+            s[i] = i as u8;
+        }
         let mut j = 0usize;
         for i in 0..256 {
             j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
             s.swap(i, j);
         }
-        let mut rc4 = Self { state: s, x: 0, y: 0 };
+        let mut rc4 = Self {
+            state: s,
+            x: 0,
+            y: 0,
+        };
         if drop_1024 {
             rc4.skip(1024);
         }
@@ -88,8 +91,7 @@ impl Rc4 {
             self.x = self.x.wrapping_add(1);
             self.y = self.y.wrapping_add(self.state[self.x as usize]);
             self.state.swap(self.x as usize, self.y as usize);
-            let xor_idx = self.state[self.x as usize]
-                .wrapping_add(self.state[self.y as usize]);
+            let xor_idx = self.state[self.x as usize].wrapping_add(self.state[self.y as usize]);
             *byte ^= self.state[xor_idx as usize];
         }
     }
@@ -112,7 +114,7 @@ fn derive_rc4(shared_secret: &[u8], magic: u8) -> Rc4 {
     buf.extend(std::iter::repeat(0u8).take(pad));
     buf.extend_from_slice(shared_secret);
     buf.push(magic);
-    use md5::{Md5, Digest};
+    use md5::{Digest, Md5};
     let digest = Md5::new().chain_update(&buf).finalize();
     Rc4::new(&digest, true)
 }
@@ -210,7 +212,11 @@ pub struct TcpObfuscation {
 impl TcpObfuscation {
     pub fn new(support_crypt: bool) -> Self {
         Self {
-            state: if support_crypt { CryptState::Waiting } else { CryptState::Plain },
+            state: if support_crypt {
+                CryptState::Waiting
+            } else {
+                CryptState::Plain
+            },
             send_key: None,
             recv_key: None,
         }
@@ -260,7 +266,7 @@ impl TcpObfuscation {
 
         let mut out = Vec::with_capacity(DH_PRIME_SIZE + enc.len());
         out.extend_from_slice(&b_pub); // plaintext DH public
-        out.extend_from_slice(&enc);   // encrypted handshake
+        out.extend_from_slice(&enc); // encrypted handshake
 
         self.state = CryptState::Negotiating;
         let _ = pad_len; // consumed conceptually
@@ -352,7 +358,9 @@ pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(n);
     let mut state: u64 = h.finish();
     for _ in 0..n {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         out.push((state >> 56) as u8);
     }
     out
@@ -437,7 +445,10 @@ mod tests {
         let mut dec_server = server_enc_part.to_vec();
         client_recv.apply(&mut dec_server);
         let sync = u32::from_le_bytes([dec_server[0], dec_server[1], dec_server[2], dec_server[3]]);
-        assert_eq!(sync, MAGIC_SYNC, "client sees correct MagicSync from server");
+        assert_eq!(
+            sync, MAGIC_SYNC,
+            "client sees correct MagicSync from server"
+        );
 
         // Client builds its ack
         let pad_len_byte = dec_server[3 + 1 + 1]; // after sync(4) + em_supported + em_preferred
@@ -447,8 +458,8 @@ mod tests {
         let mut client_ack = Vec::new();
         client_ack.extend_from_slice(&MAGIC_SYNC.to_le_bytes());
         client_ack.push(EM_OBFUSCATE); // method
-        client_ack.push(0u8);          // pad_len
-        // Append a plaintext test payload after the handshake
+        client_ack.push(0u8); // pad_len
+                              // Append a plaintext test payload after the handshake
         client_ack.extend_from_slice(b"\xE3\x05\x00\x00\x00\x38hi");
         let _ = pad_len;
 

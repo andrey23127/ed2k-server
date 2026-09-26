@@ -52,7 +52,6 @@ use crate::state::ServerState;
 /// random_part + up to 14 padding bytes — matches Lugdunum's behavior).
 pub const OBF_PING_PAYLOAD_MAX_PAD: usize = 14;
 
-
 /// Send an OBF ping and listen for the peer's encrypted response.
 ///
 /// Returns the peer's ServerKey if the round-trip succeeds — that value
@@ -145,7 +144,10 @@ pub fn decode_obf_s2s(packet: &[u8], session_key: u32) -> Option<u32> {
     use crate::proto::server_obfuscation::decode_with_obfbyte;
 
     if packet.len() < 10 {
-        warn!(len = packet.len(), "obf decode: packet too short (need ≥10)");
+        warn!(
+            len = packet.len(),
+            "obf decode: packet too short (need ≥10)"
+        );
         return None;
     }
 
@@ -165,10 +167,13 @@ pub fn decode_obf_s2s(packet: &[u8], session_key: u32) -> Option<u32> {
     // Try obf_byte = 0xa5 first (TCP+12 / obfpingport channel, used by Lugdunum
     // when sending from its 4673 equivalent).
     if let Some(msg) = decode_with_obfbyte(packet, session_key, 0xa5) {
-        info!(obf_byte = "0xa5", msg_len = msg.len(),
-              proto = format!("0x{:02x}", msg.first().copied().unwrap_or(0)),
-              opcode = format!("0x{:02x}", msg.get(1).copied().unwrap_or(0)),
-              "obf decode: magic OK with 0xa5");
+        info!(
+            obf_byte = "0xa5",
+            msg_len = msg.len(),
+            proto = format!("0x{:02x}", msg.first().copied().unwrap_or(0)),
+            opcode = format!("0x{:02x}", msg.get(1).copied().unwrap_or(0)),
+            "obf decode: magic OK with 0xa5"
+        );
         if let Some(key) = extract_server_key(&msg) {
             return Some(key);
         }
@@ -178,10 +183,13 @@ pub fn decode_obf_s2s(packet: &[u8], session_key: u32) -> Option<u32> {
 
     // Fallback: obf_byte = 0x00 (main s2s channel, used by some configs).
     if let Some(msg) = decode_with_obfbyte(packet, session_key, 0x00) {
-        info!(obf_byte = "0x00", msg_len = msg.len(),
-              proto = format!("0x{:02x}", msg.first().copied().unwrap_or(0)),
-              opcode = format!("0x{:02x}", msg.get(1).copied().unwrap_or(0)),
-              "obf decode: magic OK with 0x00");
+        info!(
+            obf_byte = "0x00",
+            msg_len = msg.len(),
+            proto = format!("0x{:02x}", msg.first().copied().unwrap_or(0)),
+            opcode = format!("0x{:02x}", msg.get(1).copied().unwrap_or(0)),
+            "obf decode: magic OK with 0x00"
+        );
         if let Some(key) = extract_server_key(&msg) {
             return Some(key);
         }
@@ -214,10 +222,14 @@ fn extract_server_key(msg: &[u8]) -> Option<u32> {
         return None;
     }
     let payload = &msg[2..];
-    info!(payload_len = payload.len(), "obf decode: GLOBSERVSTATRES payload");
+    info!(
+        payload_len = payload.len(),
+        "obf decode: GLOBSERVSTATRES payload"
+    );
     if payload.len() < 40 {
         // Log what we have — maybe it's the SHORT form (no ServerKey).
-        let hex: String = payload.iter()
+        let hex: String = payload
+            .iter()
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join(" ");
@@ -227,9 +239,7 @@ fn extract_server_key(msg: &[u8]) -> Option<u32> {
     // Extended layout: challenge+users+files+maxconn+soft+hard+pingflg+lowid
     //                  = 8 fields × 4 bytes = 32 bytes, then portUDP(2)+portTCP(2)
     //                  = 36 bytes, then ServerKey(4) at [36..40].
-    let server_key = u32::from_le_bytes([
-        payload[36], payload[37], payload[38], payload[39],
-    ]);
+    let server_key = u32::from_le_bytes([payload[36], payload[37], payload[38], payload[39]]);
     info!(
         server_key = format!("0x{:08x}", server_key),
         "obf decode: extracted peer ServerKey"
@@ -250,7 +260,9 @@ pub struct HandshakeResult {
 /// Without these, peer servers never learn we support obfuscation and our
 /// gossip presence on TCP+4 alone isn't enough to qualify for inclusion in
 /// real seeds' server.met (Lugdunum demands obf round-trip).
-#[deprecated(note = "OBF ping is now integrated into gossip's per-seed handshake — this is a no-op")]
+#[deprecated(
+    note = "OBF ping is now integrated into gossip's per-seed handshake — this is a no-op"
+)]
 #[allow(dead_code)]
 pub async fn obf_ping_loop(_seeds: Vec<SocketAddrV4>, _state: Arc<ServerState>) {
     // Intentionally empty — gossip::seed_loop now performs OBF ping inline
@@ -326,21 +338,32 @@ mod tests {
         // Encode using the 0xa5 variant (what a Lugdunum seed uses
         // when responding from its TCP+12/obfpingport channel).
         let frame_a5 = crate::proto::server_obfuscation::encode_with_obfbyte(
-            &ed2k, session_key, 0xCAFE_1234, 0xa5
+            &ed2k,
+            session_key,
+            0xCAFE_1234,
+            0xa5,
         );
 
         // decode_obf_s2s tries 0xa5 first, should succeed.
         let extracted = decode_obf_s2s(&frame_a5, session_key);
-        assert_eq!(extracted, Some(peer_server_key),
-            "should extract ServerKey from 0xa5-encoded frame");
+        assert_eq!(
+            extracted,
+            Some(peer_server_key),
+            "should extract ServerKey from 0xa5-encoded frame"
+        );
 
         // Also test the 0x00 fallback variant.
         let frame_00 = crate::proto::server_obfuscation::encode_with_obfbyte(
-            &ed2k, session_key, 0xDEAD_BEEF, 0x00
+            &ed2k,
+            session_key,
+            0xDEAD_BEEF,
+            0x00,
         );
         let extracted2 = decode_obf_s2s(&frame_00, session_key);
-        assert_eq!(extracted2, Some(peer_server_key),
-            "should extract ServerKey from 0x00-encoded frame via fallback");
+        assert_eq!(
+            extracted2,
+            Some(peer_server_key),
+            "should extract ServerKey from 0x00-encoded frame via fallback"
+        );
     }
 }
-

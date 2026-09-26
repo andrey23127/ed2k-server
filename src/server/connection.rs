@@ -74,6 +74,15 @@ pub async fn handle_connection(
     }
 
     // IP filter check — drop blocked addresses before spending any resources.
+    //
+    // ⚠ IPv4 ONLY, and an operator enabling IPv6 should know it. Both list
+    //   formats the filter reads (ipfilter.dat and .p2p) carry v4 ranges and
+    //   nothing else, so there is no v6 range to test against — an IPv6 client
+    //   is not "allowed through the filter", it is outside its coverage
+    //   entirely. The same is true of every published blocklist we know of.
+    //
+    //   The content filter is unaffected: it works on filenames and runs later,
+    //   on the same code path for both families.
     if let std::net::IpAddr::V4(v4) = peer.ip() {
         if state.ip_filter.read().await.is_blocked(v4) {
             *state.block_stats.entry("ipfilter".to_string()).or_insert(0) += 1;
@@ -147,8 +156,7 @@ pub async fn handle_connection(
                 .unwrap_or(logged_in_backstop);
             let tcp_idle = last_activity.elapsed();
             let effective_idle = tcp_idle.min(udp_idle);
-            tokio::time::Instant::now()
-                + logged_in_backstop.saturating_sub(effective_idle)
+            tokio::time::Instant::now() + logged_in_backstop.saturating_sub(effective_idle)
         };
 
         tokio::select! {
@@ -262,10 +270,17 @@ pub async fn handle_connection(
         };
         if should_decrement_lowid {
             if !c.is_high_id {
-                state.lowid_count_cached
+                state
+                    .lowid_count_cached
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             state.clients.remove(&c.user_hash);
+            // Drop the IPv6 side entry with the session. Leaving it would let a
+            // departed client's address keep being published as a source, which
+            // is the same defect the stale-IPv4 filter exists for — except a
+            // stale entry here survives indefinitely because nothing else
+            // references it.
+            state.client_ipv6.remove(&c.user_hash);
             // Retract the id→user mapping. Guarded inside: a HighID client's
             // assigned_id is its IPv4, so a reconnect from the same address may
             // already have claimed this id — in that case the entry belongs to
@@ -358,15 +373,22 @@ async fn dispatch(
                 // of the statement (never held across an .await), so a hot reload
                 // takes effect on the next login attempt.
                 let ttl = std::time::Duration::from_secs(
-                    state.live_cfg.load().content_filter.publisher_blacklist_seconds);
+                    state
+                        .live_cfg
+                        .load()
+                        .content_filter
+                        .publisher_blacklist_seconds,
+                );
                 // NB: the BAN length, deliberately — not the counting window.
                 if state.is_publisher_banned(&req.user_hash, ttl) {
                     // Throttled: the ban lasts 30 days by default while the client
                     // keeps auto-reconnecting on a ~30 s timer, so this single peer
                     // would otherwise write ~5700 warnings a day.
                     if let Some(sup) = crate::health::throttle().allow(
-                        peer.ip(), "login_banned", crate::health::SUPPRESS_WINDOW)
-                    {
+                        peer.ip(),
+                        "login_banned",
+                        crate::health::SUPPRESS_WINDOW,
+                    ) {
                         warn!(ip = %peer.ip(), user_hash = hex::encode(req.user_hash),
                               suppressed = sup, "login refused — CSAM publisher is banned");
                     }
@@ -382,24 +404,42 @@ async fn dispatch(
             // task eventually times out and decrements. eMule then reports
             // a LowID count > total connected clients.
             state.index_client_id(new_client.assigned_id, new_client.user_hash);
-            let prev = state.clients.insert(new_client.user_hash, new_client.clone());
+            // Side table of publisher IPv6 addresses. Written here, next to the
+            // client map, so the two cannot get out of step: a client with no
+            // usable v6 must have NO entry rather than a stale one from a
+            // previous session at a different address.
+            match new_client.ipv6 {
+                Some(a) => {
+                    state.client_ipv6.insert(new_client.user_hash, a);
+                }
+                None => {
+                    state.client_ipv6.remove(&new_client.user_hash);
+                }
+            }
+            let prev = state
+                .clients
+                .insert(new_client.user_hash, new_client.clone());
             // Maintain cached lowid count so handle_servstat doesn't do an O(N)
             // iter on every UDP probe (was 2.58% of CPU in v0.9.36 profile).
             if let Some(old) = &prev {
                 if !old.is_high_id {
-                    state.lowid_count_cached
+                    state
+                        .lowid_count_cached
                         .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             if !new_client.is_high_id {
-                state.lowid_count_cached
+                state
+                    .lowid_count_cached
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             // Track this IP as a recently-seen client for 30 minutes.
             // merge_server_list (gossip) uses this to prevent mldonkey client IPs
             // from entering our peer-server list even after they disconnect.
             if let std::net::IpAddr::V4(client_v4) = new_client.ip {
-                state.recent_client_ips.insert(client_v4, std::time::Instant::now());
+                state
+                    .recent_client_ips
+                    .insert(client_v4, std::time::Instant::now());
             }
             // Evict this IP from gossip server_list if it was added there by
             // a previous gossip cycle (mldonkey clients advertise themselves
@@ -432,11 +472,11 @@ async fn dispatch(
             };
             match SearchRequest::parse(&frame.payload) {
                 Ok(req) => {
-                    use crate::server::search::{build_search_result_page, SEARCH_PAGE_SIZE};
+                    use crate::server::search::{build_search_result_page, search_page_size};
                     // Run the search; keep the full result set in this
                     // connection's pending buffer.
                     let mut all = handle_search(state, req);
-                    let first_len = all.len().min(SEARCH_PAGE_SIZE);
+                    let first_len = all.len().min(search_page_size(state));
                     let first_page: Vec<_> = all.drain(..first_len).collect();
                     let has_more = !all.is_empty();
                     *pending_search = all; // remainder for QUERY_MORE_RESULT
@@ -470,8 +510,10 @@ async fn dispatch(
             };
             if frame.payload.len() >= 4 {
                 let target_id = u32::from_le_bytes([
-                    frame.payload[0], frame.payload[1],
-                    frame.payload[2], frame.payload[3],
+                    frame.payload[0],
+                    frame.payload[1],
+                    frame.payload[2],
+                    frame.payload[3],
                 ]);
                 handle_callback_request(state, c, target_id, framed).await?;
             }
@@ -484,11 +526,12 @@ async fn dispatch(
             // payload: target_id(4) + requester_udp_port(2)
             if frame.payload.len() >= 6 {
                 let target_id = u32::from_le_bytes([
-                    frame.payload[0], frame.payload[1],
-                    frame.payload[2], frame.payload[3],
+                    frame.payload[0],
+                    frame.payload[1],
+                    frame.payload[2],
+                    frame.payload[3],
                 ]);
-                let requester_udp_port =
-                    u16::from_le_bytes([frame.payload[4], frame.payload[5]]);
+                let requester_udp_port = u16::from_le_bytes([frame.payload[4], frame.payload[5]]);
                 crate::server::holepunch::handle_holepunch_request(
                     state,
                     &c.user_hash,
@@ -526,7 +569,7 @@ async fn dispatch(
         OP_QUERY_MORE_RESULT => {
             // Client wants the next page of the last search. Drain another
             // page from this connection's pending buffer.
-            use crate::server::search::{build_search_result_page, SEARCH_PAGE_SIZE};
+            use crate::server::search::{build_search_result_page, search_page_size};
             if pending_search.is_empty() {
                 // Nothing buffered — reply with an empty, "no more" result
                 // so the client's More button settles.
@@ -535,12 +578,14 @@ async fn dispatch(
                 p.put_u8(0u8);
                 framed.send(Frame::new(OP_SEARCHRESULT, p.to_vec())).await?;
             } else {
-                let n = pending_search.len().min(SEARCH_PAGE_SIZE);
+                let n = pending_search.len().min(search_page_size(state));
                 let page: Vec<_> = pending_search.drain(..n).collect();
                 let has_more = !pending_search.is_empty();
                 debug!(ip = %peer.ip(), page = page.len(), has_more,
                        "QUERY_MORE_RESULT — sending next page");
-                framed.send(build_search_result_page(&page, has_more)).await?;
+                framed
+                    .send(build_search_result_page(&page, has_more))
+                    .await?;
             }
         }
 

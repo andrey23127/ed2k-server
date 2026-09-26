@@ -84,6 +84,15 @@ fn build_callbackrequested(ip: IpAddr, port: u16) -> Frame {
             let as_u32 = u32::from_le_bytes(octets);
             payload.put_u32_le(as_u32);
         }
+        // Unreachable for an IPv6 requester, and deliberately so: the payload
+        // has four bytes for an address and no way to carry a v6 one, so a
+        // target told 0.0.0.0 would burn a connection attempt on nothing.
+        //
+        // What protects this is the LowID check at the top of
+        // `handle_callback_request` combined with the rule that an IPv6 session
+        // is never given a HighID — an eD2k client id IS an IPv4 address. If
+        // that rule is ever relaxed, this branch becomes reachable and has to be
+        // replaced by a refusal (OP_CALLBACK_FAIL), not by a zero.
         _ => payload.put_u32_le(0),
     }
     payload.put_u16_le(port);
