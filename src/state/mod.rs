@@ -72,6 +72,9 @@ pub struct ClientHandle {
     pub shared_files: u32,
     /// Counters for §7.6 enforcement
     pub csam_attempts: u32,
+    /// The soft-limit server message has been sent on this connection.
+    /// Lugdunum sends it once per connection, however many batches go over.
+    pub soft_limit_warned: bool,
     /// Channel to push frames to this client's connection task.
     /// Used by callback and keepalive code. None when channel is closed/dropped.
     pub tx: Option<mpsc::Sender<Frame>>,
@@ -694,6 +697,11 @@ pub struct ServerState {
     /// Keys: "ipfilter", "csam", "max_connections_per_ip", "rate_limit", "bot".
     pub block_stats: DashMap<String, u64>,
 
+    /// Open TCP connections per client IP, for `limits.max_clients_per_ip`.
+    /// Held by an [`IpSlot`] for the life of the connection task and released
+    /// when it drops, so the count cannot drift on any exit path.
+    pub conn_per_ip: DashMap<IpAddr, u32>,
+
     /// Searches that exhausted `limits.search_rank_scan` before running out of
     /// candidates, and were therefore ranked over a prefix of the candidate set
     /// rather than over all of it.
@@ -709,6 +717,13 @@ pub struct ServerState {
     /// (see `limits.search_drop_unknown_words`). Each of these returned
     /// something where it used to return nothing.
     pub search_words_dropped: std::sync::atomic::AtomicU64,
+    /// OFFERFILES batches in which `limits.soft_limit_files` stopped at least
+    /// one record, and the records it stopped.
+    pub offer_over_soft_batches: std::sync::atomic::AtomicU64,
+    pub offer_over_soft_records: std::sync::atomic::AtomicU64,
+    /// OFFERFILES packets rejected (and their connections closed) because the
+    /// declared record count reached `limits.hard_limit_files`.
+    pub offer_over_hard_packets: std::sync::atomic::AtomicU64,
 
     /// See `network.highid_verify_observe`.
     pub highid_observe: std::sync::Arc<HighIdObserve>,
@@ -738,7 +753,54 @@ pub struct BotDetection {
     pub reason: String,
 }
 
+/// One open TCP connection counted against its IP. Dropping it releases the
+/// slot; see [`ServerState::try_acquire_ip_slot`].
+pub struct IpSlot {
+    state: Arc<ServerState>,
+    ip: IpAddr,
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        if let Some(mut n) = self.state.conn_per_ip.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+        }
+        // Remove the entry at zero so the map holds only IPs with a live
+        // connection. remove_if re-checks under the shard lock: a connection
+        // accepted between the decrement and here keeps its entry.
+        self.state.conn_per_ip.remove_if(&self.ip, |_, n| *n == 0);
+    }
+}
+
 impl ServerState {
+    /// Count a new TCP connection from `ip` against `limits.max_clients_per_ip`.
+    ///
+    /// Returns the slot to hold for the life of the connection, or `None` when
+    /// the IP already has `limit` connections open. `limit == 0` disables the
+    /// cap (a slot is still returned, so the per-IP numbers stay visible).
+    /// Loopback is never capped: it is the operator's own tooling.
+    pub fn try_acquire_ip_slot(self: &Arc<Self>, ip: IpAddr, limit: u32) -> Option<IpSlot> {
+        let mut n = self.conn_per_ip.entry(ip).or_insert(0);
+        if limit > 0 && *n >= limit && !ip.is_loopback() {
+            return None;
+        }
+        *n += 1;
+        drop(n);
+        Some(IpSlot {
+            state: Arc::clone(self),
+            ip,
+        })
+    }
+
+    /// The most connections any single IP holds right now.
+    pub fn busiest_ip_connections(&self) -> u32 {
+        self.conn_per_ip
+            .iter()
+            .map(|e| *e.value())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// How long a flagged flood bot stays banned (its UDP traffic dropped).
     pub const BOT_BAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -781,6 +843,7 @@ impl ServerState {
             software: "test".into(),
             shared_files: 0,
             csam_attempts: 0,
+            soft_limit_warned: false,
             tx: Some(tx),
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 ClientHandle::now_ms(),
@@ -1000,9 +1063,13 @@ impl ServerState {
             review_watermark: std::sync::Mutex::new(None),
             csam_files_by_user: DashMap::new(),
             block_stats: DashMap::new(),
+            conn_per_ip: DashMap::new(),
             search_rank_capped: std::sync::atomic::AtomicU64::new(0),
             search_total: std::sync::atomic::AtomicU64::new(0),
             search_words_dropped: std::sync::atomic::AtomicU64::new(0),
+            offer_over_soft_batches: std::sync::atomic::AtomicU64::new(0),
+            offer_over_soft_records: std::sync::atomic::AtomicU64::new(0),
+            offer_over_hard_packets: std::sync::atomic::AtomicU64::new(0),
             highid_observe: std::sync::Arc::new(HighIdObserve::new()),
         }
     }
@@ -1026,6 +1093,35 @@ impl ServerState {
     pub fn note_search_words_dropped(&self) {
         self.search_words_dropped
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An OFFERFILES batch hit the soft file limit; `records` were not indexed.
+    pub fn note_offer_over_soft_limit(&self, records: u32) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.offer_over_soft_batches.fetch_add(1, Relaxed);
+        self.offer_over_soft_records
+            .fetch_add(records as u64, Relaxed);
+    }
+
+    /// (batches that hit the soft file limit, records not indexed because of it).
+    pub fn offer_over_soft_stats(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.offer_over_soft_batches.load(Relaxed),
+            self.offer_over_soft_records.load(Relaxed),
+        )
+    }
+
+    /// An OFFERFILES packet declared `>= hard_limit_files` records and was
+    /// rejected with its connection.
+    pub fn note_offer_over_hard_limit(&self) {
+        self.offer_over_hard_packets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn offer_over_hard_count(&self) -> u64 {
+        self.offer_over_hard_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn search_words_dropped_count(&self) -> u64 {
@@ -1316,6 +1412,7 @@ impl ServerState {
             software,
             shared_files: 0,
             csam_attempts: 0,
+            soft_limit_warned: false,
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1661,6 +1758,7 @@ mod callback_tests {
             software: "test".to_string(),
             shared_files: 0,
             csam_attempts: 0,
+            soft_limit_warned: false,
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 ClientHandle::now_ms(),
@@ -2180,5 +2278,68 @@ mod user_files_index_tests {
         s.set_complete(false);
         assert_eq!(s.port(), 65535);
         assert!(!s.complete());
+    }
+}
+
+#[cfg(test)]
+mod ip_slot_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    fn st() -> Arc<ServerState> {
+        Arc::new(ServerState::new(
+            Arc::new(ContentFilter::new()),
+            Arc::new(crate::config::Config::minimal_test_config()),
+        ))
+    }
+
+    #[test]
+    fn an_ip_gets_limit_connections_and_no_more() {
+        let st = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let a = st.try_acquire_ip_slot(ip, 2);
+        let b = st.try_acquire_ip_slot(ip, 2);
+        assert!(a.is_some() && b.is_some());
+        assert!(st.try_acquire_ip_slot(ip, 2).is_none());
+        assert_eq!(st.busiest_ip_connections(), 2);
+        // Another IP is counted separately.
+        assert!(st
+            .try_acquire_ip_slot(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 2)
+            .is_some());
+    }
+
+    #[test]
+    fn dropping_a_slot_frees_it_and_the_last_one_removes_the_entry() {
+        let st = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let a = st.try_acquire_ip_slot(ip, 1).unwrap();
+        assert!(st.try_acquire_ip_slot(ip, 1).is_none());
+        drop(a);
+        assert!(st.conn_per_ip.get(&ip).is_none(), "no stale zero entries");
+        let b = st.try_acquire_ip_slot(ip, 1);
+        assert!(b.is_some());
+    }
+
+    #[test]
+    fn zero_disables_the_cap_but_still_counts() {
+        let st = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let slots: Vec<_> = (0..50).map(|_| st.try_acquire_ip_slot(ip, 0)).collect();
+        assert!(slots.iter().all(|s| s.is_some()));
+        assert_eq!(st.busiest_ip_connections(), 50);
+        drop(slots);
+        assert_eq!(st.busiest_ip_connections(), 0);
+    }
+
+    #[test]
+    fn loopback_is_never_capped() {
+        let st = st();
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ] {
+            let slots: Vec<_> = (0..5).map(|_| st.try_acquire_ip_slot(ip, 1)).collect();
+            assert!(slots.iter().all(|s| s.is_some()));
+        }
     }
 }

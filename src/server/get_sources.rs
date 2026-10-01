@@ -152,8 +152,11 @@ pub fn handle_get_sources(
                 .iter()
                 // Don't return the requester to itself
                 .filter(|s| s.user_hash != requester.user_hash)
-                // LowID-to-LowID introductions are useless (neither can connect),
-                // but we don't have that detail per-source yet in MVP. Skip filter.
+                // LowID sources are returned to LowID requesters on purpose.
+                // Stock eMule cannot use them and drops them itself, but the
+                // NAT-traversal mod reaches exactly these through the server's
+                // hole-punch rendezvous, and an IPv6-capable pair can connect
+                // over v6. Filtering here would cut those paths for no gain.
                 .take(MAX_SOURCES_PER_REPLY)
                 .copied()
                 .collect::<Vec<_>>()

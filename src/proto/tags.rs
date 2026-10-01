@@ -7,14 +7,30 @@
 use bytes::{BufMut, BytesMut};
 use thiserror::Error;
 
+/// `limits.max_string_size`: at most `max_bytes` bytes of `s`, cut back to a
+/// character boundary so the result is still valid UTF-8. `0` = no limit.
+///
+/// Applied to what the server STORES (file names in the index, nicks), never to
+/// what it CHECKS: the content filter must see the whole name, or a marker past
+/// the cut would be dropped before anything looked at it.
+pub fn cap_string(s: &str, max_bytes: u32) -> &str {
+    let max = max_bytes as usize;
+    if max == 0 || s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[derive(Debug, Error)]
 pub enum TagError {
     #[error("buffer underrun while parsing tag")]
     Underrun,
     #[error("unsupported tag type 0x{0:02x}")]
     UnsupportedType(u8),
-    #[error("string too long ({0} bytes)")]
-    StringTooLong(usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,4 +638,29 @@ fn full_loginrequest_old_format_tags() {
     assert_eq!(tags[2].as_u32(), Some(1817));
     // Tag 3: CT_EMULE_VERSION = 0xFB
     assert_eq!(tags[3].name, TagName::Byte(0xfb));
+}
+
+#[cfg(test)]
+mod cap_string_tests {
+    use super::cap_string;
+
+    #[test]
+    fn short_strings_and_zero_are_untouched() {
+        assert_eq!(cap_string("abc", 10), "abc");
+        assert_eq!(cap_string("abc", 3), "abc");
+        assert_eq!(cap_string(&"x".repeat(1000), 0).len(), 1000);
+    }
+
+    #[test]
+    fn long_strings_are_cut_to_the_byte_limit() {
+        assert_eq!(cap_string("abcdef", 4), "abcd");
+    }
+
+    #[test]
+    fn the_cut_never_splits_a_character() {
+        // "й" is 2 bytes, "日" 3: a cut inside either falls back to the start.
+        assert_eq!(cap_string("ййй", 5), "йй");
+        assert_eq!(cap_string("日本語", 4), "日");
+        assert_eq!(cap_string("日本語", 2), "");
+    }
 }

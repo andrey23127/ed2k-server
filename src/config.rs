@@ -283,14 +283,23 @@ pub struct NetworkConfig {
     pub tcp_port: u16,
     #[serde(default = "default_listen_ip")]
     pub listen_ip: String,
+    /// TCP accept backlog for the IPv4 and IPv6 listeners. `0` = 1024. The
+    /// kernel caps it at net.core.somaxconn. Restart.
     #[serde(default = "default_backlog")]
     pub listen_backlog: u32,
     #[serde(default = "default_max_frame")]
     pub max_frame_size: u32,
-    /// Server key embedded in GLOBSERVSTATRES
-    #[serde(default = "default_udp_server_key")]
-    pub udp_server_key: u32,
-
+    /// Ceiling on the decompressed payload of one packed (0xD4) frame.
+    /// `max_frame_size` bounds the compressed wire length only, and zlib
+    /// expands up to ~1000:1. Must be at least 1; there is no "off". Applies to
+    /// new connections.
+    #[serde(default = "default_max_decompressed")]
+    pub max_decompressed_frame_size: u32,
+    // `udp_server_key` was here and was never read: the ServerKey a client
+    // gets in OP_GLOBSERVSTATRES is computed per client as
+    // IPObfuscate(seckey, client_ip), which is what the protocol requires. The
+    // struct has no deny_unknown_fields, so an old config carrying the key
+    // still loads and the key is ignored.
     /// Timeout for HighID probe (HighID detection)
     #[serde(default = "default_login_timeout_ms")]
     pub login_timeout_ms: u64,
@@ -409,14 +418,32 @@ fn default_listen_ip6() -> String {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LimitsConfig {
+    /// Max logged-in clients; advertised as ST_MAXUSERS and enforced at login
+    /// (a client replacing its own session is always admitted). `0` = no cap.
+    /// Live.
     #[serde(default = "default_max_clients")]
     pub max_clients: u32,
+    /// Advertised as ST_SOFTFILES. Lugdunum semantics: the indexing budget of
+    /// one client, in distinct files indexed for it across all its OFFERFILES.
+    /// New files beyond it are not indexed and the client gets one server
+    /// message per connection; re-offers of files it already sources and
+    /// files the content filter blocks use no budget; the session stays up.
+    /// `0` = no limit. Live.
     #[serde(default = "default_soft_limit")]
     pub soft_limit_files: u32,
+    /// Advertised as ST_HARDFILES. Lugdunum semantics: a per-packet bound. An
+    /// OFFERFILES declaring this many records or more is rejected before it is
+    /// read and the connection is closed. Must stay well above the largest
+    /// batch a client sends (eMule: 200), or every publisher is disconnected.
+    /// `0` = no limit. Live.
     #[serde(default = "default_hard_limit")]
     pub hard_limit_files: u32,
+    /// Open TCP connections allowed per client IP, checked at accept. Loopback
+    /// exempt, `0` = no cap. Live.
     #[serde(default = "default_per_ip")]
     pub max_clients_per_ip: u32,
+    /// Max bytes stored for a file name or nick, cut at a character boundary
+    /// AFTER the content filter has seen the whole name. `0` = no cap. Live.
     #[serde(default = "default_max_string")]
     pub max_string_size: u32,
     #[serde(default = "default_ping_delay")]
@@ -635,8 +662,8 @@ fn default_backlog() -> u32 {
 fn default_max_frame() -> u32 {
     1_000_000
 }
-fn default_udp_server_key() -> u32 {
-    0x1234_5678
+fn default_max_decompressed() -> u32 {
+    crate::proto::frame::DEFAULT_MAX_DECOMPRESSED
 }
 fn default_login_timeout_ms() -> u64 {
     2000
@@ -807,6 +834,12 @@ whitelist_hashes = ""
                  to be configured (see SPEC.md §1.2 / §7.6.3). Refusing to start."
             );
         }
+        if self.network.max_decompressed_frame_size == 0 {
+            bail!(
+                "network.max_decompressed_frame_size must be at least 1: it is the only \
+                 bound on what one compressed frame may expand to"
+            );
+        }
         if self.limits.max_search_results == 0 {
             bail!("limits.max_search_results must be at least 1");
         }
@@ -836,6 +869,28 @@ whitelist_hashes = ""
 mod tests {
     use super::*;
 
+    fn with_network(extra: &str) -> Result<Config> {
+        let toml_str = format!(
+            "[server]\nname = \"t\"\ndesc = \"t\"\nthis_ip = \"\"\nversion_major = 17\n\
+             version_minor = 15\npublic = false\n\n[network]\ntcp_port = 6262\n{extra}\n\n\
+             [limits]\nmax_clients = 1\nsoft_limit_files = 1\nhard_limit_files = 1\n\
+             ping_delay_seconds = 1\n\n[content_filter]\nhash_banlist = []\nhash_filter = []\n"
+        );
+        let cfg: Config = toml::from_str(&toml_str)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    #[test]
+    fn max_decompressed_frame_size_defaults_overrides_and_rejects_zero() {
+        let d = with_network("").unwrap();
+        assert_eq!(d.network.max_decompressed_frame_size, 8_000_000);
+        let o = with_network("max_decompressed_frame_size = 2_000_000").unwrap();
+        assert_eq!(o.network.max_decompressed_frame_size, 2_000_000);
+        let z = with_network("max_decompressed_frame_size = 0");
+        assert!(z.is_err(), "0 would remove the only bound on expansion");
+    }
+
     #[test]
     fn udp_port_is_derived_from_tcp_port() {
         let cfg = Config::minimal_test_config();
@@ -846,7 +901,8 @@ mod tests {
 
     #[test]
     fn stale_udp_port_key_is_ignored_not_an_error() {
-        // Existing deployments still carry `udp_port = ...` in config.toml.
+        // Existing deployments still carry `udp_port = ...` in config.toml, and
+        // may carry the removed `udp_server_key` too.
         // Parsing must succeed and ignore it, deriving the port from tcp_port
         // instead — otherwise every server would fail to start after upgrading.
         let toml_str = r#"
@@ -861,6 +917,7 @@ public = false
 [network]
 tcp_port = 6262
 udp_port = 9999
+udp_server_key = 305419896
 
 [limits]
 max_clients = 1

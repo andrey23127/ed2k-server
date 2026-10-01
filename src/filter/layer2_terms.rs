@@ -283,6 +283,13 @@ pub fn normalize_separators(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     let mut pending_space = false;
     for c in name.chars() {
+        // A combining mark belongs to the letter before it; turning it into a
+        // separator would split "de\u{301}tras" into "de tras". The name is
+        // recomposed before this runs (filter/nfc.rs); this covers a mark the
+        // table does not know.
+        if super::nfc::is_combining_mark(c) {
+            continue;
+        }
         if !c.is_alphanumeric() {
             pending_space = !out.is_empty();
             continue;

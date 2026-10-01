@@ -120,9 +120,26 @@ fn is_word_char_at(c: char) -> bool {
     is_letter_char(c) || c.is_ascii_digit() || c == '_'
 }
 
-/// The character immediately before byte offset `at`, if any.
+/// The character immediately before byte offset `at`, if any — looking
+/// THROUGH combining marks to the letter they belong to.
+///
+/// A combining mark is part of the character before it, so "e" + U+0301
+/// directly in front of a term means the term starts mid-word. The name is
+/// recomposed before matching (filter/nfc.rs), which removes nearly all of
+/// these; this covers a mark the composition table does not know. Returning
+/// the mark itself — not a letter — is exactly what let the NFD spelling of
+/// the French word for "elephant" through the left rule.
 fn char_before(s: &str, at: usize) -> Option<char> {
-    s[..at].chars().next_back()
+    s[..at]
+        .chars()
+        .rev()
+        .find(|c| !super::nfc::is_combining_mark(*c))
+}
+
+/// Does a combining mark sit at `at`? One right after a term modifies the
+/// term's last letter, so the text there is not the term.
+fn mark_at(s: &str, at: usize) -> bool {
+    char_at(s, at).is_some_and(super::nfc::is_combining_mark)
 }
 
 /// The character starting at byte offset `at`, if any.
@@ -269,8 +286,8 @@ fn contains_bounded(lowered: &str, term: &str, right: RightRule) -> bool {
             || match (right, char_at(lowered, end)) {
                 (_, None) => true,
                 (RightRule::Free, _) => true,
-                (RightRule::NotLetter, Some(c)) => !is_letter_char(c),
-                (RightRule::NotWordChar, Some(c)) => !is_word_char_at(c),
+                (RightRule::NotLetter, Some(c)) => !is_letter_char(c) && !mark_at(lowered, end),
+                (RightRule::NotWordChar, Some(c)) => !is_word_char_at(c) && !mark_at(lowered, end),
             };
         if before_ok && after_ok {
             return true;
@@ -439,6 +456,22 @@ mod tests {
         // ...and the term still fires at a real boundary in the same language.
         assert!(matches_terms("le shrt à paris.mp4", &t).is_some());
         assert!(matches_terms("écoute - shrt.mp4", &t).is_some());
+    }
+
+    #[test]
+    fn a_decomposed_accent_binds_like_a_precomposed_one() {
+        // 26.09.2026: the French word for "elephant" arrived as "e" + U+0301.
+        // The left neighbour of the term was the combining mark, not a letter,
+        // and the rule read it as a boundary — the third time this word came
+        // through. Tested here against the matcher alone, WITHOUT the
+        // recomposition pass, so this holds even for a mark nfc.rs cannot fold.
+        let t = vec!["shrt".to_string()];
+        assert!(matches_terms("l'e\u{301}le\u{301}shrt.cbr", &t).is_none());
+        assert!(matches_terms("l'x\u{301}shrt.cbr", &t).is_none());
+        // A mark AFTER a short term modifies its last letter: not the term.
+        assert!(matches_terms("shrt\u{301} blanc.mp4", &t).is_none());
+        // The term at a real boundary still fires.
+        assert!(matches_terms("e\u{301}coute - shrt.mp4", &t).is_some());
     }
 
     #[test]

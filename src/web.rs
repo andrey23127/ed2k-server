@@ -325,6 +325,16 @@ struct StatsResp {
     /// Searches that had at least one unknown word dropped rather than
     /// returning nothing.
     searches_words_dropped: u64,
+    /// OFFERFILES batches cut at `limits.soft_limit_files`, and records dropped.
+    offer_over_soft_batches: u64,
+    offer_over_soft_records: u64,
+    soft_limit_files: u32,
+    /// OFFERFILES packets rejected at `limits.hard_limit_files` (connection closed).
+    offer_over_hard_packets: u64,
+    hard_limit_files: u32,
+    /// Most TCP connections one IP holds now, and `limits.max_clients_per_ip`.
+    busiest_ip_connections: u32,
+    max_clients_per_ip: u32,
     /// `network.highid_verify_observe`: whether the counters below are live.
     highid_observe_enabled: bool,
     highid_observe_verified: u64,
@@ -400,6 +410,13 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         searches_served: search_served,
         searches_rank_capped: search_capped,
         searches_words_dropped: s.server.search_words_dropped_count(),
+        offer_over_soft_batches: s.server.offer_over_soft_stats().0,
+        offer_over_soft_records: s.server.offer_over_soft_stats().1,
+        soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
+        offer_over_hard_packets: s.server.offer_over_hard_count(),
+        hard_limit_files: s.server.live_cfg.load().limits.hard_limit_files,
+        busiest_ip_connections: s.server.busiest_ip_connections(),
+        max_clients_per_ip: s.server.live_cfg.load().limits.max_clients_per_ip,
         highid_observe_enabled: {
             let n = &s.server.live_cfg.load().network;
             n.highid_verify_observe || n.highid_downgrade_on_wrong_hash
@@ -899,6 +916,17 @@ async fn api_config_set(
             })
         }
     };
+
+    // 1b. The same checks as at startup. Without this a config the server would
+    // refuse to start with (e.g. a zero network.max_decompressed_frame_size)
+    // could be applied live.
+    if let Err(e) = new_cfg.validate() {
+        return Json(ConfigSetResp {
+            ok: false,
+            error: Some(format!("config invalid: {}", e)),
+            hint: Some("config file was not modified".into()),
+        });
+    }
 
     // 2. Detect non-hot-reloadable changes (require restart) for the user message.
     let old = s.server.live_cfg.load();
@@ -2342,6 +2370,9 @@ async function refreshStatus() {
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
+     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_connections)} connections <span style="color:#6b7280;font-size:.75rem">most TCP connections one IP holds right now; limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'}, loopback exempt</span></td></tr>
+     <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
+     <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
      <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
@@ -2557,7 +2588,8 @@ async function refreshBlocks() {
           'bot':                     { label: 'Bot detection (flagged)',   desc: 'detection events (cooldown 30s/IP)' },
           'bot_ban':                 { label: '  └ Bots banned (24h)',     desc: 'distinct flood-bot IPs auto-banned; UDP dropped for 24h' },
           'rate_limit':              { label: 'Rate limit',                desc: 'queries throttled' },
-          'max_connections_per_ip':  { label: 'Too many connections',      desc: 'TCP connections rejected from same IP' },
+          'max_connections_per_ip':  { label: 'Too many connections',      desc: 'TCP connections refused: the IP already had limits.max_clients_per_ip open' },
+          'server_full':             { label: 'Server full',               desc: 'logins refused: limits.max_clients clients were connected' },
         }[r.reason] || { label: r.reason, desc: '' };
         const uniq = (r.unique_ips != null) ? r.unique_ips.toLocaleString() : '—';
         return `<tr><td>${meta.label}</td><td>${r.count.toLocaleString()}</td>`

@@ -80,7 +80,7 @@ fn main() -> Result<()> {
 ///   Setting the flag also keeps the promise made elsewhere in this file: IPv4
 ///   peers arrive on the IPv4 listener and are never seen as `::ffff:a.b.c.d`
 ///   by anything downstream.
-fn bind_v6_only(addr: &str) -> std::io::Result<TcpListener> {
+fn bind_v6_only(addr: &str, backlog: u32) -> std::io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sa: std::net::SocketAddr = addr
         .parse()
@@ -90,7 +90,46 @@ fn bind_v6_only(addr: &str) -> std::io::Result<TcpListener> {
     sock.set_reuse_address(true)?;
     sock.set_nonblocking(true)?;
     sock.bind(&sa.into())?;
-    sock.listen(1024)?;
+    sock.listen(backlog_or_default(backlog))?;
+    TcpListener::from_std(std::net::TcpListener::from(sock))
+}
+
+/// `network.listen_backlog`, with 0 meaning the previous fixed value (1024,
+/// which is also what tokio's `TcpListener::bind` uses). The kernel still caps
+/// it at `net.core.somaxconn`.
+fn backlog_or_default(backlog: u32) -> i32 {
+    if backlog == 0 {
+        1024
+    } else {
+        backlog.min(i32::MAX as u32) as i32
+    }
+}
+
+/// The IPv4 listener, with `network.listen_backlog` applied. Same options as
+/// `TcpListener::bind` set (SO_REUSEADDR, non-blocking); only the backlog is
+/// now the configured one rather than tokio's fixed 1024.
+fn bind_v4(addr: &str, backlog: u32) -> std::io::Result<TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::ToSocketAddrs;
+    // Resolved the way TcpListener::bind resolved it, so a host name in
+    // listen_ip keeps working.
+    let sa = addr.to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "listen address resolved to nothing",
+        )
+    })?;
+    let domain = if sa.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    #[cfg(not(windows))]
+    sock.set_reuse_address(true)?;
+    sock.set_nonblocking(true)?;
+    sock.bind(&sa.into())?;
+    sock.listen(backlog_or_default(backlog))?;
     TcpListener::from_std(std::net::TcpListener::from(sock))
 }
 
@@ -386,8 +425,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     // Bind TCP listener
     let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.tcp_port);
-    let listener = TcpListener::bind(&bind_addr)
-        .await
+    let listener = bind_v4(&bind_addr, cfg.network.listen_backlog)
         .with_context(|| format!("binding {}", bind_addr))?;
 
     info!(addr = %bind_addr, "TCP listener ready");
@@ -404,7 +442,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // conflict, and clients find the server by address, not by port.
     let listener6 = if cfg.network.ipv6_enabled {
         let a6 = format!("[{}]:{}", cfg.network.listen_ip6, cfg.network.tcp_port);
-        match bind_v6_only(&a6) {
+        match bind_v6_only(&a6, cfg.network.listen_backlog) {
             Ok(l) => {
                 info!(addr = %a6, "IPv6 TCP listener ready");
                 Some(l)
@@ -1719,7 +1757,29 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 //   it gets a second identity and every one of those bookkeeping
                 //   structures counts it twice.
                 let peer = normalize_peer(peer);
+                // limits.max_clients_per_ip (live). Checked before any work is
+                // spent on the connection: no task, no handshake. The slot moves
+                // into the task and is released when the task ends, however it
+                // ends.
+                let per_ip = state.live_cfg.load().limits.max_clients_per_ip;
+                let Some(ip_slot) = state.try_acquire_ip_slot(peer.ip(), per_ip) else {
+                    *state
+                        .block_stats
+                        .entry("max_connections_per_ip".to_string())
+                        .or_insert(0) += 1;
+                    if let Some(sup) = ed2k_server::health::throttle().allow(
+                        peer.ip(),
+                        "max_connections_per_ip",
+                        ed2k_server::health::SUPPRESS_WINDOW,
+                    ) {
+                        warn!(ip = %peer.ip(), limit = per_ip, suppressed = sup,
+                              "connection refused — too many connections from this IP");
+                    }
+                    drop(stream);
+                    continue;
+                };
                 tokio::spawn(async move {
+                    let _ip_slot = ip_slot;
                     // Bound the setup phase (TCP accept → obfuscation
                     // handshake → first frame). Without this, make_stream's
                     // read_exact() blocks forever on a silent peer (port

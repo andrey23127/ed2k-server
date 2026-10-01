@@ -10,6 +10,7 @@ pub mod geoip;
 pub mod ipfilter;
 mod jargon;
 pub mod layer2_terms;
+mod nfc;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -457,6 +458,13 @@ impl ContentFilter {
             return FilterResult::Block(Layer::L5Poison, "poison".to_string());
         }
 
+        // Recompose NFD letters before ANY term matching: "e" + U+0301 must be
+        // the same text as "é" to every layer below — the boundary rules, the
+        // phrase exemptions and the age scanner. See filter/nfc.rs for the
+        // history (the same French word came through three times).
+        let composed = nfc::compose_latin(filename);
+        let filename: &str = &composed;
+
         // Normalize for term matching.
         let lowered = filename.to_lowercase();
 
@@ -494,15 +502,29 @@ impl ContentFilter {
         // too. Only the non-ASCII terms can gain anything — the ASCII part of a
         // mangled name is untouched and the scans below already cover it — but
         // those are exactly the terms this damage hides.
-        if let Some(recovered) = Self::undo_mojibake(filename) {
+        // When the name carries recoverable mojibake, the RECOVERED text is what
+        // the publisher wrote, and the term layers judge that — not the damaged
+        // bytes as well. The damaged form puts non-letters where letters were:
+        // "l'Ã©lÃ©phant" has '©' in front of an L4 term where the
+        // real text has "é", so the boundary rule saw a separator and fired on a
+        // French children's series (27.09.2026 review, "Flipper le dauphin").
+        // Scanning the raw name too only ever ADDED such mistakes: a term that
+        // is really in the name survives recovery unchanged, because recovery
+        // only rewrites the damaged non-ASCII runs.
+        //
+        // Layer 2 still reads both, as before — the age scanner matches the
+        // broken spellings of the year unit literally, on purpose.
+        let recovered = Self::undo_mojibake(filename);
+        if let Some(recovered) = recovered.as_deref() {
             let rec_lower = recovered.to_lowercase();
             if !term_exempt {
+                let rec_stem = without_extension(&rec_lower);
                 let jt = self.jargon_terms.load();
-                if let Some(term) = jargon::matches_terms(&rec_lower, &jt) {
+                if let Some(term) = jargon::matches_terms(rec_stem, &jt) {
                     return FilterResult::Block(Layer::L1Jargon, format!("{term} (mojibake)"));
                 }
                 let ex = self.extra_terms.load();
-                if let Some(term) = jargon::matches_terms(&rec_lower, &ex) {
+                if let Some(term) = jargon::matches_terms(rec_stem, &ex) {
                     return FilterResult::Block(Layer::L4Extra, format!("{term} (mojibake)"));
                 }
             }
@@ -515,9 +537,17 @@ impl ContentFilter {
         // created inline inside the `if let` condition is a temporary whose
         // lifetime rules changed between editions. An explicit binding is correct
         // under every edition.
+        // The term layers read the name WITHOUT its extension. A term is a
+        // statement about what the file is called, and the extension is the
+        // file type: 66 FreeDOS package descriptors were blocked in one review
+        // window by a three-letter term that happens to be their extension
+        // window (28.09.2026), because the dot before the extension satisfies
+        // the boundary rule. Layer 2 keeps the full name — its extension gate
+        // needs it.
+        let stem = without_extension(&lowered);
         let jargon_terms = self.jargon_terms.load();
-        if !term_exempt {
-            if let Some(term) = jargon::matches_terms(&lowered, &jargon_terms) {
+        if !term_exempt && recovered.is_none() {
+            if let Some(term) = jargon::matches_terms(stem, &jargon_terms) {
                 return FilterResult::Block(Layer::L1Jargon, term.to_string());
             }
         }
@@ -568,8 +598,8 @@ impl ContentFilter {
         // block medical papers. Sharing the matcher is what keeps the two lists
         // from drifting apart again.
         let extra = self.extra_terms.load();
-        if !term_exempt {
-            if let Some(term) = jargon::matches_terms(&lowered, &extra) {
+        if !term_exempt && recovered.is_none() {
+            if let Some(term) = jargon::matches_terms(stem, &extra) {
                 return FilterResult::Block(Layer::L4Extra, term.to_string());
             }
         }
@@ -643,6 +673,27 @@ impl ContentFilter {
 impl Default for ContentFilter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The name without its file extension, for the term layers.
+///
+/// An extension is the text after the LAST dot when it is 1–8 ASCII letters or
+/// digits and something precedes the dot. Anything else — no dot, a leading
+/// dot, a "mp4.!qB" partial, a dot followed by spaces — leaves the name whole.
+/// Only one extension comes off: in "x.abc.torrent" the inner one stays part of
+/// the name, as it is for the publisher.
+fn without_extension(lowered: &str) -> &str {
+    match lowered.rfind('.') {
+        Some(dot) if dot > 0 => {
+            let ext = &lowered[dot + 1..];
+            if (1..=8).contains(&ext.len()) && ext.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                &lowered[..dot]
+            } else {
+                lowered
+            }
+        }
+        _ => lowered,
     }
 }
 
@@ -798,6 +849,48 @@ mod tests {
                 "{name} must pass"
             );
         }
+    }
+
+    #[test]
+    fn a_term_in_the_file_extension_does_not_count() {
+        // 28.09.2026: 66 FreeDOS package descriptors blocked by a term that is
+        // also their extension. The extension is the file type, not the name.
+        // (A neutral stand-in term here; the real list is not published.)
+        let f = ContentFilter::new().with_extra_terms(["qxz".to_string()]);
+        for innocent in ["movex.qxz", "chkdskx.QXZ", "fdiskx.qxz"] {
+            assert!(
+                matches!(f.check(&zh(), innocent), FilterResult::Allow),
+                "{innocent}"
+            );
+        }
+        // The same term anywhere in the name itself still fires.
+        for material in [
+            "Qxz-11-08-02.avi",
+            "set_QXZ_3_14.jpg",
+            "mag 08 qxz-08-07 full.avi",
+            "movex.qxz.torrent", // only the last extension comes off
+            "foo qxz",           // no extension at all
+        ] {
+            assert!(
+                matches!(
+                    f.check(&zh(), material),
+                    FilterResult::Block(Layer::L4Extra, _)
+                ),
+                "{material}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_extension_takes_off_only_a_plain_trailing_extension() {
+        assert_eq!(without_extension("a b.avi"), "a b");
+        assert_eq!(without_extension("x.abc.torrent"), "x.abc");
+        assert_eq!(without_extension("clip.mp4.!qb"), "clip.mp4.!qb");
+        assert_eq!(without_extension(".abc"), ".abc");
+        assert_eq!(without_extension("no extension"), "no extension");
+        assert_eq!(without_extension("a.b c"), "a.b c");
+        assert_eq!(without_extension("x.download"), "x");
+        assert_eq!(without_extension("x.toolongext"), "x.toolongext");
     }
 
     #[test]

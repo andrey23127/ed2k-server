@@ -51,6 +51,8 @@ tcp_port = 4661
 listen_ip = "0.0.0.0"          # DO NOT change to your VPS IP — 0.0.0.0 is correct
 listen_backlog = 1024
 max_frame_size = 1_000_000
+# Ceiling on what one compressed (0xD4) frame may decompress to. Must be >= 1.
+max_decompressed_frame_size = 8_000_000
 login_timeout_ms = 3000         # Slightly longer for VPS latency
 support_crypt = true
 

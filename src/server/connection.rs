@@ -10,7 +10,9 @@ use crate::proto::{opcodes::*, CryptStream, Ed2kCodec, Frame};
 use crate::server::callback::handle_callback_request;
 use crate::server::get_sources::{handle_get_sources, GetSourcesRequest};
 use crate::server::login::{build_welcome_batch, handle_login, LoginRequest};
-use crate::server::offerfiles::{handle_offerfiles, parse_offerfiles};
+use crate::server::offerfiles::{
+    declared_count, handle_offerfiles, over_hard_limit, parse_offerfiles, soft_limit_message,
+};
 use crate::server::search::{handle_search, SearchRequest};
 use crate::state::{ClientHandle, ServerState};
 use anyhow::Result;
@@ -21,6 +23,31 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
+
+/// A session closed on purpose (server full, banned publisher, OFFERFILES over
+/// the hard limit). Ends the connection like any handler error, but is logged
+/// where it is decided.
+#[derive(Debug)]
+pub(crate) struct SessionRefused(pub &'static str);
+
+impl std::fmt::Display for SessionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for SessionRefused {}
+
+/// `limits.max_clients`: may this user hash log in now? `max == 0` = no cap.
+/// A user hash already connected is replacing its own session and does not add
+/// a client, so it is always admitted.
+pub(crate) fn login_admitted(
+    state: &ServerState,
+    user_hash: &crate::state::UserHash,
+    max: u32,
+) -> bool {
+    max == 0 || state.client_count() < max as usize || state.clients.contains_key(user_hash)
+}
 
 pub async fn handle_connection(
     cfg: Arc<Config>,
@@ -36,7 +63,8 @@ pub async fn handle_connection(
     // tokio may move between worker threads. load_full() hands back a plain Arc,
     // which is safe to keep and costs one refcount bump per connection.
     let live = state.live_cfg.load_full();
-    let codec = Ed2kCodec::new(live.network.max_frame_size);
+    let codec = Ed2kCodec::new(live.network.max_frame_size)
+        .with_max_decompressed(live.network.max_decompressed_frame_size);
     // Framed::new would allocate 8 KiB for the read buffer AND 8 KiB for the write
     // buffer — 16 KiB of heap per connection before a single byte arrives. eD2k
     // control frames are small (a login, a search, a keepalive: tens to hundreds of
@@ -190,6 +218,12 @@ pub async fn handle_connection(
                         ).await {
                             // Throttled: a banned publisher's client retries every
                             // ~30 s forever, and each retry lands here.
+                            // A refused login has already been logged where it was
+                            // decided; logging it again here as a "handler error"
+                            // only doubled every refusal in the health tab.
+                            if e.downcast_ref::<SessionRefused>().is_some() {
+                                break;
+                            }
                             if let Some(sup) = crate::health::throttle().allow(
                                 peer.ip(), "handler_error", crate::health::SUPPRESS_WINDOW)
                             {
@@ -392,8 +426,34 @@ async fn dispatch(
                         warn!(ip = %peer.ip(), user_hash = hex::encode(req.user_hash),
                               suppressed = sup, "login refused — CSAM publisher is banned");
                     }
-                    return Err(anyhow::anyhow!("banned CSAM publisher"));
+                    return Err(SessionRefused("banned CSAM publisher").into());
                 }
+            }
+            // limits.max_clients (live; 0 = no cap). Checked before
+            // handle_login, which runs the HighID probe — a full server should
+            // not spend a connection on a client it is about to turn away. A
+            // client whose user hash is already connected is replacing its own
+            // stale session, not adding one, and is always let in.
+            let max_clients = state.live_cfg.load().limits.max_clients;
+            if !login_admitted(state, &req.user_hash, max_clients) {
+                *state
+                    .block_stats
+                    .entry("server_full".to_string())
+                    .or_insert(0) += 1;
+                let text = b"Server full, please try again later";
+                let mut payload = Vec::with_capacity(2 + text.len());
+                payload.extend_from_slice(&(text.len() as u16).to_le_bytes());
+                payload.extend_from_slice(text);
+                let _ = framed.send(Frame::new(OP_SERVERMESSAGE, payload)).await;
+                if let Some(sup) = crate::health::throttle().allow(
+                    peer.ip(),
+                    "server_full",
+                    crate::health::SUPPRESS_WINDOW,
+                ) {
+                    info!(ip = %peer.ip(), max_clients, suppressed = sup,
+                          "login refused — server full");
+                }
+                return Err(SessionRefused("server full").into());
             }
             let mut new_client = handle_login(cfg, state, peer.ip(), req).await;
             *rx = ServerState::create_client_channel(&mut new_client);
@@ -459,8 +519,35 @@ async fn dispatch(
             let Some(c) = client else {
                 return Err(anyhow::anyhow!("OFFERFILES before login"));
             };
+            // limits.hard_limit_files: a per-packet bound, checked on the
+            // declared count before any record is read (Lugdunum semantics).
+            let hard = state.live_cfg.load().limits.hard_limit_files;
+            if let Some(declared) = declared_count(&frame.payload) {
+                if over_hard_limit(declared, hard) {
+                    state.note_offer_over_hard_limit();
+                    if let Some(sup) = crate::health::throttle().allow(
+                        peer.ip(),
+                        "offer_hard_limit",
+                        crate::health::SUPPRESS_WINDOW,
+                    ) {
+                        info!(ip = %peer.ip(), nick = %c.nick, declared, hard_limit = hard,
+                              suppressed = sup,
+                              "OFFERFILES over the hard limit — packet rejected, connection closed");
+                    }
+                    return Err(SessionRefused("OFFERFILES over hard limit").into());
+                }
+            }
             let files = parse_offerfiles(&frame.payload)?;
+            let warned_before = c.soft_limit_warned;
             handle_offerfiles(state, c, files);
+            if c.soft_limit_warned && !warned_before {
+                let soft = state.live_cfg.load().limits.soft_limit_files;
+                let text = soft_limit_message(soft);
+                let mut payload = Vec::with_capacity(2 + text.len());
+                payload.extend_from_slice(&(text.len() as u16).to_le_bytes());
+                payload.extend_from_slice(text.as_bytes());
+                framed.send(Frame::new(OP_SERVERMESSAGE, payload)).await?;
+            }
             if let Some(mut entry) = state.clients.get_mut(&c.user_hash) {
                 entry.csam_attempts = c.csam_attempts;
             }
@@ -595,4 +682,51 @@ async fn dispatch(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn state_with(n_clients: u8) -> Arc<ServerState> {
+        let st = Arc::new(ServerState::new(
+            Arc::new(crate::filter::ContentFilter::new()),
+            Arc::new(Config::minimal_test_config()),
+        ));
+        for i in 0..n_clients {
+            st.register_synthetic_client(
+                [i + 1; 16],
+                100 + i as u32,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, i + 1)),
+                "t".into(),
+                "??".into(),
+                "test".into(),
+                0,
+            );
+        }
+        st
+    }
+
+    #[test]
+    fn a_new_client_is_admitted_below_max_clients_and_refused_at_it() {
+        let st = state_with(3);
+        assert!(login_admitted(&st, &[0xEE; 16], 4));
+        assert!(!login_admitted(&st, &[0xEE; 16], 3));
+        assert!(!login_admitted(&st, &[0xEE; 16], 2));
+    }
+
+    #[test]
+    fn a_client_replacing_its_own_session_is_always_admitted() {
+        let st = state_with(3);
+        // [1;16] is connected: its reconnect does not add a client.
+        assert!(login_admitted(&st, &[1; 16], 3));
+        assert!(login_admitted(&st, &[1; 16], 1));
+    }
+
+    #[test]
+    fn zero_max_clients_means_no_cap() {
+        let st = state_with(3);
+        assert!(login_admitted(&st, &[0xEE; 16], 0));
+    }
 }

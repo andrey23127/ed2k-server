@@ -110,6 +110,88 @@ impl LoginRequest {
     }
 }
 
+/// The 16-byte server hash sent in `OP_SERVERIDENT`.
+///
+/// Derived from the seckey (itself derived from `this_ip` + `tcp_port`), so it
+/// is stable across restarts and differs between servers, with no new stored
+/// secret. It is an identifier, not a secret: eMule reads it only to label
+/// eFarm servers (a hash starting 0x2A2A2A2A, which MD5 output here cannot be
+/// made to produce on purpose). The domain string keeps it unrelated to the
+/// identity the HighID probe presents (`server_pseudo_user_hash`).
+///
+/// Computed once. The seckey only changes with the IP or port, and both need a
+/// restart to take effect for obfuscation anyway, so a cached value cannot go
+/// out of step with the key the rest of the server uses.
+pub fn server_ident_hash(cfg: &Config) -> [u8; 16] {
+    static IDENT: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    *IDENT.get_or_init(|| server_ident_hash_for(&crate::server::udp::resolve_seckey(cfg)))
+}
+
+pub(crate) fn server_ident_hash_for(seckey: &[u8; 16]) -> [u8; 16] {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(b"ed2k-server-ident");
+    h.update(seckey);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h.finalize());
+    // Never the eFarm marker, however unlikely.
+    if out[..4] == [0x2A; 4] {
+        out[0] = 0x2B;
+    }
+    out
+}
+
+/// Bytes 12–15 of `OP_IDCHANGE`: the client's address as the server sees it.
+///
+/// eMule reads the field at `packet+12` as `dwServerReportedIP`. On a LowID it
+/// calls `SetPublicIP` with it, so a LowID client takes this value as its own
+/// public address and keys UDP obfuscation, the Kad verify key and what it
+/// advertises about itself on it. On a HighID it asserts the field equals the
+/// client id; aMule logs a mismatch. Up to 0.9.76 this carried the SERVER's
+/// `this_ip`, and every LowID client believed it lived at our address
+/// (issue #17).
+///
+/// * HighID — the client id itself. For an ordinary login that is the address
+///   the connection came from; for a client verified through the hairpin path
+///   (`hairpin_lan_clients`) it is our public address, which IS that client's
+///   public address, while the connection came from a LAN address that must not
+///   be reported.
+/// * LowID from a public IPv4 — that address.
+/// * LowID from a private or loopback IPv4 — the client sits behind the same
+///   NAT as the server, so its public address is ours: `this_ip`, when that is
+///   set and public. This is the one case the old code happened to get right,
+///   and reporting the LAN address instead would hand the client a private IP
+///   as its public one. Otherwise 0.
+/// * IPv6 session — its IPv4 is unknown. 0 makes eMule leave its public IP
+///   unset rather than learn a wrong one.
+///
+/// Nothing in the HighID decision reads this field: the verdict is taken
+/// before the welcome batch is built, and the identity probes compare user
+/// hashes over TCP.
+pub(crate) fn reported_client_ip(
+    client_ip: IpAddr,
+    is_high_id: bool,
+    assigned_id: u32,
+    this_ip: &str,
+) -> u32 {
+    if is_high_id {
+        return assigned_id;
+    }
+    match client_ip {
+        IpAddr::V4(v4) if !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() => {
+            u32::from_le_bytes(v4.octets())
+        }
+        IpAddr::V4(_) => this_ip
+            .trim()
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .filter(|ip| !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified())
+            .map(|ip| u32::from_le_bytes(ip.octets()))
+            .unwrap_or(0),
+        IpAddr::V6(_) => 0,
+    }
+}
+
 /// Build the canonical post-login welcome batch (SPEC.md §3.1.2):
 /// IDCHANGE, SERVERSTATUS, SERVERMESSAGE, SERVERIDENT, plus optional
 /// extra welcome lines.
@@ -131,7 +213,8 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
     //   [0-3]   client_id          (LoginAnswer_Struct.clientid)
     //   [4-7]   tcp_flags          (read at offset sizeof(LoginAnswer_Struct)=4)
     //   [8-11]  filler             (eMule skips bytes 8-11)
-    //   [12-15] server_reported_ip (eMule reads packet+12; our public IP)
+    //   [12-15] the CLIENT's address as we see it (eMule reads packet+12 —
+    //           see `reported_client_ip`; NOT our own IP, issue #17)
     //   [16-19] obfuscation_tcp_port (eMule reads packet+16 as u32)
     //
     // eMule's check: `if (size >= 20)` before reading IP+obfport — payload
@@ -148,15 +231,12 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
     //   0x0400 TCPOBFUSCATION — required (with non-zero obf port) for "Obfuscation: Yes"
     //   = 0x05DD
     {
-        let server_ip: u32 = if live.server.this_ip.is_empty() {
-            0
-        } else {
-            live.server
-                .this_ip
-                .parse::<std::net::Ipv4Addr>()
-                .map(|ip| u32::from_le_bytes(ip.octets()))
-                .unwrap_or(0)
-        };
+        let reported_ip = reported_client_ip(
+            client.ip,
+            client.is_high_id,
+            client.assigned_id,
+            &live.server.this_ip,
+        );
         //   0x4000 IPV6           — added only when the server actually speaks it
         let mut tcp_flags: u32 = 0x0000_05DD;
         if live.network.ipv6_publish_sources {
@@ -189,7 +269,7 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
                                        // is the standard port to advertise", so send our real TCP port. aMule then
                                        // sets the port to what it already is (no-op) and eMule is unaffected.
         payload.put_u32_le(cfg.network.tcp_port as u32); // [8-11]  aux/standard port
-        payload.put_u32_le(server_ip); // [12-15] server_reported_ip
+        payload.put_u32_le(reported_ip); // [12-15] the client's own address
         payload.put_u32_le(cfg.network.tcp_port as u32); // [16-19] obfuscation_tcp_port
         frames.push(Frame::new(OP_IDCHANGE, payload.to_vec()));
     }
@@ -218,13 +298,13 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
     // 4. SERVERIDENT — server hash + IP + port + tags
     {
         let mut payload = BytesMut::new();
-        // Server hash (a stable random 16-byte ID; in production this lives
-        // in config.toml; for MVP we use a fixed value.)
-        let server_hash: [u8; 16] =
-            *b"\xDE\xAD\xBE\xEF\xCA\xFE\xBA\xBE\x12\x34\x56\x78\x9A\xBC\xDE\xF0";
-        payload.put_slice(&server_hash);
+        // Server hash: this server's 16-byte identity, stable and distinct per
+        // server (see server_ident_hash). It used to be one fixed constant for
+        // every server running this code.
+        payload.put_slice(&server_ident_hash(&live));
 
-        // Server IP: use configured this_ip if set, otherwise 0 (client uses TCP source)
+        // Server IP: use configured this_ip if set, otherwise 0 (client uses TCP source).
+        // This one IS the server's own address — unlike OP_IDCHANGE bytes 12–15.
         let server_ip: u32 = if live.server.this_ip.is_empty() {
             0
         } else {
@@ -858,7 +938,11 @@ pub async fn handle_login(
     let client_ipv6 = req.client_ipv6();
     let (assigned_id, is_high_id, source_ip) =
         assign_client_id_for(state, peer_ip, req.port, Some(&req.user_hash), client_flags).await;
-    let nick = req.nick().unwrap_or("(no name)").to_string();
+    // limits.max_string_size (live): the nick is stored and shown, so it is
+    // capped like any other stored string.
+    let max_string = state.live_cfg.load().limits.max_string_size;
+    let nick =
+        crate::proto::tags::cap_string(req.nick().unwrap_or("(no name)"), max_string).to_string();
     let server_flags = client_flags;
 
     // Debug: log every parsed tag to diagnose field extraction
@@ -1050,6 +1134,7 @@ pub async fn handle_login(
         software: software.clone(),
         shared_files: 0,
         csam_attempts: 0,
+        soft_limit_warned: false,
         tx: None,
         last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             ClientHandle::now_ms(),
@@ -1082,6 +1167,161 @@ mod tests {
     // stayed broken while `cargo build` kept passing: the three uses below are
     // all inside `#[cfg(test)]`.
     use crate::proto::opcodes::CAPABLE_IPV6 as SRVCAP_IPV6;
+
+    // ── OP_SERVERIDENT server hash ─────────────────────────────────────────
+    #[test]
+    fn the_server_hash_is_stable_per_seckey_and_differs_between_servers() {
+        let a = server_ident_hash_for(&[1; 16]);
+        assert_eq!(a, server_ident_hash_for(&[1; 16]), "stable");
+        assert_ne!(a, server_ident_hash_for(&[2; 16]), "per server");
+        // Not the old shared constant, not the HighID probe identity, not eFarm.
+        assert_ne!(&a[..4], b"\xDE\xAD\xBE\xEF");
+        assert_ne!(
+            a,
+            crate::server::highid_probe::server_pseudo_user_hash(&[1; 16])
+        );
+        assert_ne!(&a[..4], &[0x2A; 4]);
+    }
+
+    #[test]
+    fn serverident_carries_the_derived_hash() {
+        let mut cfg = crate::config::Config::minimal_test_config();
+        cfg.server.this_ip = "85.17.116.222".to_string();
+        let cfg = std::sync::Arc::new(cfg);
+        let state = ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::clone(&cfg),
+        );
+        let client = ClientHandle {
+            user_hash: [7; 16],
+            assigned_id: 42,
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: false,
+            connected_at: Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            shared_files: 0,
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            tx: None,
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let frames = build_welcome_batch(&cfg, &state, &client);
+        let ident = frames.iter().find(|f| f.opcode == OP_SERVERIDENT).unwrap();
+        assert_eq!(&ident.payload[..16], &server_ident_hash(&cfg));
+        assert_ne!(&ident.payload[..4], b"\xDE\xAD\xBE\xEF");
+    }
+
+    // ── OP_IDCHANGE bytes 12–15 (issue #17) ────────────────────────────────
+    fn le(ip: [u8; 4]) -> u32 {
+        u32::from_le_bytes(ip)
+    }
+    const OUR_IP: &str = "85.17.116.222";
+
+    #[test]
+    fn a_lowid_client_is_told_its_own_public_address_not_ours() {
+        let peer = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(
+            reported_client_ip(peer, false, 5, OUR_IP),
+            le([93, 184, 216, 34])
+        );
+    }
+
+    #[test]
+    fn a_highid_client_is_told_exactly_its_client_id() {
+        // eMule asserts dwServerReportedIP == clientid for a HighID.
+        let peer = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34));
+        let id = le([93, 184, 216, 34]);
+        assert_eq!(reported_client_ip(peer, true, id, OUR_IP), id);
+    }
+
+    #[test]
+    fn a_hairpin_highid_client_gets_the_public_id_not_its_lan_address() {
+        // Verified through hairpin_lan_clients: recorded under our public IP,
+        // id derived from it; the connection itself came from the LAN.
+        let recorded = IpAddr::V4(OUR_IP.parse().unwrap());
+        let id = le([85, 17, 116, 222]);
+        assert_eq!(reported_client_ip(recorded, true, id, OUR_IP), id);
+        // Even if the handle carried the LAN address, the id wins.
+        let lan = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 30, 254));
+        assert_eq!(reported_client_ip(lan, true, id, OUR_IP), id);
+    }
+
+    #[test]
+    fn a_lowid_client_on_our_lan_is_told_our_public_address() {
+        // Behind the same NAT as the server, its public address IS ours. The
+        // private address must never be handed out as a public one.
+        for lan in [
+            std::net::Ipv4Addr::new(192, 168, 30, 254),
+            std::net::Ipv4Addr::new(10, 0, 0, 7),
+            std::net::Ipv4Addr::new(172, 16, 5, 5),
+            std::net::Ipv4Addr::new(127, 0, 0, 1),
+        ] {
+            assert_eq!(
+                reported_client_ip(IpAddr::V4(lan), false, 5, OUR_IP),
+                le([85, 17, 116, 222]),
+                "{lan}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lan_client_gets_zero_when_our_own_address_is_unknown_or_private() {
+        let lan = IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 5));
+        assert_eq!(reported_client_ip(lan, false, 5, ""), 0);
+        assert_eq!(reported_client_ip(lan, false, 5, "192.168.1.1"), 0);
+        assert_eq!(reported_client_ip(lan, false, 5, "garbage"), 0);
+    }
+
+    #[test]
+    fn an_ipv6_session_reports_no_ipv4() {
+        let v6 = IpAddr::V6("2001:db8::1".parse().unwrap());
+        assert_eq!(reported_client_ip(v6, false, 5, OUR_IP), 0);
+    }
+
+    #[test]
+    fn the_welcome_batch_carries_the_client_address_and_serverident_keeps_ours() {
+        let mut cfg = crate::config::Config::minimal_test_config();
+        cfg.server.this_ip = OUR_IP.to_string();
+        let cfg = std::sync::Arc::new(cfg);
+        let state = ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::clone(&cfg),
+        );
+        let client = ClientHandle {
+            user_hash: [7; 16],
+            assigned_id: 42,
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: false,
+            connected_at: Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            shared_files: 0,
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            tx: None,
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let frames = build_welcome_batch(&cfg, &state, &client);
+        let idc = frames.iter().find(|f| f.opcode == OP_IDCHANGE).unwrap();
+        assert_eq!(&idc.payload[12..16], &[93, 184, 216, 34]);
+        let ident = frames.iter().find(|f| f.opcode == OP_SERVERIDENT).unwrap();
+        assert_eq!(&ident.payload[16..20], &[85, 17, 116, 222]);
+    }
 
     #[test]
     fn an_ipv6_peer_is_never_given_a_high_id() {

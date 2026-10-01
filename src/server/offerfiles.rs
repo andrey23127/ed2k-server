@@ -6,10 +6,7 @@
 
 use crate::filter::FilterResult;
 use crate::proto::{
-    opcodes::{
-        FT_FILENAME, FT_FILESIZE, FT_FILESIZE_HI, SELF_COMPLETE_ID, SELF_COMPLETE_PORT,
-        SELF_INCOMPLETE_ID, SELF_INCOMPLETE_PORT,
-    },
+    opcodes::{FT_FILENAME, FT_FILESIZE, FT_FILESIZE_HI, SELF_INCOMPLETE_ID, SELF_INCOMPLETE_PORT},
     tags::{read_tag_list, TagName},
 };
 use crate::state::{ClientHandle, ServerState};
@@ -102,6 +99,34 @@ pub fn handle_offerfiles(
     let mut accepted = 0u32;
     let mut blocked = 0u32;
 
+    // SOFT FILE LIMIT (`limits.soft_limit_files`, live; 0 = no limit).
+    //
+    // Lugdunum semantics (issue #18): the soft limit is the indexing budget of
+    // one client, counted in files actually indexed for it across all its
+    // OFFERFILES. Records beyond it are not indexed, the session stays up, and
+    // the client gets one server message per connection saying so. (The HARD
+    // limit is a different thing — a per-packet record count, enforced in the
+    // connection loop before the packet is parsed; see `over_hard_limit`.)
+    //
+    // What counts is the number of distinct files this client currently
+    // sources (`user_files`), which is what Lugdunum's per-client share count
+    // amounts to. Re-offering a hash it already sources is a refresh, not a new
+    // file, and is always accepted (Lugdunum ignores refreshes too once the
+    // budget is spent; accepting them keeps the complete/partial state current
+    // and costs no budget). Records the content filter blocks are never indexed
+    // and never counted. Each accepted record is added whole (slab, keyword
+    // index, user_files), so a partly accepted batch leaves nothing half-done.
+    let soft_limit = state.live_cfg.load().limits.soft_limit_files as usize;
+    let mut sourced = if soft_limit > 0 {
+        layer_count(state, &client.user_hash).unwrap_or(0)
+    } else {
+        0
+    };
+    let mut over_limit = 0u32;
+    // limits.max_string_size (live): names are STORED capped. The content
+    // filter above runs on the full name first — see cap_string.
+    let max_string = state.live_cfg.load().limits.max_string_size;
+
     for file in files {
         // Replace placeholder client_id/port with real values.
         // Determine whether the publisher holds a COMPLETE copy of the file.
@@ -114,12 +139,6 @@ pub fn handle_offerfiles(
         let has_complete = !matches!(
             (file.client_id, file.port),
             (SELF_INCOMPLETE_ID, SELF_INCOMPLETE_PORT)
-        );
-
-        // Per SPEC.md §3.3, 0xFBFBFBFB / 0xFCFCFCFC + matching port = self-source.
-        let _is_self_source = matches!(
-            (file.client_id, file.port),
-            (SELF_COMPLETE_ID, SELF_COMPLETE_PORT) | (SELF_INCOMPLETE_ID, SELF_INCOMPLETE_PORT)
         );
 
         // §7.6: mandatory content filter. Always runs, cannot be skipped.
@@ -266,9 +285,15 @@ pub fn handle_offerfiles(
             FilterResult::Allow => {}
         }
 
+        if soft_limit > 0 && sourced >= soft_limit && !already_sources(state, client, &file.hash) {
+            over_limit += 1;
+            continue;
+        }
+
         // Index the file with this client as a source.
         let source = (client.user_hash, client.ip, client.port, has_complete);
-        state.add_file_with_source(file.hash, file.size, file.filename.clone(), source);
+        let stored_name = crate::proto::tags::cap_string(&file.filename, max_string).to_string();
+        state.add_file_with_source(file.hash, file.size, stored_name, source);
         accepted += 1;
 
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -288,11 +313,27 @@ pub fn handle_offerfiles(
         // §7.6.5: thresholded disconnect handled at the connection-loop level
         // by inspecting csam_attempts; not here.
 
-        // Light hard_limit policy
-        if matches!(layer_count(state, &client.user_hash), Some(n) if n > 4000) {
-            // SPEC.md §3.3 says drop connection on hard_limit. The handler
-            // returns its accumulated counts; the caller will check the
-            // connection state and disconnect. (MVP shortcut.)
+        if soft_limit > 0 {
+            sourced = layer_count(state, &client.user_hash).unwrap_or(sourced);
+        }
+    }
+
+    if over_limit > 0 {
+        state.note_offer_over_soft_limit(over_limit);
+        // The caller sends the server message when this flips to true.
+        let first = !client.soft_limit_warned;
+        client.soft_limit_warned = true;
+        // INFO, once per connection: a client at the limit re-offers roughly
+        // every minute, and the health tab keeps only WARN/ERROR.
+        if first {
+            info!(
+                ip = %client.ip,
+                nick = %client.nick,
+                soft_limit,
+                sourced,
+                not_indexed = over_limit,
+                "offerfiles: soft file limit reached, further new files not indexed"
+            );
         }
     }
 
@@ -308,6 +349,45 @@ pub fn handle_offerfiles(
     }
 
     (accepted, blocked)
+}
+
+/// The record count an OFFERFILES payload declares (its first four bytes).
+pub fn declared_count(payload: &[u8]) -> Option<u32> {
+    payload
+        .get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// HARD FILE LIMIT (`limits.hard_limit_files`, live; 0 = no limit).
+///
+/// Lugdunum semantics (issue #18): a per-packet boundary on the declared
+/// record count. A packet declaring `>= hard` records is rejected before any
+/// record is read, and the connection is closed. Lugdunum uses `>=` for plain
+/// packets and `>` for compressed ones; this server applies `>=` to both (the
+/// payload is already decompressed here), which is the rule a client can rely
+/// on: every OFFERFILES strictly below ST_HARDFILES.
+pub fn over_hard_limit(declared: u32, hard: u32) -> bool {
+    hard > 0 && declared >= hard
+}
+
+/// The server message Lugdunum sends, once per connection, when the soft limit
+/// stops indexing. Same text, so tools that recognise it keep working.
+pub fn soft_limit_message(soft: u32) -> String {
+    format!(
+        "WARNING : This server accepts {soft} shares per client. Some of your shares are ignored."
+    )
+}
+
+/// Does this client already source `hash`? A re-offer of such a file is a
+/// refresh and does not count against the soft limit.
+fn already_sources(state: &ServerState, client: &ClientHandle, hash: &[u8; 16]) -> bool {
+    let Some(id) = state.file_slab.id_of(hash) else {
+        return false;
+    };
+    state
+        .user_files
+        .get(&client.user_hash)
+        .is_some_and(|set| set.contains(&id))
 }
 
 /// Number of files this user is currently sourcing. O(1) via the user_files
@@ -389,5 +469,297 @@ mod large_file_tests {
             .get_by_hash(&files[0].hash)
             .expect("indexed");
         assert_eq!(entry.size, size_64, "stored size still 5 GiB");
+    }
+}
+
+#[cfg(test)]
+mod soft_limit_tests {
+    //! `limits.soft_limit_files` and `limits.soft_limit_files` (issue #18).
+    use super::*;
+    use crate::filter::ContentFilter;
+    use crate::proto::{SELF_COMPLETE_ID, SELF_COMPLETE_PORT};
+    use crate::state::ServerState;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn state_with(soft: u32, filter: ContentFilter) -> ServerState {
+        let mut cfg = crate::config::Config::minimal_test_config();
+        cfg.limits.soft_limit_files = soft;
+        ServerState::new(Arc::new(filter), Arc::new(cfg))
+    }
+
+    fn set_live_limit(state: &ServerState, soft: u32) {
+        let mut cfg = (**state.live_cfg.load()).clone();
+        cfg.limits.soft_limit_files = soft;
+        state.live_cfg.store(Arc::new(cfg));
+    }
+
+    fn client() -> ClientHandle {
+        ClientHandle {
+            user_hash: [9; 16],
+            assigned_id: 0x0A00_0001,
+            ip: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 10)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: true,
+            connected_at: Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            shared_files: 0,
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            tx: None,
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    /// Distinct files `from..to`, each with its own hash and an innocent name.
+    fn files(from: u16, to: u16) -> Vec<OfferedFile> {
+        (from..to)
+            .map(|n| {
+                let mut hash = [0u8; 16];
+                hash[..2].copy_from_slice(&n.to_le_bytes());
+                hash[15] = 0x5A;
+                OfferedFile {
+                    hash,
+                    client_id: SELF_COMPLETE_ID,
+                    port: SELF_COMPLETE_PORT,
+                    filename: format!("holiday clip number {n}.avi"),
+                    size: 1_000_000 + n as u64,
+                }
+            })
+            .collect()
+    }
+
+    fn sourced(state: &ServerState, c: &ClientHandle) -> usize {
+        state.user_files.get(&c.user_hash).map_or(0, |s| s.len())
+    }
+
+    #[test]
+    fn a_client_below_the_limit_is_untouched() {
+        let state = state_with(10, ContentFilter::new());
+        let mut c = client();
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 5)), (5, 0));
+        assert_eq!(sourced(&state, &c), 5);
+        assert_eq!(state.offer_over_soft_stats(), (0, 0));
+    }
+
+    #[test]
+    fn a_batch_ending_exactly_at_the_limit_is_accepted_whole() {
+        let state = state_with(5, ContentFilter::new());
+        let mut c = client();
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 5)), (5, 0));
+        assert_eq!(sourced(&state, &c), 5);
+        assert_eq!(state.offer_over_soft_stats(), (0, 0));
+    }
+
+    #[test]
+    fn a_batch_crossing_the_limit_is_cut_at_it_and_counted() {
+        let state = state_with(5, ContentFilter::new());
+        let mut c = client();
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 8)), (5, 0));
+        assert_eq!(sourced(&state, &c), 5);
+        assert_eq!(state.offer_over_soft_stats(), (1, 3));
+        // The records past the limit left nothing behind in the index.
+        for f in files(5, 8) {
+            assert!(state.file_slab.get_by_hash(&f.hash).is_none());
+        }
+        // A later batch of new files gets nothing more in.
+        assert_eq!(handle_offerfiles(&state, &mut c, files(8, 11)), (0, 0));
+        assert_eq!(sourced(&state, &c), 5);
+        assert_eq!(state.offer_over_soft_stats(), (2, 6));
+    }
+
+    #[test]
+    fn republishing_files_already_sourced_is_always_accepted() {
+        let state = state_with(5, ContentFilter::new());
+        let mut c = client();
+        handle_offerfiles(&state, &mut c, files(0, 5));
+        // At the limit: the same five again are refreshes, not new files.
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 5)), (5, 0));
+        assert_eq!(sourced(&state, &c), 5);
+        assert_eq!(state.offer_over_soft_stats(), (0, 0));
+        // Mixed: known ones refresh, the new ones stop at the limit.
+        assert_eq!(handle_offerfiles(&state, &mut c, files(3, 9)), (2, 0));
+        assert_eq!(state.offer_over_soft_stats(), (1, 4));
+    }
+
+    #[test]
+    fn a_non_default_limit_is_the_one_applied() {
+        let state = state_with(3, ContentFilter::new());
+        let mut c = client();
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 10)), (3, 0));
+        assert_eq!(sourced(&state, &c), 3);
+    }
+
+    #[test]
+    fn zero_means_no_limit() {
+        let state = state_with(0, ContentFilter::new());
+        let mut c = client();
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 50)), (50, 0));
+        assert_eq!(state.offer_over_soft_stats(), (0, 0));
+    }
+
+    #[test]
+    fn the_limit_follows_the_live_configuration() {
+        let state = state_with(4, ContentFilter::new());
+        let mut c = client();
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 6)), (4, 0));
+        // Raised: the next batch fills up to the new value.
+        set_live_limit(&state, 7);
+        assert_eq!(handle_offerfiles(&state, &mut c, files(4, 10)), (3, 0));
+        assert_eq!(sourced(&state, &c), 7);
+        // Lowered: nothing already indexed is evicted, nothing new gets in.
+        set_live_limit(&state, 2);
+        assert_eq!(handle_offerfiles(&state, &mut c, files(20, 22)), (0, 0));
+        assert_eq!(sourced(&state, &c), 7);
+        // Known files still refresh below or above the new value.
+        assert_eq!(handle_offerfiles(&state, &mut c, files(0, 2)), (2, 0));
+    }
+
+    #[test]
+    fn files_the_filter_blocks_do_not_use_up_the_limit() {
+        let filter = ContentFilter::new().with_extra_terms(["qxzmarker".to_string()]);
+        let state = state_with(2, filter);
+        let mut c = client();
+        let mut batch = files(0, 3);
+        batch[0].filename = "qxzmarker clip.avi".into();
+        // One blocked, two accepted — the blocked record did not take a slot.
+        assert_eq!(handle_offerfiles(&state, &mut c, batch), (2, 1));
+        assert_eq!(sourced(&state, &c), 2);
+        assert_eq!(state.offer_over_soft_stats(), (0, 0));
+    }
+
+    #[test]
+    fn the_message_is_flagged_once_per_connection() {
+        let state = state_with(2, ContentFilter::new());
+        let mut c = client();
+        handle_offerfiles(&state, &mut c, files(0, 2));
+        assert!(!c.soft_limit_warned, "at the limit, nothing ignored yet");
+        handle_offerfiles(&state, &mut c, files(2, 4));
+        assert!(c.soft_limit_warned);
+        // Further batches over the limit keep counting but do not re-arm it.
+        handle_offerfiles(&state, &mut c, files(4, 6));
+        assert!(c.soft_limit_warned);
+        assert_eq!(state.offer_over_soft_stats(), (2, 4));
+        // A new connection starts unwarned.
+        assert!(!client().soft_limit_warned);
+    }
+
+    #[test]
+    fn the_message_text_is_lugdunums() {
+        assert_eq!(
+            soft_limit_message(1000),
+            "WARNING : This server accepts 1000 shares per client. Some of your shares are ignored."
+        );
+    }
+
+    #[test]
+    fn hard_limit_is_a_per_packet_bound_on_the_declared_count() {
+        assert!(!over_hard_limit(199, 200));
+        assert!(over_hard_limit(200, 200), ">= rejects, as Lugdunum does for plain packets");
+        assert!(over_hard_limit(5000, 200));
+        assert!(!over_hard_limit(u32::MAX, 0), "0 = no limit");
+    }
+
+    #[test]
+    fn declared_count_reads_the_first_four_bytes() {
+        assert_eq!(declared_count(&[0xC8, 0, 0, 0, 0xFF]), Some(200));
+        assert_eq!(declared_count(&[1, 2, 3]), None);
+    }
+}
+
+#[cfg(test)]
+mod string_size_tests {
+    //! `limits.max_string_size` on stored file names.
+    use super::*;
+    use crate::filter::ContentFilter;
+    use crate::proto::{SELF_COMPLETE_ID, SELF_COMPLETE_PORT};
+    use crate::state::ServerState;
+    use std::sync::Arc;
+
+    fn state_with(max: u32, filter: ContentFilter) -> ServerState {
+        let mut cfg = crate::config::Config::minimal_test_config();
+        cfg.limits.max_string_size = max;
+        ServerState::new(Arc::new(filter), Arc::new(cfg))
+    }
+
+    fn offer(name: &str, n: u8) -> OfferedFile {
+        OfferedFile {
+            hash: [n; 16],
+            client_id: SELF_COMPLETE_ID,
+            port: SELF_COMPLETE_PORT,
+            filename: name.to_string(),
+            size: 123_456,
+        }
+    }
+
+    fn client() -> ClientHandle {
+        ClientHandle {
+            user_hash: [3; 16],
+            assigned_id: 0x0A00_0003,
+            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 3)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: true,
+            connected_at: std::time::Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            shared_files: 0,
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            tx: None,
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn a_long_name_is_stored_capped() {
+        let state = state_with(20, ContentFilter::new());
+        let mut c = client();
+        let name = "a very long holiday clip name that goes on.avi";
+        assert_eq!(
+            handle_offerfiles(&state, &mut c, vec![offer(name, 1)]),
+            (1, 0)
+        );
+        let rec = state.file_slab.get_by_hash(&[1; 16]).unwrap();
+        assert_eq!(&*rec.name, &name[..20]);
+    }
+
+    #[test]
+    fn the_filter_sees_the_whole_name_before_the_cap() {
+        // The marker sits past the cut. Capping first would let it through.
+        let filter = ContentFilter::new().with_extra_terms(["qxzmarker".to_string()]);
+        let state = state_with(20, filter);
+        let mut c = client();
+        let name = "an ordinary long clip name then qxzmarker.avi";
+        assert_eq!(
+            handle_offerfiles(&state, &mut c, vec![offer(name, 2)]),
+            (0, 1)
+        );
+        assert!(state.file_slab.get_by_hash(&[2; 16]).is_none());
+    }
+
+    #[test]
+    fn zero_stores_names_whole() {
+        let state = state_with(0, ContentFilter::new());
+        let mut c = client();
+        let name = "x".repeat(600) + ".avi";
+        handle_offerfiles(&state, &mut c, vec![offer(&name, 3)]);
+        assert_eq!(
+            state.file_slab.get_by_hash(&[3; 16]).unwrap().name.len(),
+            604
+        );
     }
 }
