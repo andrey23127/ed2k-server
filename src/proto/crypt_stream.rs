@@ -123,11 +123,12 @@ impl CryptStream {
     /// Write out pending ciphertext. Ready(Ok) once it is all taken.
     fn poll_drain_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.pending_pos < self.pending.len() {
-            let n = match Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pending_pos..]) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
+            let n =
+                match Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pending_pos..]) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
             if n == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }

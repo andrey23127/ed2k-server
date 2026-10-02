@@ -75,6 +75,10 @@ pub struct ClientHandle {
     /// The soft-limit server message has been sent on this connection.
     /// Lugdunum sends it once per connection, however many batches go over.
     pub soft_limit_warned: bool,
+    /// This session's `limits.max_clients` slot (issue #25). Shared by every
+    /// copy of the handle, so a same-hash re-login that replaces this session
+    /// releases it at once.
+    pub slot: crate::admission::SharedSlot,
     /// Channel to push frames to this client's connection task.
     /// Used by callback and keepalive code. None when channel is closed/dropped.
     pub tx: Option<mpsc::Sender<Frame>>,
@@ -108,6 +112,11 @@ impl ClientHandle {
     /// `last_activity_ms` Arc, which each login allocates afresh. assigned_id
     /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
     /// same address gets the same one (issue #23).
+    /// Give back this session's logged-in slot, if it still holds one.
+    pub fn release_slot(&self) {
+        crate::admission::release_slot(&self.slot);
+    }
+
     pub fn same_session(&self, other: &ClientHandle) -> bool {
         std::sync::Arc::ptr_eq(&self.last_activity_ms, &other.last_activity_ms)
     }
@@ -126,11 +135,19 @@ impl ClientHandle {
         )
     }
 
-    /// Send a frame to this client without waiting (fire-and-forget).
-    /// Silently drops if the channel is full or closed.
-    pub fn send_frame(&self, frame: Frame) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send(frame);
+    /// Send a frame to this client without waiting. Never blocks: a full
+    /// channel drops the frame. The outcome is returned so callers can count
+    /// drops (issue #25); a handle without a channel reports Closed.
+    pub fn send_frame(&self, frame: Frame) -> crate::admission::PushOutcome {
+        use crate::admission::PushOutcome;
+        use tokio::sync::mpsc::error::TrySendError;
+        match &self.tx {
+            Some(tx) => match tx.try_send(frame) {
+                Ok(()) => PushOutcome::Queued,
+                Err(TrySendError::Full(_)) => PushOutcome::Full,
+                Err(TrySendError::Closed(_)) => PushOutcome::Closed,
+            },
+            None => PushOutcome::Closed,
         }
     }
 
@@ -736,6 +753,10 @@ pub struct ServerState {
 
     /// See `network.highid_verify_observe`.
     pub highid_observe: std::sync::Arc<HighIdObserve>,
+
+    /// Server-wide work admission (issue #25). Built once from the startup
+    /// configuration; restart-only.
+    pub admission: Arc<crate::admission::Admission>,
 }
 
 /// Sliding-window query tracker per client IP.
@@ -789,8 +810,16 @@ impl ServerState {
     /// cap (a slot is still returned, so the per-IP numbers stay visible).
     /// Loopback is never capped: it is the operator's own tooling.
     pub fn try_acquire_ip_slot(self: &Arc<Self>, ip: IpAddr, limit: u32) -> Option<IpSlot> {
+        // Counted per source key (issue #25): an IPv6 /64 (by default) is one
+        // source, as it is for the UDP budgets — a host with a /64 has 2^64
+        // addresses to spread connections over.
+        // Loopback is judged on the real address: masked, ::1 would no
+        // longer be loopback.
+        let loopback = ip.is_loopback();
+        let ip =
+            crate::admission::SourceKey::of(ip, self.admission.cfg.ipv6_source_prefix_bits).as_ip();
         let mut n = self.conn_per_ip.entry(ip).or_insert(0);
-        if limit > 0 && *n >= limit && !ip.is_loopback() {
+        if limit > 0 && *n >= limit && !loopback {
             return None;
         }
         *n += 1;
@@ -803,11 +832,18 @@ impl ServerState {
 
     /// The most connections any single IP holds right now.
     pub fn busiest_ip_connections(&self) -> u32 {
+        self.busiest_ip().map_or(0, |(_, n)| n)
+    }
+
+    /// The source holding the most open TCP connections right now, and how
+    /// many. For IPv6 the address is the prefix the per-IP limit counts by
+    /// (`admission.ipv6_source_prefix_bits`).
+    pub fn busiest_ip(&self) -> Option<(IpAddr, u32)> {
         self.conn_per_ip
             .iter()
-            .map(|e| *e.value())
-            .max()
-            .unwrap_or(0)
+            .map(|e| (*e.key(), *e.value()))
+            .max_by_key(|&(_, n)| n)
+            .filter(|&(_, n)| n > 0)
     }
 
     /// How long a flagged flood bot stays banned (its UDP traffic dropped).
@@ -853,6 +889,7 @@ impl ServerState {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: Some(tx),
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 ClientHandle::now_ms(),
@@ -1031,6 +1068,7 @@ impl ServerState {
     }
 
     pub fn new(filter: Arc<ContentFilter>, cfg: Arc<crate::config::Config>) -> Self {
+        let admission = Arc::new(crate::admission::Admission::new(&cfg));
         Self {
             clients: DashMap::new(),
             user_files: DashMap::new(),
@@ -1080,6 +1118,7 @@ impl ServerState {
             offer_over_soft_records: std::sync::atomic::AtomicU64::new(0),
             offer_over_hard_packets: std::sync::atomic::AtomicU64::new(0),
             highid_observe: std::sync::Arc::new(HighIdObserve::new()),
+            admission,
         }
     }
 
@@ -1175,6 +1214,54 @@ impl ServerState {
         let (tx, rx) = mpsc::channel(CLIENT_CHANNEL_CAP);
         handle.tx = Some(tx);
         rx
+    }
+
+    /// The (client id, port) a search result names as its source (issue #27).
+    ///
+    /// eMule keeps this pair from a search result and adds it as a source when
+    /// the user downloads, so it must mean the same as a GETSOURCES record:
+    /// a HighID's address, or a LowID's server-assigned low id (reached by
+    /// callback through this server) — never a LowID's NAT address dialled as
+    /// if it were a HighID, a LAN address, or a departed client's leftover.
+    ///
+    /// Only CONNECTED sources qualify. Preference: complete HighID, complete
+    /// LowID, then the same for partial copies. At most the first 32 sources
+    /// are examined, so a popular file costs the same as any other. None
+    /// qualifies → 0/0, which eMule treats as "no source in the result".
+    pub fn search_result_source(&self, sources: &[Source]) -> (u32, u16) {
+        const SCAN: usize = 32;
+        let mut best: Option<(u8, u32, u16)> = None;
+        for s in sources.iter().take(SCAN) {
+            let Some(h) = self.clients.get(&s.user_hash) else {
+                continue; // stale: its owner is gone
+            };
+            if !h.is_alive() || s.port() == 0 {
+                continue;
+            }
+            let (id, rank) = if h.is_high_id {
+                if !Self::is_publishable_source_ip(h.ip) {
+                    continue;
+                }
+                (h.assigned_id, if s.complete() { 0 } else { 2 })
+            } else {
+                (h.assigned_id, if s.complete() { 1 } else { 3 })
+            };
+            if id == 0 {
+                continue;
+            }
+            // (Not is_none_or: rust-version is 1.75.)
+            let better = match best {
+                None => true,
+                Some(b) => rank < b.0,
+            };
+            if better {
+                best = Some((rank, id, s.port()));
+                if rank == 0 {
+                    break;
+                }
+            }
+        }
+        best.map_or((0, 0), |(_, id, port)| (id, port))
     }
 
     /// Is this address usable as a source by anybody outside our own network?
@@ -1422,6 +1509,7 @@ impl ServerState {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1768,6 +1856,7 @@ mod callback_tests {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
                 ClientHandle::now_ms(),
@@ -2311,6 +2400,7 @@ mod ip_slot_tests {
         assert!(a.is_some() && b.is_some());
         assert!(st.try_acquire_ip_slot(ip, 2).is_none());
         assert_eq!(st.busiest_ip_connections(), 2);
+        assert_eq!(st.busiest_ip().map(|(_, n)| n), Some(2));
         // Another IP is counted separately.
         assert!(st
             .try_acquire_ip_slot(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 2)
@@ -2338,6 +2428,21 @@ mod ip_slot_tests {
         assert_eq!(st.busiest_ip_connections(), 50);
         drop(slots);
         assert_eq!(st.busiest_ip_connections(), 0);
+    }
+
+    #[test]
+    fn ipv6_connections_are_counted_per_prefix() {
+        let st = st();
+        let a: IpAddr = "2001:db8:7:8::1".parse().unwrap();
+        let b: IpAddr = "2001:db8:7:8:dead::2".parse().unwrap();
+        let other: IpAddr = "2001:db8:7:9::1".parse().unwrap();
+        let _s1 = st.try_acquire_ip_slot(a, 2).unwrap();
+        let _s2 = st.try_acquire_ip_slot(b, 2).unwrap();
+        assert!(
+            st.try_acquire_ip_slot(a, 2).is_none(),
+            "same /64, at the limit"
+        );
+        assert!(st.try_acquire_ip_slot(other, 2).is_some());
     }
 
     #[test]

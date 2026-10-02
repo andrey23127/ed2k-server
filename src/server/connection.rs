@@ -38,15 +38,29 @@ impl std::fmt::Display for SessionRefused {
 
 impl std::error::Error for SessionRefused {}
 
-/// `limits.max_clients`: may this user hash log in now? `max == 0` = no cap.
-/// A user hash already connected is replacing its own session and does not add
-/// a client, so it is always admitted.
-pub(crate) fn login_admitted(
+/// `limits.max_clients`: reserve a logged-in slot for this user hash, or None
+/// if the server is full. `max == 0` = no cap. A user hash already connected
+/// is replacing its own session and is always let in.
+///
+/// A reservation, not a count-then-insert (issue #25): the slot is taken with
+/// one compare-and-swap before the login does any work, so concurrent logins
+/// cannot all see room. The connection task holds it until it ends.
+pub(crate) fn reserve_client_slot(
     state: &ServerState,
     user_hash: &crate::state::UserHash,
     max: u32,
-) -> bool {
-    max == 0 || state.client_count() < max as usize || state.clients.contains_key(user_hash)
+) -> Option<crate::admission::ClientSlot> {
+    if state.clients.contains_key(user_hash) {
+        return Some(state.admission.clients.force_reserve());
+    }
+    state.admission.clients.try_reserve(max)
+}
+
+/// Admission state one connection carries (issue #25). (Its logged-in slot
+/// lives in the `ClientHandle`, where a replacing login can release it.)
+pub(crate) struct SessionAdmission {
+    /// Callback / hole-punch allowance.
+    pub relay: crate::admission::RelayBudget,
 }
 
 pub async fn handle_connection(
@@ -54,6 +68,19 @@ pub async fn handle_connection(
     state: Arc<ServerState>,
     stream: CryptStream,
     peer: SocketAddr,
+) -> Result<()> {
+    handle_admitted_connection(cfg, state, stream, peer, None).await
+}
+
+/// `handle_connection` for a socket admitted at accept: `pending_login` is its
+/// `admission.max_pending_logins` permit, given back as soon as the login
+/// completes (or the connection ends before that).
+pub async fn handle_admitted_connection(
+    cfg: Arc<Config>,
+    state: Arc<ServerState>,
+    stream: CryptStream,
+    peer: SocketAddr,
+    mut pending_login: Option<crate::admission::PendingLogin>,
 ) -> Result<()> {
     // Per-connection snapshot of the hot-reloadable config. Taken once here, so a
     // config change applies to every NEW connection without a restart while an
@@ -96,6 +123,9 @@ pub async fn handle_connection(
     // SEARCHREQUEST fills it; QUERY_MORE_RESULT (0x21) drains it page by page.
     // Lives in the connection task — it is per-connection, not per-identity.
     let mut pending_search: Vec<crate::state::file_id::FileRecord> = Vec::new();
+    let mut sess = SessionAdmission {
+        relay: crate::admission::RelayBudget::new(&state.admission.cfg),
+    };
 
     if live.log.connection_trace {
         info!(ip = %peer.ip(), port = peer.port(), "connection accepted");
@@ -212,10 +242,15 @@ pub async fn handle_connection(
                 if let Some(c) = client.as_ref() { c.touch_activity(); }
                 match result {
                     Some(Ok(frame)) => {
-                        if let Err(e) = dispatch(
+                        let res = dispatch(
                             &cfg, &state, &state, &mut client, &mut framed, &mut rx,
-                            &mut pending_search, peer, frame
-                        ).await {
+                            &mut pending_search, &mut sess, peer, frame
+                        ).await;
+                        // Logged in: no longer a pending login.
+                        if client.is_some() {
+                            pending_login.take();
+                        }
+                        if let Err(e) = res {
                             // Throttled: a banned publisher's client retries every
                             // ~30 s forever, and each retry lands here.
                             // A refused login has already been logged where it was
@@ -292,6 +327,7 @@ pub async fn handle_connection(
 
     if let Some(c) = client {
         info!(ip = %peer.ip(), nick = %c.nick, id = c.assigned_id, "client disconnected");
+        c.release_slot();
         end_session(&state, &c);
     }
 
@@ -317,7 +353,7 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
     // login landing between a check and a remove cannot be evicted.
     let removed = state
         .clients
-        .remove_if(&c.user_hash, |_, entry| entry.same_session(&c))
+        .remove_if(&c.user_hash, |_, entry| entry.same_session(c))
         .is_some();
     if removed {
         if !c.is_high_id {
@@ -397,6 +433,7 @@ async fn dispatch(
     framed: &mut Framed<CryptStream, Ed2kCodec>,
     rx: &mut mpsc::Receiver<Frame>,
     pending_search: &mut Vec<crate::state::file_id::FileRecord>,
+    sess: &mut SessionAdmission,
     peer: SocketAddr,
     frame: Frame,
 ) -> Result<()> {
@@ -449,13 +486,13 @@ async fn dispatch(
                     return Err(SessionRefused("banned CSAM publisher").into());
                 }
             }
-            // limits.max_clients (live; 0 = no cap). Checked before
+            // limits.max_clients (live; 0 = no cap). Reserved before
             // handle_login, which runs the HighID probe — a full server should
             // not spend a connection on a client it is about to turn away. A
             // client whose user hash is already connected is replacing its own
             // stale session, not adding one, and is always let in.
             let max_clients = state.live_cfg.load().limits.max_clients;
-            if !login_admitted(state, &req.user_hash, max_clients) {
+            let Some(slot) = reserve_client_slot(state, &req.user_hash, max_clients) else {
                 *state
                     .block_stats
                     .entry("server_full".to_string())
@@ -474,8 +511,9 @@ async fn dispatch(
                           "login refused — server full");
                 }
                 return Err(SessionRefused("server full").into());
-            }
+            };
             let mut new_client = handle_login(cfg, state, peer.ip(), req).await;
+            *new_client.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(slot);
             *rx = ServerState::create_client_channel(&mut new_client);
             // Detect duplicate user_hash login — happens when a NAT-dropped
             // connection's old task hasn't timed out yet, but the same user
@@ -499,6 +537,13 @@ async fn dispatch(
             let prev = state
                 .clients
                 .insert(new_client.user_hash, new_client.clone());
+            // The replaced session (a NAT-dropped connection whose task has not
+            // noticed yet) gives its logged-in slot back now: one user, one
+            // slot, or routine reconnects would fill max_clients with dead
+            // sessions until their sockets time out.
+            if let Some(old) = &prev {
+                old.release_slot();
+            }
             // Maintain cached lowid count so handle_servstat doesn't do an O(N)
             // iter on every UDP probe (was 2.58% of CPU in v0.9.36 profile).
             if let Some(old) = &prev {
@@ -580,15 +625,28 @@ async fn dispatch(
             match SearchRequest::parse(&frame.payload) {
                 Ok(req) => {
                     use crate::server::search::{build_search_result_page, search_page_size};
-                    // Run the search; keep the full result set in this
-                    // connection's pending buffer.
-                    let mut all = handle_search(state, req);
+                    // Run the search off the runtime, in a bounded lane
+                    // (admission.max_search_jobs / max_queued_tcp_searches,
+                    // issue #25). No job within tcp_search_wait_ms → an empty
+                    // result, as for a query that matched nothing.
+                    let all = match state.admission.tcp_search_permit().await {
+                        Some(permit) => {
+                            let st = Arc::clone(state_arc);
+                            crate::admission::run_search(permit, move || handle_search(&st, req))
+                                .await
+                                .unwrap_or_default()
+                        }
+                        None => Vec::new(),
+                    };
+                    let mut all = all;
+                    // Keep the full result set in this connection's pending
+                    // buffer.
                     let first_len = all.len().min(search_page_size(state));
                     let first_page: Vec<_> = all.drain(..first_len).collect();
                     let has_more = !all.is_empty();
                     *pending_search = all; // remainder for QUERY_MORE_RESULT
                     framed
-                        .send(build_search_result_page(&first_page, has_more))
+                        .send(build_search_result_page(state, &first_page, has_more))
                         .await?;
                 }
                 Err(e) => {
@@ -622,6 +680,14 @@ async fn dispatch(
                     frame.payload[2],
                     frame.payload[3],
                 ]);
+                // admission.session_relay_* (issue #25): each callback makes
+                // the server push a frame to another client. Over the session's
+                // allowance the requester gets the protocol's own failure reply.
+                if !sess.relay.allow() {
+                    state.admission.note_relay_rejected();
+                    framed.send(Frame::new(OP_CALLBACK_FAIL, vec![])).await?;
+                    return Ok(());
+                }
                 handle_callback_request(state, c, target_id, framed).await?;
             }
         }
@@ -639,6 +705,12 @@ async fn dispatch(
                     frame.payload[3],
                 ]);
                 let requester_udp_port = u16::from_le_bytes([frame.payload[4], frame.payload[5]]);
+                // Same per-session allowance as callbacks. Over it the request
+                // is ignored: the client's own timeout handles it.
+                if !sess.relay.allow() {
+                    state.admission.note_relay_rejected();
+                    return Ok(());
+                }
                 crate::server::holepunch::handle_holepunch_request(
                     state,
                     &c.user_hash,
@@ -691,7 +763,7 @@ async fn dispatch(
                 debug!(ip = %peer.ip(), page = page.len(), has_more,
                        "QUERY_MORE_RESULT — sending next page");
                 framed
-                    .send(build_search_result_page(&page, has_more))
+                    .send(build_search_result_page(state, &page, has_more))
                     .await?;
             }
         }
@@ -728,26 +800,45 @@ mod admission_tests {
         st
     }
 
+    /// Logged-in sessions: their slots, as connection tasks hold them.
+    fn hold(st: &ServerState, n: usize) -> Vec<crate::admission::ClientSlot> {
+        (0..n)
+            .map(|_| st.admission.clients.try_reserve(0).unwrap())
+            .collect()
+    }
+
     #[test]
     fn a_new_client_is_admitted_below_max_clients_and_refused_at_it() {
         let st = state_with(3);
-        assert!(login_admitted(&st, &[0xEE; 16], 4));
-        assert!(!login_admitted(&st, &[0xEE; 16], 3));
-        assert!(!login_admitted(&st, &[0xEE; 16], 2));
+        let _held = hold(&st, 3);
+        assert!(reserve_client_slot(&st, &[0xEE; 16], 4).is_some());
+        assert!(reserve_client_slot(&st, &[0xEE; 16], 3).is_none());
+        assert!(reserve_client_slot(&st, &[0xEE; 16], 2).is_none());
     }
 
     #[test]
     fn a_client_replacing_its_own_session_is_always_admitted() {
         let st = state_with(3);
-        // [1;16] is connected: its reconnect does not add a client.
-        assert!(login_admitted(&st, &[1; 16], 3));
-        assert!(login_admitted(&st, &[1; 16], 1));
+        let _held = hold(&st, 3);
+        // [1;16] is connected: its reconnect is let in even when full.
+        assert!(reserve_client_slot(&st, &[1; 16], 3).is_some());
+        assert!(reserve_client_slot(&st, &[1; 16], 1).is_some());
     }
 
     #[test]
     fn zero_max_clients_means_no_cap() {
         let st = state_with(3);
-        assert!(login_admitted(&st, &[0xEE; 16], 0));
+        let _held = hold(&st, 3);
+        assert!(reserve_client_slot(&st, &[0xEE; 16], 0).is_some());
+    }
+
+    #[test]
+    fn a_slot_returns_when_the_session_ends() {
+        let st = state_with(0);
+        let s1 = reserve_client_slot(&st, &[0xEE; 16], 1).unwrap();
+        assert!(reserve_client_slot(&st, &[0xEF; 16], 1).is_none());
+        drop(s1);
+        assert!(reserve_client_slot(&st, &[0xEF; 16], 1).is_some());
     }
 }
 
@@ -786,6 +877,7 @@ mod session_end_tests {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -824,7 +916,10 @@ mod session_end_tests {
         let live = st.clients.get(&[7; 16]).expect("live session evicted");
         assert!(live.same_session(&new));
         drop(live);
-        assert_eq!(st.client_id_index.get(&0x0A00_0001).map(|e| *e), Some([7; 16]));
+        assert_eq!(
+            st.client_id_index.get(&0x0A00_0001).map(|e| *e),
+            Some([7; 16])
+        );
         assert_eq!(sources(&st), 2, "sources the client re-published must stay");
         // The new session's own end then cleans up as usual.
         end_session(&st, &new);
@@ -838,8 +933,14 @@ mod session_end_tests {
         let old = login(&st, 0x0A00_0001, [1, 0, 0, 10], true, 1);
         let new = login(&st, 0x0A00_0002, [2, 0, 0, 10], true, 2);
         end_session(&st, &old);
-        assert!(st.client_id_index.get(&0x0A00_0001).is_none(), "stale id left mapped");
-        assert_eq!(st.client_id_index.get(&0x0A00_0002).map(|e| *e), Some([7; 16]));
+        assert!(
+            st.client_id_index.get(&0x0A00_0001).is_none(),
+            "stale id left mapped"
+        );
+        assert_eq!(
+            st.client_id_index.get(&0x0A00_0002).map(|e| *e),
+            Some([7; 16])
+        );
         assert!(st.clients.get(&[7; 16]).unwrap().same_session(&new));
         assert_eq!(sources(&st), 2);
     }

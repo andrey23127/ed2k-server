@@ -514,6 +514,7 @@ mod soft_limit_tests {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
@@ -663,7 +664,10 @@ mod soft_limit_tests {
     #[test]
     fn hard_limit_is_a_per_packet_bound_on_the_declared_count() {
         assert!(!over_hard_limit(199, 200));
-        assert!(over_hard_limit(200, 200), ">= rejects, as Lugdunum does for plain packets");
+        assert!(
+            over_hard_limit(200, 200),
+            ">= rejects, as Lugdunum does for plain packets"
+        );
         assert!(over_hard_limit(5000, 200));
         assert!(!over_hard_limit(u32::MAX, 0), "0 = no limit");
     }
@@ -719,6 +723,7 @@ mod string_size_tests {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }

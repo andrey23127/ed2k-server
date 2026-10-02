@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 
 use ed2k_server::config::Config;
 use ed2k_server::filter::ContentFilter;
-use ed2k_server::server::connection::handle_connection;
+use ed2k_server::server::connection::handle_admitted_connection;
 use ed2k_server::server::gossip::parse_seed;
 use ed2k_server::server::keepalive::spawn_keepalive;
 use ed2k_server::server::obfuscated_conn::make_stream;
@@ -401,6 +401,36 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    // admission (issue #25): the open-socket ceiling is only a ceiling if the
+    // process can actually hold that many descriptors.
+    {
+        let open_tcp = state.admission.open_tcp.cap() as u64;
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes into the struct we pass and nothing else.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+            #[allow(clippy::unnecessary_cast)] // rlim_t's width differs by platform
+            let fds = rl.rlim_cur as u64;
+            if open_tcp + 1024 > fds {
+                warn!(
+                    open_tcp_ceiling = open_tcp,
+                    fd_limit = fds,
+                    "admission.max_open_tcp_connections is near or above the file-descriptor limit; \
+                     raise LimitNOFILE or lower the ceiling, or accept() will fail before admission refuses"
+                );
+            }
+        }
+        info!(
+            open_tcp = state.admission.open_tcp.cap(),
+            pending_logins = state.admission.pending_login.cap(),
+            probes = state.admission.probes.cap(),
+            search_jobs = state.admission.search_jobs.cap(),
+            udp_enforce = state.admission.udp.enforce,
+            "admission ceilings"
+        );
+    }
 
     // ─── Load auxiliary data files ───────────────────────────────────────────
     // IP filter (guarding.p2p format). Blocks connections from known bad ranges.
@@ -1664,6 +1694,25 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         // gossip — splitting the work across two tasks broke that.
     }
 
+    // admission (issue #25): sample pool saturation once a second for the
+    // readiness report, and every 30 s forget per-source UDP budgets that have
+    // been idle long enough to be full again.
+    {
+        let st = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut n: u32 = 0;
+            loop {
+                tick.tick().await;
+                st.admission.sample();
+                n = n.wrapping_add(1);
+                if n % 30 == 0 {
+                    st.admission.udp.sweep();
+                }
+            }
+        });
+    }
+
     // ─── Accept loop ────────────────────────────────────────────────────
     //
     // Two listeners, ONE handler. `serve_accepted` holds everything that used
@@ -1778,8 +1827,49 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     drop(stream);
                     continue;
                 };
+                // admission (issue #25): a server-wide bound on open sockets
+                // and on sockets still in setup/login, however the load is
+                // spread across addresses. Taken before a task exists; when
+                // either pool is full the socket is closed at once — no
+                // unauthenticated connection waits in a queue.
+                // The IP filter first: a blocked address must not occupy a
+                // pending-login slot for the whole setup timeout.
+                if let std::net::IpAddr::V4(v4) = peer.ip() {
+                    if state.ip_filter.read().await.is_blocked(v4) {
+                        *state.block_stats.entry("ipfilter".to_string()).or_insert(0) += 1;
+                        drop(stream);
+                        continue;
+                    }
+                }
+                let mut permits = None;
+                let adm = &state.admission;
+                let refused = match adm.open_tcp.try_take() {
+                    None => Some("admission_open_tcp"),
+                    Some(open) => match adm.try_pending(peer.ip()) {
+                        Err(key) => Some(key),
+                        Ok(pending) => {
+                            permits = Some((open, pending));
+                            None
+                        }
+                    },
+                };
+                if let Some(key) = refused {
+                    *state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+                    if let Some(sup) = ed2k_server::health::throttle().allow(
+                        peer.ip(),
+                        key,
+                        ed2k_server::health::SUPPRESS_WINDOW,
+                    ) {
+                        warn!(ip = %peer.ip(), ceiling = key, suppressed = sup,
+                              "connection refused — admission ceiling reached");
+                    }
+                    drop(stream);
+                    continue;
+                }
+                let (open_permit, pending_permit) = permits.take().expect("set above");
                 tokio::spawn(async move {
                     let _ip_slot = ip_slot;
+                    let _open_permit = open_permit;
                     // Bound the setup phase (TCP accept → obfuscation
                     // handshake → first frame). Without this, make_stream's
                     // read_exact() blocks forever on a silent peer (port
@@ -1810,7 +1900,15 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                             return;
                         }
                     };
-                    if let Err(e) = handle_connection(cfg, state, crypt_stream, peer).await {
+                    if let Err(e) = handle_admitted_connection(
+                        cfg,
+                        state,
+                        crypt_stream,
+                        peer,
+                        Some(pending_permit),
+                    )
+                    .await
+                    {
                         tracing::debug!(ip = %peer.ip(), error = %e, "connection ended");
                     }
                 });

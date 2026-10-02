@@ -72,12 +72,17 @@ pub fn resolve_seckey(cfg: &Config) -> [u8; 16] {
 
     let ip = cfg.server.this_ip.trim();
     let have_ip = !ip.is_empty() && ip != "0.0.0.0";
+    // Several paths derive the key (startup, the server hash in
+    // OP_SERVERIDENT, the hairpin check, the admin page). Say it once.
+    static WARNED: std::sync::Once = std::sync::Once::new();
     if !have_ip {
-        tracing::warn!(
-            "server.this_ip is not set — deriving seckey from TCP port only \
-             (degraded). Set this_ip in config: it is required for a stable \
-             obfuscation seckey."
-        );
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "server.this_ip is not set — deriving seckey from TCP port only \
+                 (degraded). Set this_ip in config: it is required for a stable \
+                 obfuscation seckey."
+            );
+        });
     }
 
     // Two independent hashes fill the 16-byte key. Both fold in the IP (when
@@ -402,6 +407,17 @@ impl UdpServer {
                 }
             }
 
+            // admission (issue #25): every datagram is charged on arrival,
+            // server-wide first and then to its source, before any parsing or
+            // crypto. Shared by every UDP listener and both families.
+            if !self
+                .state
+                .admission
+                .udp_admit(peer.ip(), crate::admission::udp_cost::ARRIVAL)
+            {
+                continue;
+            }
+
             // Plain eD2k datagram — first byte is the 0xE3 proto marker.
             // Anything else MAY be an obfuscated server-to-server datagram:
             // try to decrypt it with the key derived from our seckey and the
@@ -509,6 +525,14 @@ impl UdpServer {
 
                 // Cold path: cache miss or stale entry — enumerate combinations.
                 if decoded_opt.is_none() {
+                    // Up to nine MD5+RC4 attempts: charged before they run.
+                    if !self
+                        .state
+                        .admission
+                        .udp_admit(peer.ip(), crate::admission::udp_cost::OBF_COLD)
+                    {
+                        continue;
+                    }
                     let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
                     let keys_to_try: [Option<u32>; 3] = [
                         self.state
@@ -644,45 +668,7 @@ impl UdpServer {
         peer: SocketAddr,
         obf: Option<(u32, u8)>,
     ) -> std::io::Result<usize> {
-        match obf {
-            None => self.socket.send_to(bytes, peer).await,
-            Some((key, formula)) => {
-                use crate::proto::server_obfuscation::{encode, encode_with_obfbyte};
-                let rng_seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.subsec_nanos())
-                    .unwrap_or(0x1234_ABCD)
-                    .wrapping_mul(0x9E37_79B9);
-                // The obf byte encodes the DIRECTION, so a reply must flip it —
-                // re-using the byte that decoded the request produces a packet the
-                // peer cannot decrypt at all.
-                //
-                // From eMule's EncryptedDatagramSocket.cpp:
-                //   MAGICVALUE_UDP_CLIENTSERVER = 0x6B  (client -> server)
-                //   MAGICVALUE_UDP_SERVERCLIENT = 0xA5  (server -> client)
-                // EncryptSendServer() keys with 0x6B; DecryptReceivedServer() keys
-                // with 0xA5. The base key is the same in both directions (the
-                // server's UDP key), only this byte differs.
-                //
-                // So: a request that decoded with 0x6B came from a client, and our
-                // answer to it must use 0xA5. A packet that decoded with 0xA5 came
-                // from a peer acting as the server, so our answer goes out as
-                // 0x6B. Formula 0 is the server-to-server gossip scheme, which has
-                // no direction byte and is symmetric.
-                //
-                // Getting this wrong is worse than not encrypting: eMule passes an
-                // unencrypted reply straight through (it only logs "Expected
-                // encrypted packet, but received unencrypted"), but a reply
-                // encrypted with the wrong direction byte fails the magic check,
-                // stays ciphertext, and is dropped for not starting with 0xE3.
-                let wire = match formula {
-                    0 => encode(bytes, key, rng_seed),
-                    1 => encode_with_obfbyte(bytes, key, rng_seed, 0x6b),
-                    _ => encode_with_obfbyte(bytes, key, rng_seed, 0xa5),
-                };
-                self.socket.send_to(&wire, peer).await
-            }
-        }
+        send_reply(&self.socket, bytes, peer, obf).await
     }
 
     /// `obf`: how the request was obfuscated, or None if it arrived in the clear.
@@ -701,6 +687,21 @@ impl UdpServer {
                 len = payload.len(),
                 "UDP frame in"
             );
+        }
+
+        // admission (issue #25): what this opcode costs beyond its arrival.
+        {
+            use crate::admission::udp_cost::*;
+            let extra = match opcode {
+                OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 | OP_GLOB_SEARCHREQ3 => SEARCH,
+                OP_GLOB_GETSOURCES => (payload.len() / 16).clamp(1, 64) as u32 * PER_SOURCE_HASH,
+                OP_GLOB_GETSOURCES2 => (payload.len() / 20).clamp(1, 64) as u32 * PER_SOURCE_HASH,
+                0xA0 | 0xA1 => SERVER_LIST,
+                _ => 0,
+            };
+            if extra > 0 && !self.state.admission.udp_admit(peer.ip(), extra) {
+                return Ok(());
+            }
         }
 
         // Track CLIENT IPs that send UDP-only queries. Opcodes 0x9A, 0x94, 0x98,
@@ -1758,6 +1759,13 @@ impl UdpServer {
     // ─── GLOBSEARCHREQ (0x98) ───────────────────────────────────────────────
 
     /// UDP global search — one result per datagram (SPEC.md §2.3.4).
+    ///
+    /// The search runs off the runtime, in the same bounded lane as TCP
+    /// search (issue #25). The receive loop never waits for it: a free job is
+    /// taken at once, or the query takes a place in the small UDP queue and
+    /// waits (at most `udp_search_wait_ms`) from a task, or — both full — it
+    /// is dropped, which for UDP is what a lost datagram looks like anyway.
+    /// The answer is sent from that task once the job is done.
     async fn handle_search(
         &self,
         payload: &[u8],
@@ -1771,172 +1779,198 @@ impl UdpServer {
                 return Ok(());
             }
         };
-        // Same unknown-word rewrite as the TCP path, applied before anything
-        // else reads the tree. If only one channel dropped unknown words, the
-        // same query would return results over TCP and nothing over UDP.
-        let tree = if self.state.live_cfg.load().limits.search_drop_unknown_words {
-            let (t, dropped) = crate::proto::search::drop_unknown_words(&tree, &|tok: &str| {
-                self.state.keyword_index.contains_token(tok)
-            });
-            if !dropped.is_empty() {
-                self.state.note_search_words_dropped();
-            }
-            t
-        } else {
-            tree
-        };
-
-        // Same splitting as the TCP path — see server/search.rs. The two must
-        // tokenize identically, or a query answered by one channel and not the
-        // other becomes a protocol-dependent result set.
-        let tokens: Vec<String> = collect_terms(&tree)
-            .iter()
-            .flat_map(|t| crate::state::keyword_index::tokenize_search_term(t))
-            // Wildcards are not keywords. The TCP path already dropped them;
-            // here they used to fall through as a literal "*" key, which
-            // matches nothing and turned a wildcard search into an empty
-            // result instead of the intended broad one.
-            .filter(|t| t != "*" && t != "**")
-            .collect();
-
-        if tokens.is_empty() {
+        let Some(ticket) = self.state.admission.udp_search_admit() else {
+            debug!(ip = %peer.ip(), "UDP search dropped — search lane and its queue full");
             return Ok(());
-        }
-
-        // Grouped exactly as the TCP path does. The two must not disagree, or a
-        // query answered by one channel and not the other becomes a
-        // protocol-dependent result set.
-        // ⚠ A GROUP OF ONE EXPANDS INTO SEVERAL GROUPS, NOT INTO ONE BIGGER GROUP.
-        //   Many clients send the whole query as a single Term node — "ubuntu linux
-        //   bible" — and `tokenize_search_term` splits it into three tokens that
-        //   must ALL match. Letting those three sit in one group turns them into
-        //   alternatives, which is the opposite of what #10 established, and the
-        //   candidate set becomes the UNION of three common words over the whole
-        //   index instead of their intersection.
-        //
-        //   Results stayed correct, because `evaluate` still applies the real
-        //   condition, and that is what made it invisible: the only symptom was the
-        //   server going from 3% CPU to 92% on a 1.6M-file index.
-        //
-        //   A genuine OR group (more than one element) is different: its branches
-        //   are alternatives by construction, so its tokens are unioned as before.
-        // Shared with the TCP path — see `candidate_groups`.
-        let groups: Vec<Vec<String>> = crate::proto::search::candidate_groups(&tree);
-        let candidate_ids = self.state.keyword_index.find_grouped(&groups);
-
-        // Ranked by source count, exactly as the TCP path does.
-        //
-        // UDP returns far fewer results (UDP_MAX_SEARCH_RESULTS), which makes
-        // the ordering matter MORE, not less: taking the first ten candidates
-        // in FileId order means the ten oldest matching files, every time. The
-        // two channels must also agree — a result set that depends on which
-        // protocol asked is worse than either ordering on its own.
-        let ranked: Vec<crate::state::file_id::FileRecord> = {
-            let live = self.state.live_cfg.load();
-            let rank_scan = (live.limits.search_rank_scan as usize).max(UDP_MAX_SEARCH_RESULTS);
-            let mut heap: std::collections::BinaryHeap<crate::server::search::UdpRanked> =
-                std::collections::BinaryHeap::with_capacity(UDP_MAX_SEARCH_RESULTS + 1);
-            let mut examined = 0usize;
-            for fid in candidate_ids {
-                if examined >= rank_scan {
-                    self.state.note_search_rank_capped();
+        };
+        let state = Arc::clone(&self.state);
+        let socket = Arc::clone(&self.socket);
+        tokio::spawn(async move {
+            let Some(permit) = state.admission.udp_search_wait(ticket).await else {
+                return;
+            };
+            let st = Arc::clone(&state);
+            let Some(ranked) =
+                crate::admission::run_search(permit, move || udp_search_ranked(&st, tree)).await
+            else {
+                return;
+            };
+            let mut sent = 0;
+            for entry in ranked {
+                let out = udp_search_datagram(&state, &entry);
+                if send_reply(&socket, &out, peer, obf).await.is_err() {
                     break;
                 }
-                examined += 1;
-                let entry = match self.state.file_slab.with_record(fid, |r| r.clone()) {
-                    Some(e) => e,
-                    None => continue,
-                };
-                // Full filter, not just the hash lists — see
-                // ContentFilter::is_withheld. The UDP and TCP search paths must
-                // withhold the same records, or a file merely moves from one to
-                // the other.
-                if self.state.filter.is_withheld(&entry.hash, &entry.name) {
-                    continue;
-                }
-                // Skip orphans (no live source). See src/server/search.rs for
-                // the full rationale — orphans are useless to return.
-                if entry.sources.is_empty() {
-                    continue;
-                }
-                // Folded, exactly as the TCP path does. The two must agree or a
-                // query answered by one channel and not the other becomes a
-                // protocol-dependent result set.
-                let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
-                if !evaluate(&tree, &name_lower, entry.size) {
-                    continue;
-                }
-                heap.push(crate::server::search::UdpRanked {
-                    sources: entry.sources.len() as u32,
-                    id: fid,
-                    rec: entry,
-                });
-                if heap.len() > UDP_MAX_SEARCH_RESULTS {
-                    heap.pop();
-                }
+                sent += 1;
             }
-            // Ord is inverted (see `Ranked` in server/search.rs), so ascending
-            // is already best first.
-            heap.into_sorted_vec().into_iter().map(|r| r.rec).collect()
-        };
-
-        let mut sent = 0;
-        for entry in ranked {
-            let hash = entry.hash;
-            // One file per UDP datagram
-            let mut out = BytesMut::new();
-            out.put_u8(PROTO_EDONKEY);
-            out.put_u8(OP_GLOB_SEARCHRES);
-            out.put_slice(&hash);
-
-            // source id + port from first source
-            if let Some(src) = entry.sources.first() {
-                let id = src.ipv4;
-                out.put_u32_le(id);
-                out.put_u16_le(src.port());
-            } else {
-                out.put_u32_le(0);
-                out.put_u16_le(0);
-            }
-
-            let size_lo = entry.size as u32;
-            let size_hi = (entry.size >> 32) as u32;
-            let mut tags = vec![
-                Tag::byte(FT_FILENAME, TagValue::String(entry.name.to_string())),
-                Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
-            ];
-            if size_hi > 0 {
-                tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
-            }
-            tags.push(Tag::byte(
-                FT_SOURCES,
-                TagValue::U32(entry.sources.len() as u32),
-            ));
-            // FT_COMPLETE_SOURCES (0x30) MUST be sent or eMule's "Complete"
-            // column stays at "0% (0)" forever — the UDP search response path
-            // was missing this tag before v0.9.40. Server-side we use the
-            // Lugdunum convention: total sources == complete sources (see
-            // FileEntry::complete_source_count in state/mod.rs for full rationale).
-            tags.push(Tag::byte(
-                FT_COMPLETE_SOURCES,
-                TagValue::U32(entry.complete_source_count()),
-            ));
-            // FT_FILETYPE as an integer — see the note in server/search.rs. The
-            // UDP and TCP result paths must carry the same tags, or a client
-            // gets different metadata depending on which one answered it.
-            let ftype = crate::proto::search::ed2k_file_type_id(&entry.name.to_lowercase());
-            if ftype != crate::proto::search::ed2k_file_type::ANY {
-                tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
-            }
-            write_tag_list(&mut out, &tags);
-
-            self.reply(&out, peer, obf).await?;
-            sent += 1;
-        }
-
-        debug!(ip = %peer.ip(), results = sent, "glob_search");
+            debug!(ip = %peer.ip(), results = sent, "glob_search");
+        });
         Ok(())
     }
+}
+
+/// The ranked UDP search result for `tree`. CPU-heavy: runs in the search
+/// lane, never on the runtime.
+fn udp_search_ranked(
+    state: &ServerState,
+    tree: crate::proto::search::SearchNode,
+) -> Vec<crate::state::file_id::FileRecord> {
+    // Same unknown-word rewrite as the TCP path, applied before anything
+    // else reads the tree. If only one channel dropped unknown words, the
+    // same query would return results over TCP and nothing over UDP.
+    let tree = if state.live_cfg.load().limits.search_drop_unknown_words {
+        let (t, dropped) = crate::proto::search::drop_unknown_words(&tree, &|tok: &str| {
+            state.keyword_index.contains_token(tok)
+        });
+        if !dropped.is_empty() {
+            state.note_search_words_dropped();
+        }
+        t
+    } else {
+        tree
+    };
+
+    // Same splitting as the TCP path — see server/search.rs. The two must
+    // tokenize identically, or a query answered by one channel and not the
+    // other becomes a protocol-dependent result set.
+    let tokens: Vec<String> = collect_terms(&tree)
+        .iter()
+        .flat_map(|t| crate::state::keyword_index::tokenize_search_term(t))
+        // Wildcards are not keywords. The TCP path already dropped them;
+        // here they used to fall through as a literal "*" key, which
+        // matches nothing and turned a wildcard search into an empty
+        // result instead of the intended broad one.
+        .filter(|t| t != "*" && t != "**")
+        .collect();
+
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+
+    // Grouped exactly as the TCP path does. The two must not disagree, or a
+    // query answered by one channel and not the other becomes a
+    // protocol-dependent result set.
+    // ⚠ A GROUP OF ONE EXPANDS INTO SEVERAL GROUPS, NOT INTO ONE BIGGER GROUP.
+    //   Many clients send the whole query as a single Term node — "ubuntu linux
+    //   bible" — and `tokenize_search_term` splits it into three tokens that
+    //   must ALL match. Letting those three sit in one group turns them into
+    //   alternatives, which is the opposite of what #10 established, and the
+    //   candidate set becomes the UNION of three common words over the whole
+    //   index instead of their intersection.
+    //
+    //   Results stayed correct, because `evaluate` still applies the real
+    //   condition, and that is what made it invisible: the only symptom was the
+    //   server going from 3% CPU to 92% on a 1.6M-file index.
+    //
+    //   A genuine OR group (more than one element) is different: its branches
+    //   are alternatives by construction, so its tokens are unioned as before.
+    // Shared with the TCP path — see `candidate_groups`.
+    let groups: Vec<Vec<String>> = crate::proto::search::candidate_groups(&tree);
+    let candidate_ids = state.keyword_index.find_grouped(&groups);
+
+    // Ranked by source count, exactly as the TCP path does.
+    //
+    // UDP returns far fewer results (UDP_MAX_SEARCH_RESULTS), which makes
+    // the ordering matter MORE, not less: taking the first ten candidates
+    // in FileId order means the ten oldest matching files, every time. The
+    // two channels must also agree — a result set that depends on which
+    // protocol asked is worse than either ordering on its own.
+    {
+        let live = state.live_cfg.load();
+        let rank_scan = (live.limits.search_rank_scan as usize).max(UDP_MAX_SEARCH_RESULTS);
+        let mut heap: std::collections::BinaryHeap<crate::server::search::UdpRanked> =
+            std::collections::BinaryHeap::with_capacity(UDP_MAX_SEARCH_RESULTS + 1);
+        let mut examined = 0usize;
+        for fid in candidate_ids {
+            if examined >= rank_scan {
+                state.note_search_rank_capped();
+                break;
+            }
+            examined += 1;
+            let entry = match state.file_slab.with_record(fid, |r| r.clone()) {
+                Some(e) => e,
+                None => continue,
+            };
+            // Full filter, not just the hash lists — see
+            // ContentFilter::is_withheld. The UDP and TCP search paths must
+            // withhold the same records, or a file merely moves from one to
+            // the other.
+            if state.filter.is_withheld(&entry.hash, &entry.name) {
+                continue;
+            }
+            // Skip orphans (no live source). See src/server/search.rs for
+            // the full rationale — orphans are useless to return.
+            if entry.sources.is_empty() {
+                continue;
+            }
+            // Folded, exactly as the TCP path does. The two must agree or a
+            // query answered by one channel and not the other becomes a
+            // protocol-dependent result set.
+            let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
+            if !evaluate(&tree, &name_lower, entry.size) {
+                continue;
+            }
+            heap.push(crate::server::search::UdpRanked {
+                sources: entry.sources.len() as u32,
+                id: fid,
+                rec: entry,
+            });
+            if heap.len() > UDP_MAX_SEARCH_RESULTS {
+                heap.pop();
+            }
+        }
+        // Ord is inverted (see `Ranked` in server/search.rs), so ascending
+        // is already best first.
+        heap.into_sorted_vec().into_iter().map(|r| r.rec).collect()
+    }
+}
+
+/// One OP_GLOB_SEARCHRES datagram for one file.
+fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileRecord) -> BytesMut {
+    let hash = entry.hash;
+    // One file per UDP datagram
+    let mut out = BytesMut::new();
+    out.put_u8(PROTO_EDONKEY);
+    out.put_u8(OP_GLOB_SEARCHRES);
+    out.put_slice(&hash);
+
+    // The source the result names: chosen and encoded exactly as the TCP
+    // result and GETSOURCES do (issue #27).
+    let (id, port) = state.search_result_source(&entry.sources);
+    out.put_u32_le(id);
+    out.put_u16_le(port);
+
+    let size_lo = entry.size as u32;
+    let size_hi = (entry.size >> 32) as u32;
+    let mut tags = vec![
+        Tag::byte(FT_FILENAME, TagValue::String(entry.name.to_string())),
+        Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
+    ];
+    if size_hi > 0 {
+        tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
+    }
+    tags.push(Tag::byte(
+        FT_SOURCES,
+        TagValue::U32(entry.sources.len() as u32),
+    ));
+    // FT_COMPLETE_SOURCES (0x30) MUST be sent or eMule's "Complete"
+    // column stays at "0% (0)" forever — the UDP search response path
+    // was missing this tag before v0.9.40. Server-side we use the
+    // Lugdunum convention: total sources == complete sources (see
+    // FileEntry::complete_source_count in state/mod.rs for full rationale).
+    tags.push(Tag::byte(
+        FT_COMPLETE_SOURCES,
+        TagValue::U32(entry.complete_source_count()),
+    ));
+    // FT_FILETYPE as an integer — see the note in server/search.rs. The
+    // UDP and TCP result paths must carry the same tags, or a client
+    // gets different metadata depending on which one answered it.
+    let ftype = crate::proto::search::ed2k_file_type_id(&entry.name.to_lowercase());
+    if ftype != crate::proto::search::ed2k_file_type::ANY {
+        tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
+    }
+    write_tag_list(&mut out, &tags);
+    out
 }
 
 // ─── Additional opcode constants used only by UDP ──────────────────────────
@@ -1973,3 +2007,52 @@ const OP_GLOB_FOUNDSOURCES: u8 = 0x9B;
 const OP_GLOB_SERVSTATRES: u8 = 0x97;
 const OP_SERVER_DESC_RES: u8 = 0xA3;
 const OP_GLOB_SEARCHRES: u8 = 0x99;
+
+/// Send a UDP reply, obfuscated the way the request was. A free function so
+/// tasks spawned off the receive loop can answer too.
+async fn send_reply(
+    socket: &UdpSocket,
+    bytes: &[u8],
+    peer: SocketAddr,
+    obf: Option<(u32, u8)>,
+) -> std::io::Result<usize> {
+    match obf {
+        None => socket.send_to(bytes, peer).await,
+        Some((key, formula)) => {
+            use crate::proto::server_obfuscation::{encode, encode_with_obfbyte};
+            let rng_seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0x1234_ABCD)
+                .wrapping_mul(0x9E37_79B9);
+            // The obf byte encodes the DIRECTION, so a reply must flip it —
+            // re-using the byte that decoded the request produces a packet the
+            // peer cannot decrypt at all.
+            //
+            // From eMule's EncryptedDatagramSocket.cpp:
+            //   MAGICVALUE_UDP_CLIENTSERVER = 0x6B  (client -> server)
+            //   MAGICVALUE_UDP_SERVERCLIENT = 0xA5  (server -> client)
+            // EncryptSendServer() keys with 0x6B; DecryptReceivedServer() keys
+            // with 0xA5. The base key is the same in both directions (the
+            // server's UDP key), only this byte differs.
+            //
+            // So: a request that decoded with 0x6B came from a client, and our
+            // answer to it must use 0xA5. A packet that decoded with 0xA5 came
+            // from a peer acting as the server, so our answer goes out as
+            // 0x6B. Formula 0 is the server-to-server gossip scheme, which has
+            // no direction byte and is symmetric.
+            //
+            // Getting this wrong is worse than not encrypting: eMule passes an
+            // unencrypted reply straight through (it only logs "Expected
+            // encrypted packet, but received unencrypted"), but a reply
+            // encrypted with the wrong direction byte fails the magic check,
+            // stays ciphertext, and is dropped for not starting with 0xE3.
+            let wire = match formula {
+                0 => encode(bytes, key, rng_seed),
+                1 => encode_with_obfbyte(bytes, key, rng_seed, 0x6b),
+                _ => encode_with_obfbyte(bytes, key, rng_seed, 0xa5),
+            };
+            socket.send_to(&wire, peer).await
+        }
+    }
+}

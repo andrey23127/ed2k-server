@@ -216,11 +216,18 @@ pub fn handle_holepunch_request(
     // a reconnect claimed the id in between — HighID ids are IPv4 addresses and
     // are not unique over time. The hash identifies the client we actually
     // validated, so the frame cannot be delivered to a stranger.
+    use crate::admission::PushKind::Holepunch;
     if let Some(target) = state.clients.get(&t_hash) {
-        target.send_frame(to_target);
+        state
+            .admission
+            .push
+            .note(Holepunch, target.send_frame(to_target));
     }
     if let Some(me) = state.clients.get(requester_user_hash) {
-        me.send_frame(to_requester);
+        state
+            .admission
+            .push
+            .note(Holepunch, me.send_frame(to_requester));
     }
 
     debug!(
@@ -272,7 +279,19 @@ pub fn schedule_info_retries(
     requester_udp_port: u16,
     target_id: u32,
 ) {
+    // admission (issue #25): at most one pending retry per (requester,
+    // target) pair, and at most `max_retry_tasks` in all. Retrying is optional
+    // help — the immediate coordination already happened — so a refusal just
+    // skips it.
+    let guards = match state.admission.try_retry(requester_user_hash, target_id) {
+        Ok(g) => g,
+        Err(why) => {
+            debug!(?why, target_id, "holepunch retry skipped");
+            return;
+        }
+    };
     tokio::spawn(async move {
+        let _guards = guards;
         // Two extra attempts at +1.2s and +3.0s, IN ADDITION to the immediate
         // coordination already done by the caller. Small and short so a
         // genuinely unreachable pair still fails fast.
@@ -327,7 +346,11 @@ fn send_fail(state: &ServerState, requester_user_hash: &[u8; 16], target_id: u32
     p.put_u32_le(target_id);
     p.put_u8(reason);
     if let Some(me) = state.clients.get(requester_user_hash) {
-        me.send_frame(Frame::new(OP_LOWID_HOLEPUNCH_FAIL, p.to_vec()));
+        let outcome = me.send_frame(Frame::new(OP_LOWID_HOLEPUNCH_FAIL, p.to_vec()));
+        state
+            .admission
+            .push
+            .note(crate::admission::PushKind::Holepunch, outcome);
     } else {
         warn!(
             target_id,

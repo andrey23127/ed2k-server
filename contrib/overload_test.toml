@@ -1,0 +1,52 @@
+# Small-capacity configuration for contrib/overload_test.py.
+# Ceilings are tiny so one machine can saturate every path. Not for production.
+
+[server]
+name = "overload test"
+desc = "admission overload test"
+public = false
+version_major = 17
+version_minor = 15
+
+[network]
+tcp_port = 24661
+listen_ip = "127.0.0.1"
+max_frame_size = 1_000_000
+login_timeout_ms = 2000
+support_crypt = true
+ipv6_enabled = false
+
+[limits]
+max_clients = 200
+soft_limit_files = 1000
+hard_limit_files = 4000
+max_clients_per_ip = 1000
+
+[content_filter]
+hash_banlist = []
+hash_filter = []
+
+[log]
+level = "warn"
+
+[admin]
+enabled = true
+port = 28080
+
+[admission]
+max_open_tcp_connections = 300
+max_pending_logins = 16
+max_probe_jobs = 8
+max_retry_tasks = 8
+session_relay_per_second = 2
+session_relay_burst = 10
+max_search_jobs = 1
+max_queued_tcp_searches = 8
+tcp_search_wait_ms = 200
+max_rate_state_entries = 256
+udp_global_credits_per_second = 2000
+udp_global_burst_credits = 2000
+udp_source_credits_per_second = 20
+udp_source_burst_credits = 40
+udp_rate_enforce = true
+readiness_window_secs = 1

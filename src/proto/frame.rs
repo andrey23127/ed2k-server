@@ -433,7 +433,11 @@ mod tests {
         let bomb = vec![0u8; 64 * 1024 * 1024];
         let mut buf = packed(0x15, &bomb);
         drop(bomb);
-        assert!(buf.len() < 200_000, "the wire frame is small: {}", buf.len());
+        assert!(
+            buf.len() < 200_000,
+            "the wire frame is small: {}",
+            buf.len()
+        );
         let mut codec = Ed2kCodec::new(1_000_000).with_max_decompressed(1_000_000);
         assert!(matches!(
             codec.decode(&mut buf),
@@ -443,7 +447,10 @@ mod tests {
 
     #[test]
     fn the_default_ceiling_applies_without_configuration() {
-        assert_eq!(Ed2kCodec::new(1).max_decompressed_size, DEFAULT_MAX_DECOMPRESSED);
+        assert_eq!(
+            Ed2kCodec::new(1).max_decompressed_size,
+            DEFAULT_MAX_DECOMPRESSED
+        );
     }
 
     #[test]
@@ -455,7 +462,10 @@ mod tests {
         let len = (cut - HEADER_LEN + 1) as u32;
         buf[1..5].copy_from_slice(&len.to_le_bytes());
         let mut codec = Ed2kCodec::new(1_000_000);
-        assert!(matches!(codec.decode(&mut buf), Err(FrameError::Decompress(_))));
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::Decompress(_))
+        ));
     }
 
     #[test]
@@ -463,7 +473,10 @@ mod tests {
         let mut buf = packed(0x15, &[0u8; 100_000]);
         let wire = (buf.len() - HEADER_LEN + 1) as u32;
         let mut codec = Ed2kCodec::new(wire - 1).with_max_decompressed(u32::MAX);
-        assert!(matches!(codec.decode(&mut buf), Err(FrameError::TooLarge { .. })));
+        assert!(matches!(
+            codec.decode(&mut buf),
+            Err(FrameError::TooLarge { .. })
+        ));
     }
 
     #[test]

@@ -24,6 +24,252 @@ pub struct Config {
     pub admin: AdminConfig,
     #[serde(default)]
     pub updates: UpdatesConfig,
+    #[serde(default)]
+    pub admission: AdmissionConfig,
+}
+
+/// Server-wide work admission (issue #25). Restart-only. No value accepts 0
+/// as "unlimited": a zero ceiling is refused at startup.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct AdmissionConfig {
+    /// Accepted TCP sockets at once, logged in or not. Checked at accept,
+    /// before a task is spawned. Absent = limits.max_clients + 10% +
+    /// max_pending_logins (200 000 when max_clients is 0). Keep it below the
+    /// process file-descriptor limit.
+    #[serde(default)]
+    pub max_open_tcp_connections: Option<u32>,
+    /// Accepted sockets that have not completed a login (obfuscation
+    /// handshake, LOGINREQUEST, HighID probe).
+    #[serde(default = "default_adm_pending")]
+    pub max_pending_logins: u32,
+    /// The same, per source (IPv4 address, IPv6 prefix): one source cannot
+    /// hold the whole pending pool. Loopback exempt.
+    #[serde(default = "default_adm_pending_per_source")]
+    pub max_pending_logins_per_source: u32,
+    /// Outbound HighID probes at once, initial and background together. A
+    /// login that finds none free is given LowID. Absent = 64 more than
+    /// max_pending_logins, so logins (bounded by max_pending_logins) always
+    /// find one beside the background checks (at most 64).
+    #[serde(default)]
+    pub max_probe_jobs: Option<u32>,
+    /// Detached hole-punch retry tasks at once.
+    #[serde(default = "default_adm_retries")]
+    pub max_retry_tasks: u32,
+    /// Per-session allowance for callback and hole-punch requests (each makes
+    /// the server push a frame to another client): sustained rate and burst.
+    #[serde(default = "default_adm_relay_rate")]
+    pub session_relay_per_second: u32,
+    #[serde(default = "default_adm_relay_burst")]
+    pub session_relay_burst: u32,
+    /// Searches running at once, off the async runtime.
+    #[serde(default = "default_adm_search_jobs")]
+    pub max_search_jobs: u32,
+    /// TCP searches allowed to wait for a search job; beyond it the search
+    /// gets an empty result at once. UDP searches never wait.
+    #[serde(default = "default_adm_search_queue")]
+    pub max_queued_tcp_searches: u32,
+    /// How long a queued TCP search waits before it gets an empty result.
+    #[serde(default = "default_adm_search_wait")]
+    pub tcp_search_wait_ms: u64,
+    /// UDP searches allowed to wait for a search job — from a task, never in
+    /// the receive loop — and for how long. Small and separate from the TCP
+    /// queue, so UDP cannot crowd out established sessions.
+    #[serde(default = "default_adm_udp_search_queue")]
+    pub max_queued_udp_searches: u32,
+    #[serde(default = "default_adm_udp_search_wait")]
+    pub udp_search_wait_ms: u64,
+    /// Per-source UDP budgets tracked at once. A new source beyond it is
+    /// refused rather than letting the table grow.
+    #[serde(default = "default_adm_rate_entries")]
+    pub max_rate_state_entries: u32,
+    /// IPv6 sources sharing this prefix share one budget (TCP per-IP limit
+    /// and UDP). IPv4 is always per address.
+    #[serde(default = "default_adm_v6_bits")]
+    pub ipv6_source_prefix_bits: u8,
+    /// Server-wide UDP budget, in credits (a status query costs 1).
+    #[serde(default = "default_adm_udp_global_rate")]
+    pub udp_global_credits_per_second: u32,
+    #[serde(default = "default_adm_udp_global_burst")]
+    pub udp_global_burst_credits: u32,
+    /// Per-source UDP budget, in the same credits.
+    #[serde(default = "default_adm_udp_source_rate")]
+    pub udp_source_credits_per_second: u32,
+    #[serde(default = "default_adm_udp_source_burst")]
+    pub udp_source_burst_credits: u32,
+    /// false (default): UDP budgets are measured and over-budget packets are
+    /// COUNTED but still served — to choose values from live traffic first.
+    /// true: over-budget packets are dropped.
+    #[serde(default)]
+    pub udp_rate_enforce: bool,
+    /// /api/ready reports not-ready once a critical pool (open sockets,
+    /// pending logins, search jobs) has stayed full this long.
+    #[serde(default = "default_adm_ready_window")]
+    pub readiness_window_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self {
+            max_open_tcp_connections: None,
+            max_pending_logins: default_adm_pending(),
+            max_pending_logins_per_source: default_adm_pending_per_source(),
+            max_probe_jobs: None,
+            max_retry_tasks: default_adm_retries(),
+            session_relay_per_second: default_adm_relay_rate(),
+            session_relay_burst: default_adm_relay_burst(),
+            max_search_jobs: default_adm_search_jobs(),
+            max_queued_tcp_searches: default_adm_search_queue(),
+            tcp_search_wait_ms: default_adm_search_wait(),
+            max_queued_udp_searches: default_adm_udp_search_queue(),
+            udp_search_wait_ms: default_adm_udp_search_wait(),
+            max_rate_state_entries: default_adm_rate_entries(),
+            ipv6_source_prefix_bits: default_adm_v6_bits(),
+            udp_global_credits_per_second: default_adm_udp_global_rate(),
+            udp_global_burst_credits: default_adm_udp_global_burst(),
+            udp_source_credits_per_second: default_adm_udp_source_rate(),
+            udp_source_burst_credits: default_adm_udp_source_burst(),
+            udp_rate_enforce: false,
+            readiness_window_secs: default_adm_ready_window(),
+        }
+    }
+}
+
+impl AdmissionConfig {
+    /// `max_open_tcp_connections`, or its default derived from the limits.
+    pub fn effective_open_tcp(&self, cfg: &Config) -> u32 {
+        self.max_open_tcp_connections.unwrap_or_else(|| {
+            let mc = cfg.limits.max_clients;
+            if mc == 0 {
+                200_000
+            } else {
+                mc.saturating_add(mc / 10)
+                    .saturating_add(self.max_pending_logins)
+            }
+        })
+    }
+
+    /// `max_probe_jobs`, or its default.
+    pub fn effective_probes(&self) -> u32 {
+        self.max_probe_jobs
+            .unwrap_or_else(|| self.max_pending_logins.saturating_add(64))
+    }
+
+    fn validate(&self) -> Result<()> {
+        let nonzero: [(&str, u64); 18] = [
+            (
+                "max_pending_logins_per_source",
+                self.max_pending_logins_per_source as u64,
+            ),
+            (
+                "max_queued_udp_searches",
+                self.max_queued_udp_searches as u64,
+            ),
+            ("udp_search_wait_ms", self.udp_search_wait_ms),
+            (
+                "max_probe_jobs",
+                self.max_probe_jobs.map_or(1, |v| v as u64),
+            ),
+            ("readiness_window_secs", self.readiness_window_secs),
+            ("max_pending_logins", self.max_pending_logins as u64),
+            ("max_retry_tasks", self.max_retry_tasks as u64),
+            (
+                "session_relay_per_second",
+                self.session_relay_per_second as u64,
+            ),
+            ("session_relay_burst", self.session_relay_burst as u64),
+            ("max_search_jobs", self.max_search_jobs as u64),
+            (
+                "max_queued_tcp_searches",
+                self.max_queued_tcp_searches as u64,
+            ),
+            ("tcp_search_wait_ms", self.tcp_search_wait_ms),
+            ("max_rate_state_entries", self.max_rate_state_entries as u64),
+            (
+                "udp_global_credits_per_second",
+                self.udp_global_credits_per_second as u64,
+            ),
+            (
+                "udp_global_burst_credits",
+                self.udp_global_burst_credits as u64,
+            ),
+            (
+                "udp_source_credits_per_second",
+                self.udp_source_credits_per_second as u64,
+            ),
+            (
+                "udp_source_burst_credits",
+                self.udp_source_burst_credits as u64,
+            ),
+            (
+                "max_open_tcp_connections",
+                self.max_open_tcp_connections.map_or(1, |v| v as u64),
+            ),
+        ];
+        for (name, v) in nonzero {
+            if v == 0 {
+                bail!("admission.{name} must be at least 1: there is no \"unlimited\" for a safety limit");
+            }
+        }
+        if !(16..=128).contains(&self.ipv6_source_prefix_bits) {
+            bail!(
+                "admission.ipv6_source_prefix_bits = {} must be between 16 and 128",
+                self.ipv6_source_prefix_bits
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_adm_ready_window() -> u64 {
+    30
+}
+fn default_adm_pending() -> u32 {
+    4096
+}
+fn default_adm_pending_per_source() -> u32 {
+    8
+}
+fn default_adm_udp_search_queue() -> u32 {
+    32
+}
+fn default_adm_udp_search_wait() -> u64 {
+    250
+}
+fn default_adm_retries() -> u32 {
+    256
+}
+fn default_adm_relay_rate() -> u32 {
+    5
+}
+fn default_adm_relay_burst() -> u32 {
+    100
+}
+fn default_adm_search_jobs() -> u32 {
+    4
+}
+fn default_adm_search_queue() -> u32 {
+    128
+}
+fn default_adm_search_wait() -> u64 {
+    2000
+}
+fn default_adm_rate_entries() -> u32 {
+    262_144
+}
+fn default_adm_v6_bits() -> u8 {
+    64
+}
+fn default_adm_udp_global_rate() -> u32 {
+    100_000
+}
+fn default_adm_udp_global_burst() -> u32 {
+    200_000
+}
+fn default_adm_udp_source_rate() -> u32 {
+    20
+}
+fn default_adm_udp_source_burst() -> u32 {
+    200
 }
 
 /// Update service for the filter data files.
@@ -834,6 +1080,7 @@ whitelist_hashes = ""
                  to be configured (see SPEC.md §1.2 / §7.6.3). Refusing to start."
             );
         }
+        self.admission.validate()?;
         if self.network.max_decompressed_frame_size == 0 {
             bail!(
                 "network.max_decompressed_frame_size must be at least 1: it is the only \

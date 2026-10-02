@@ -406,6 +406,7 @@ pub fn search_page_size(state: &ServerState) -> usize {
 /// trailing "more results available" byte — eMule shows a "More" button and
 /// sends QUERY_MORE_RESULT when it is 1.
 pub fn build_search_result_page(
+    state: &ServerState,
     page: &[crate::state::file_id::FileRecord],
     has_more: bool,
 ) -> Frame {
@@ -415,15 +416,12 @@ pub fn build_search_result_page(
     for file in page {
         payload.put_slice(&file.hash);
 
-        // Source IP as u32 LE with octets in natural order.
-        if let Some(src) = file.sources.first() {
-            let id = src.ipv4;
-            payload.put_u32_le(id);
-            payload.put_u16_le(src.port());
-        } else {
-            payload.put_u32_le(0);
-            payload.put_u16_le(0);
-        }
+        // The source eMule keeps from this result: chosen and encoded as
+        // GETSOURCES does (issue #27) — HighID address or LowID low id, 0/0
+        // when no connected source qualifies.
+        let (id, port) = state.search_result_source(&file.sources);
+        payload.put_u32_le(id);
+        payload.put_u16_le(port);
 
         // Tags: filename, size_lo, optional size_hi (files >4 GiB), sources,
         // complete sources.
@@ -474,6 +472,122 @@ mod pagination_and_largefile_tests {
     use crate::state::file_id::FileRecord;
     use std::net::{IpAddr, Ipv4Addr};
 
+    fn st() -> ServerState {
+        ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::new(crate::config::Config::minimal_test_config()),
+        )
+    }
+
+    /// A connected client: registered, with its channel open.
+    fn connect(
+        st: &ServerState,
+        hash: u8,
+        id: u32,
+        ip: Ipv4Addr,
+        high: bool,
+        keep: &mut Vec<tokio::sync::mpsc::Receiver<Frame>>,
+    ) {
+        st.register_synthetic_client(
+            [hash; 16],
+            id,
+            IpAddr::V4(ip),
+            "t".into(),
+            "??".into(),
+            "test".into(),
+            0,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        keep.push(rx);
+        let mut h = st.clients.get_mut(&[hash; 16]).unwrap();
+        h.tx = Some(tx);
+        h.is_high_id = high;
+    }
+
+    fn src(hash: u8, ip: Ipv4Addr, complete: bool) -> crate::state::Source {
+        crate::state::Source::new([hash; 16], IpAddr::V4(ip), 4662, complete)
+    }
+
+    /// The (id, port) the first record of a one-result page carries.
+    fn first_record_source(f: &Frame) -> (u32, u16) {
+        let p = &f.payload[4 + 16..4 + 16 + 6];
+        (
+            u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+            u16::from_le_bytes([p[4], p[5]]),
+        )
+    }
+
+    #[test]
+    fn a_lowid_source_is_named_by_its_low_id_not_its_nat_address_issue_27() {
+        let st = st();
+        let mut keep = Vec::new();
+        let nat = Ipv4Addr::new(203, 0, 113, 9);
+        connect(&st, 1, 77, nat, false, &mut keep);
+        let mut e = entry("a.avi", 1);
+        e.sources = vec![src(1, nat, true)].into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(first_record_source(&f), (77, 4662));
+    }
+
+    #[test]
+    fn a_highid_is_preferred_and_departed_or_lan_sources_are_never_named() {
+        let st = st();
+        let mut keep = Vec::new();
+        let lan = Ipv4Addr::new(192, 168, 1, 5);
+        let pubv4 = Ipv4Addr::new(198, 51, 100, 7);
+        let high_id = u32::from_le_bytes(pubv4.octets());
+        connect(&st, 2, 78, Ipv4Addr::new(203, 0, 113, 10), false, &mut keep);
+        connect(&st, 3, high_id, pubv4, true, &mut keep);
+        connect(&st, 4, 0x0505_0505, lan, true, &mut keep); // HighID flag, LAN address
+        let mut e = entry("b.avi", 1);
+        e.sources = vec![
+            src(9, Ipv4Addr::new(198, 51, 100, 99), true), // departed
+            src(4, lan, true),
+            src(2, Ipv4Addr::new(203, 0, 113, 10), true),
+            src(3, pubv4, true),
+        ]
+        .into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(
+            first_record_source(&f),
+            (high_id, 4662),
+            "complete HighID first"
+        );
+
+        // Only departed and LAN sources left: no source at all.
+        let mut e = entry("c.avi", 1);
+        e.sources = vec![
+            src(9, Ipv4Addr::new(198, 51, 100, 99), true),
+            src(4, lan, true),
+        ]
+        .into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(first_record_source(&f), (0, 0));
+    }
+
+    #[test]
+    fn a_complete_copy_beats_a_partial_one() {
+        let st = st();
+        let mut keep = Vec::new();
+        let a = Ipv4Addr::new(198, 51, 100, 1);
+        let b = Ipv4Addr::new(198, 51, 100, 2);
+        connect(&st, 5, u32::from_le_bytes(a.octets()), a, true, &mut keep);
+        connect(&st, 6, 90, Ipv4Addr::new(203, 0, 113, 11), false, &mut keep);
+        let _ = b;
+        let mut e = entry("d.avi", 1);
+        e.sources = vec![
+            src(5, a, false),
+            src(6, Ipv4Addr::new(203, 0, 113, 11), true),
+        ]
+        .into();
+        let f = build_search_result_page(&st, &[e], false);
+        assert_eq!(
+            first_record_source(&f),
+            (90, 4662),
+            "complete LowID over partial HighID"
+        );
+    }
+
     fn entry(name: &str, size: u64) -> FileRecord {
         FileRecord {
             hash: [0u8; 16],
@@ -495,7 +609,7 @@ mod pagination_and_largefile_tests {
     fn large_file_emits_filesize_hi_tag() {
         // A 5 GiB file: size_hi = 1, so FT_FILESIZE_HI must be present.
         let size: u64 = 5_u64 * 1024 * 1024 * 1024;
-        let frame = build_search_result_page(&[entry("huge.iso", size)], false);
+        let frame = build_search_result_page(&st(), &[entry("huge.iso", size)], false);
 
         // The decoded size_hi we encoded should be non-zero.
         let size_hi = (size >> 32) as u32;
@@ -504,7 +618,7 @@ mod pagination_and_largefile_tests {
         // FT_FILESIZE_HI is 0x3A — its tag byte appears as 0x80|0x03 newtag
         // with name 0x3A somewhere in the payload. Just assert the frame is
         // larger than the same file would be under 4 GiB (the extra tag).
-        let small = build_search_result_page(&[entry("huge.iso", 1000)], false);
+        let small = build_search_result_page(&st(), &[entry("huge.iso", 1000)], false);
         assert!(
             frame.payload.len() > small.payload.len(),
             "large-file frame should carry an extra FT_FILESIZE_HI tag"
@@ -516,7 +630,7 @@ mod pagination_and_largefile_tests {
         // Just under 4 GiB — size_hi = 0, no FT_FILESIZE_HI tag.
         let size: u64 = 4_u64 * 1024 * 1024 * 1024 - 1;
         assert_eq!((size >> 32) as u32, 0, "just-under-4GiB has size_hi 0");
-        let _ = build_search_result_page(&[entry("almost.iso", size)], false);
+        let _ = build_search_result_page(&st(), &[entry("almost.iso", size)], false);
         // No panic, size fits in size_lo — covered by the size_hi assert above.
     }
 
@@ -524,14 +638,14 @@ mod pagination_and_largefile_tests {
     fn pagination_more_byte() {
         let page = vec![entry("a", 1), entry("b", 2)];
         // has_more = true → trailing byte 1
-        let f = build_search_result_page(&page, true);
+        let f = build_search_result_page(&st(), &page, true);
         assert_eq!(
             *f.payload.last().unwrap(),
             1,
             "has_more should set trailing byte"
         );
         // has_more = false → trailing byte 0
-        let f = build_search_result_page(&page, false);
+        let f = build_search_result_page(&st(), &page, false);
         assert_eq!(*f.payload.last().unwrap(), 0, "no more → trailing byte 0");
         // count field reflects the page size
         let count = u32::from_le_bytes([f.payload[0], f.payload[1], f.payload[2], f.payload[3]]);
@@ -540,7 +654,7 @@ mod pagination_and_largefile_tests {
 
     #[test]
     fn empty_page_is_valid() {
-        let f = build_search_result_page(&[], false);
+        let f = build_search_result_page(&st(), &[], false);
         // count = 0, trailing byte = 0, total 5 bytes
         assert_eq!(f.payload.len(), 5);
         assert_eq!(&f.payload[..4], &[0, 0, 0, 0]);

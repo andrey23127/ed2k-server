@@ -125,3 +125,28 @@ country_db_path = ""
 # Then open http://localhost:8080 in a browser.
 enabled = true
 port = 8080
+
+[admission]
+# Server-wide ceilings on remotely caused work (issue #25). Restart-only; no
+# value accepts 0. Every key is optional — the defaults are shown. See README.
+# max_open_tcp_connections = <max_clients + 10% + max_pending_logins>  # keep under LimitNOFILE
+# max_pending_logins = 4096
+# max_pending_logins_per_source = 8
+# max_probe_jobs = <max_pending_logins + 64>   # full -> the login gets LowID
+# max_retry_tasks = 256
+# session_relay_per_second = 5   # callback / hole-punch requests per session
+# session_relay_burst = 100
+# max_search_jobs = 4
+# max_queued_tcp_searches = 128
+# tcp_search_wait_ms = 2000
+# max_queued_udp_searches = 32
+# udp_search_wait_ms = 250
+# max_rate_state_entries = 262144
+# ipv6_source_prefix_bits = 64
+# udp_global_credits_per_second = 100000
+# udp_global_burst_credits = 200000
+# udp_source_credits_per_second = 20
+# udp_source_burst_credits = 200
+# Observe first: over-budget UDP is counted but served. Set true to drop it.
+udp_rate_enforce = false
+# readiness_window_secs = 30

@@ -57,8 +57,12 @@ pub async fn handle_callback_request(
     // Build CALLBACKREQUESTED packet: requester_ip(4) + requester_port(2)
     let callback_frame = build_callbackrequested(requester.ip, requester.port);
 
-    // Push to target's send channel (fire-and-forget)
-    target.send_frame(callback_frame);
+    // Push to target's send channel (never blocks; drops are counted)
+    let outcome = target.send_frame(callback_frame);
+    state
+        .admission
+        .push
+        .note(crate::admission::PushKind::Callback, outcome);
 
     debug!(
         requester_ip = %requester.ip,

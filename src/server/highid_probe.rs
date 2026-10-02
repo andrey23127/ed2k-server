@@ -592,14 +592,22 @@ pub fn server_pseudo_user_hash(seckey: &[u8; 16]) -> [u8; 16] {
     out
 }
 
+/// Ids below this are LowIDs (eMule `IsLowID`: `id < 0x01000000`).
+pub const LOWID_CEILING: u32 = 0x0100_0000;
+
 /// Compute the HighID from an IPv4 address.
 /// eD2k uses the raw u32 (big-endian octets interpreted as little-endian u32).
+///
+/// None when the address cannot be a HighID (issue #26): an address ending in
+/// `.0` encodes to an id below 0x01000000, which every client reads as a
+/// LowID — and which can collide with one `allocate_low_id` hands out. Such a
+/// client is LowID, as other servers make it.
 pub fn high_id_from_ip(ip: IpAddr) -> Option<u32> {
     match ip {
         IpAddr::V4(v4) => {
             let octets = v4.octets();
             // Stored as u32 LE: octets in natural order
-            Some(u32::from_le_bytes(octets))
+            Some(u32::from_le_bytes(octets)).filter(|&id| id >= LOWID_CEILING)
         }
         _ => None,
     }
@@ -803,5 +811,22 @@ mod tests {
         let id = high_id_from_ip(ip).unwrap();
         // LE bytes of [1,2,3,4] = 0x04030201
         assert_eq!(id, 0x04030201);
+    }
+
+    #[test]
+    fn an_address_ending_in_zero_is_never_a_highid() {
+        // Issue #26: a.b.c.0 encodes below 0x01000000, the LowID range.
+        assert_eq!(
+            high_id_from_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 0))),
+            None
+        );
+        assert_eq!(
+            high_id_from_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 1))),
+            Some(0x01D8_B85D)
+        );
+        assert_eq!(
+            high_id_from_ip(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 1))),
+            Some(LOWID_CEILING)
+        );
     }
 }

@@ -412,7 +412,7 @@ async fn search_finds_indexed_files() {
     );
 
     // The paginated frame builder should encode that one result.
-    let frame = build_search_result_page(&matches, false);
+    let frame = build_search_result_page(&state, &matches, false);
     let count = u32::from_le_bytes([
         frame.payload[0],
         frame.payload[1],

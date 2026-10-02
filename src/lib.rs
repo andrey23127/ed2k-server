@@ -1,5 +1,6 @@
 //! ed2k-server library root.
 
+pub mod admission;
 pub mod config;
 pub mod filter;
 pub mod health;

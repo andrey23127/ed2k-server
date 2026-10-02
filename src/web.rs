@@ -209,6 +209,8 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/memsize", get(api_memsize))
             .route("/api/publishers", get(api_publishers))
             .route("/api/health", get(api_health))
+            .route("/api/admission", get(api_admission))
+            .route("/api/ready", get(api_ready))
             .route("/api/review", get(api_review))
             .route("/api/updates", get(api_updates_status))
             .route("/api/update", post(api_update_run))
@@ -331,9 +333,16 @@ struct StatsResp {
     soft_limit_files: u32,
     /// OFFERFILES packets rejected at `limits.hard_limit_files` (connection closed).
     offer_over_hard_packets: u64,
+    /// Admission gauges and counters (issue #25), as /api/admission.
+    admission: serde_json::Value,
     hard_limit_files: u32,
     /// Most TCP connections one IP holds now, and `limits.max_clients_per_ip`.
     busiest_ip_connections: u32,
+    /// That source: "1.2.3.4" or "2001:db8::/64", with its country and how
+    /// many of its connections are logged in. Admin page is localhost-only.
+    busiest_ip: Option<String>,
+    busiest_ip_country: Option<String>,
+    busiest_ip_logged_in: u32,
     max_clients_per_ip: u32,
     /// `network.highid_verify_observe`: whether the counters below are live.
     highid_observe_enabled: bool,
@@ -382,6 +391,7 @@ struct StatsResp {
 
 async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
     let proc = read_proc_stats();
+    let busiest = s.server.busiest_ip();
     let m = &s.metrics;
     // GETSOURCES cache hit rate comes from the SmartSources cache's own
     // hit/miss counters. (The Metrics::get_sources_* atomics were never wired
@@ -414,8 +424,32 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         offer_over_soft_records: s.server.offer_over_soft_stats().1,
         soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
         offer_over_hard_packets: s.server.offer_over_hard_count(),
+        admission: s.server.admission.metrics(),
         hard_limit_files: s.server.live_cfg.load().limits.hard_limit_files,
-        busiest_ip_connections: s.server.busiest_ip_connections(),
+        busiest_ip_connections: busiest.map_or(0, |(_, n)| n),
+        busiest_ip: busiest.map(|(ip, _)| match ip {
+            std::net::IpAddr::V6(_) => {
+                format!("{ip}/{}", s.server.admission.cfg.ipv6_source_prefix_bits)
+            }
+            v4 => v4.to_string(),
+        }),
+        busiest_ip_country: busiest.and_then(|(ip, _)| match ip {
+            std::net::IpAddr::V4(v4) => s
+                .server
+                .country_db
+                .try_read()
+                .ok()
+                .and_then(|db| db.lookup(v4).map(|(c, _)| c)),
+            _ => None,
+        }),
+        busiest_ip_logged_in: busiest.map_or(0, |(ip, _)| {
+            let bits = s.server.admission.cfg.ipv6_source_prefix_bits;
+            s.server
+                .clients
+                .iter()
+                .filter(|c| crate::admission::SourceKey::of(c.ip, bits).as_ip() == ip)
+                .count() as u32
+        }),
         max_clients_per_ip: s.server.live_cfg.load().limits.max_clients_per_ip,
         highid_observe_enabled: {
             let n = &s.server.live_cfg.load().network;
@@ -936,6 +970,16 @@ async fn api_config_set(
     }
     if old.admin.port != new_cfg.admin.port || old.admin.enabled != new_cfg.admin.enabled {
         restart_needed.push("admin.port / admin.enabled".into());
+    }
+    // [admission] is restart-only (issue #25). The open-socket ceiling also
+    // derives from limits.max_clients when it is not set, so raising
+    // max_clients live does not raise it until a restart.
+    if old.admission != new_cfg.admission
+        || old.admission.effective_open_tcp(&old) != new_cfg.admission.effective_open_tcp(&new_cfg)
+    {
+        restart_needed.push(
+            "admission (incl. the open-socket ceiling derived from limits.max_clients)".into(),
+        );
     }
 
     // 3. Write to tempfile + atomic rename.
@@ -1483,6 +1527,27 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         }
     }
     ([("content-type", "text/plain; charset=utf-8")], out)
+}
+
+/// Admission gauges and counters (issue #25).
+async fn api_admission(State(s): State<WebState>) -> Json<serde_json::Value> {
+    Json(s.server.admission.metrics())
+}
+
+/// Readiness, distinct from /api/health: 503 once a critical admission pool
+/// has stayed full for `admission.readiness_window_secs`. Liveness is simply
+/// that this answers at all.
+async fn api_ready(State(s): State<WebState>) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    let (ready, saturated) = s.server.admission.readiness();
+    let code = if ready {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({ "ready": ready, "saturated": saturated })),
+    )
 }
 
 async fn api_health(State(s): State<WebState>) -> Json<serde_json::Value> {
@@ -2370,8 +2435,9 @@ async function refreshStatus() {
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
-     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_connections)} connections <span style="color:#6b7280;font-size:.75rem">most TCP connections one IP holds right now; limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'}, loopback exempt</span></td></tr>
+     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_connections)} connections${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+sys.busiest_ip_country+')' : ''} · ${fmt(sys.busiest_ip_logged_in)} logged in` : ''} <span style="color:#6b7280;font-size:.75rem">most TCP connections one IP holds right now; limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'}, loopback exempt</span></td></tr>
      <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
+     <tr><td>Admission</td><td>${(()=>{const a=sys.admission||{};const p=x=>x?`${fmt(x.in_use)}/${fmt(x.cap)}${x.rejected?` · ${fmt(x.rejected)} refused`:''}`:'–';const u=a.udp||{};return `<b style="color:${a.ready?'#16a34a':'#dc2626'}">${a.ready?'ready':'NOT READY: '+(a.saturated||[]).join(', ')}</b> · sockets ${p(a.open_tcp)} · pending logins ${p(a.pending_login)} · probes ${p(a.probes)} (${fmt(a.probe_shed_lowid||0)} → LowID) · search jobs ${p(a.search_jobs)}, queue ${p(a.search_queue)} · UDP ${u.enforce?'enforced':'observe'}: refused ${fmt((u.refused_global||0)+(u.refused_source||0)+(u.refused_table_full||0))} (global ${fmt(u.refused_global||0)}, source ${fmt(u.refused_source||0)}, table ${fmt(u.refused_table_full||0)}), sources ${fmt(u.source_entries||0)}/${fmt(u.source_entries_cap||0)}`})()} <span style="color:#6b7280;font-size:.75rem">[admission] — details at /api/admission</span></td></tr>
      <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
      <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>

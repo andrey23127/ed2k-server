@@ -31,7 +31,11 @@ pub fn spawn_keepalive(state: Arc<ServerState>, ping_delay_seconds: u64) {
             // Send to every connected client via their mpsc channel
             let mut pinged = 0u32;
             for entry in state.clients.iter() {
-                entry.send_frame(frame.clone());
+                let outcome = entry.send_frame(frame.clone());
+                state
+                    .admission
+                    .push
+                    .note(crate::admission::PushKind::Keepalive, outcome);
                 pinged += 1;
             }
 

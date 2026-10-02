@@ -1066,7 +1066,11 @@ mod filetype_tests {
         match &tree {
             SearchNode::Bool(BoolOp::And, _, r) => assert_eq!(
                 **r,
-                SearchNode::Numeric { tag_name: SearchTag::Id(0xD4), op: CmpOp::Ge, value: 128 }
+                SearchNode::Numeric {
+                    tag_name: SearchTag::Id(0xD4),
+                    op: CmpOp::Ge,
+                    value: 128
+                }
             ),
             other => panic!("unexpected tree {other:?}"),
         }
@@ -1079,7 +1083,10 @@ mod filetype_tests {
         data.extend(enc_tag_id(0xD0));
         assert_eq!(
             parse(&data).unwrap(),
-            SearchNode::Meta { tag_name: SearchTag::Id(0xD0), value: "Beatles".into() }
+            SearchNode::Meta {
+                tag_name: SearchTag::Id(0xD0),
+                value: "Beatles".into()
+            }
         );
 
         // Every media ID 0xD0-0xD5 parses, as a numeric and as a meta node.

@@ -179,7 +179,11 @@ pub(crate) fn reported_client_ip(
     }
     match client_ip {
         IpAddr::V4(v4) if !v4.is_private() && !v4.is_loopback() && !v4.is_link_local() => {
-            u32::from_le_bytes(v4.octets())
+            // An address ending in .0 encodes into the LowID range; eMule
+            // asserts on it and zeroes it (issue #26). Send 0 = unknown.
+            Some(u32::from_le_bytes(v4.octets()))
+                .filter(|&ip| ip >= crate::server::highid_probe::LOWID_CEILING)
+                .unwrap_or(0)
         }
         IpAddr::V4(_) => this_ip
             .trim()
@@ -482,6 +486,16 @@ const CT_MOD_IP_V6: u8 = 0xAE;
 /// was not, and two constants for one wire bit is how that survives unnoticed.
 pub(crate) use crate::proto::opcodes::CAPABLE_SUPPORTCRYPT as SRVCAP_SUPPORTCRYPT;
 
+/// The HighID for a verified address, or — if the address has none (IPv6,
+/// or an IPv4 ending in .0, issue #26) — a fresh LowID flagged as LowID. Never
+/// a LowID-range id flagged as HighID.
+fn high_or_low_id(state: &ServerState, ip: IpAddr) -> (u32, bool) {
+    match crate::server::highid_probe::high_id_from_ip(ip) {
+        Some(id) => (id, true),
+        None => (state.allocate_low_id(), false),
+    }
+}
+
 pub async fn assign_client_id_for(
     state: &ServerState,
     peer_ip: IpAddr,
@@ -504,6 +518,26 @@ pub async fn assign_client_id_for(
     if peer_ip.is_ipv6() {
         return (state.allocate_low_id(), false, peer_ip);
     }
+
+    // A public address ending in .0 has no HighID: its id would fall in the
+    // LowID range (issue #26). LowID, without spending a probe on it.
+    if matches!(peer_ip, IpAddr::V4(v4) if !v4.is_private() && !v4.is_loopback())
+        && high_id_from_ip(peer_ip).is_none()
+    {
+        debug!(ip = %peer_ip, "highid: address has no HighID (ends in .0) → LowID");
+        return (state.allocate_low_id(), false, peer_ip);
+    }
+
+    // admission.max_probe_jobs (issue #25): every outbound probe — this one,
+    // the hairpin probe below, and the background identity checks — shares
+    // one ceiling. Held until this function returns. With none free the login
+    // is not delayed: it gets LowID, the conservative answer, and its next
+    // login is probed again.
+    let Some(_probe_permit) = state.admission.probes.try_take() else {
+        state.admission.note_probe_shed();
+        debug!(ip = %peer_ip, "highid: probe ceiling full → LowID");
+        return (state.allocate_low_id(), false, peer_ip);
+    };
 
     if probe(peer_ip, client_port, probe_timeout).await {
         // VERDICT, opt-in, remembered: a port that answered the hello with
@@ -539,10 +573,10 @@ pub async fn assign_client_id_for(
                     return (state.allocate_low_id(), false, peer_ip);
                 }
             }
-            let id = high_id_from_ip(peer_ip).unwrap_or_else(|| state.allocate_low_id());
-            return (id, true, peer_ip);
+            let (id, high) = high_or_low_id(state, peer_ip);
+            return (id, high, peer_ip);
         }
-        let id = high_id_from_ip(peer_ip).unwrap_or_else(|| state.allocate_low_id());
+        let (id, high) = high_or_low_id(state, peer_ip);
         // OBSERVE ONLY. The verdict above is already final and is returned
         // unchanged on the next line; this merely counts what the stricter,
         // Lugdunum-style check would have said. Detached, so the login does not
@@ -561,7 +595,7 @@ pub async fn assign_client_id_for(
                 );
             }
         }
-        return (id, true, peer_ip);
+        return (id, high, peer_ip);
     }
 
     // ─── HAIRPIN FALLBACK (opt-in) ──────────────────────────────────────
@@ -653,9 +687,8 @@ pub async fn assign_client_id_for(
                             lan_ip = %peer_ip, public_ip = %this_ip, port = client_port,
                             "hairpin: client verified behind our own NAT → HighID"
                         );
-                        let id = high_id_from_ip(IpAddr::V4(this_ip))
-                            .unwrap_or_else(|| state.allocate_low_id());
-                        return (id, true, IpAddr::V4(this_ip));
+                        let (id, high) = high_or_low_id(state, IpAddr::V4(this_ip));
+                        return (id, high, IpAddr::V4(this_ip));
                     }
                     Ok(false) => {
                         // A different host holds that forward. Handing out the
@@ -887,12 +920,18 @@ fn spawn_highid_check(
             return;
         }
     };
+    // And the server-wide probe ceiling shared with login probes (#25).
+    let Some(global_permit) = state.admission.probes.try_take() else {
+        obs.skipped_busy.fetch_add(1, Relaxed);
+        return;
+    };
     let ident = HighIdProbeIdent::from_config(live);
     let supports_crypt = client_flags & SRVCAP_SUPPORTCRYPT != 0;
     let ttl = std::time::Duration::from_secs(live.network.highid_wrong_hash_ttl_secs.max(1));
 
     tokio::spawn(async move {
         let _permit = permit;
+        let _global_permit = global_permit;
         let outcome =
             highid_identity_answer(ip, port, user_hash, ident, timeout_ms, supports_crypt).await;
         let check = record_highid_outcome(&obs, ip, port, user_hash, outcome, marking);
@@ -1135,6 +1174,7 @@ pub async fn handle_login(
         shared_files: 0,
         csam_attempts: 0,
         soft_limit_warned: false,
+        slot: Default::default(),
         tx: None,
         last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
             ClientHandle::now_ms(),
@@ -1210,6 +1250,7 @@ mod tests {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1281,6 +1322,12 @@ mod tests {
     }
 
     #[test]
+    fn a_lowid_from_an_address_ending_in_zero_reports_zero_issue_26() {
+        let dot0 = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 0));
+        assert_eq!(reported_client_ip(dot0, false, 5, OUR_IP), 0);
+    }
+
+    #[test]
     fn an_ipv6_session_reports_no_ipv4() {
         let v6 = IpAddr::V6("2001:db8::1".parse().unwrap());
         assert_eq!(reported_client_ip(v6, false, 5, OUR_IP), 0);
@@ -1313,6 +1360,7 @@ mod tests {
             shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
+            slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -1620,6 +1668,46 @@ mod highid_observe_tests {
         Err("peer closed without sending a byte"),
         Err("read failed"),
     ];
+
+    #[tokio::test]
+    async fn a_public_address_ending_in_zero_gets_lowid_without_a_probe_issue_26() {
+        let st = state();
+        let dot0 = IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 0));
+        let (id, high, _) = assign_client_id_for(&st, dot0, 4662, None, 0).await;
+        assert!(!high);
+        assert!(id < crate::server::highid_probe::LOWID_CEILING && id != 0);
+        assert_eq!(st.admission.probes.in_use(), 0);
+        assert_eq!(
+            st.admission.probes.rejected(),
+            0,
+            "no probe slot was even asked for"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_full_probe_ceiling_gives_lowid_without_probing() {
+        // issue #25: the login does not wait for a probe slot.
+        let st = state();
+        let cap = st.admission.probes.cap() as usize;
+        let held: Vec<_> = (0..cap)
+            .map(|_| st.admission.probes.try_take().unwrap())
+            .collect();
+        let public = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 77));
+        let t0 = std::time::Instant::now();
+        let (_, high, _) = assign_client_id_for(&st, public, 4662, None, 0).await;
+        assert!(!high);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(200),
+            "no probe was run"
+        );
+        assert_eq!(st.admission.probe_shed_lowid.load(Relaxed), 1);
+        // A background check is shed as well, counted as busy.
+        let live = st.live_cfg.load_full();
+        spawn_highid_observe(&st, &live, LOCAL, 1, [1; 16], 0, 2000);
+        assert_eq!(st.highid_observe.skipped_busy.load(Relaxed), 1);
+        drop(held);
+        assert_eq!(st.admission.probes.in_use(), 0);
+    }
 
     #[tokio::test]
     async fn a_port_that_answers_with_the_right_hash_is_verified() {
