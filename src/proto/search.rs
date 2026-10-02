@@ -60,6 +60,44 @@ impl CmpOp {
     }
 }
 
+/// The tag a meta or numeric node refers to.
+///
+/// eMule writes a tag name of length 1 holding the raw tag ID
+/// (`WriteUInt16(1); WriteUInt8(id)`). The media IDs are 0xD0-0xD5, and a lone
+/// byte >= 0x80 is not valid UTF-8 — reading names as strings made every
+/// artist/album/title/length/bitrate/codec search fail to parse (issue #24).
+/// So a one-byte name is an ID, whatever its value; a longer one is a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchTag {
+    Id(u8),
+    Name(String),
+}
+
+impl SearchTag {
+    fn from_bytes(b: &[u8]) -> Self {
+        match b {
+            [id] => SearchTag::Id(*id),
+            _ => SearchTag::Name(String::from_utf8_lossy(b).into_owned()),
+        }
+    }
+
+    /// The one-byte tag ID, if this is one.
+    pub fn id(&self) -> Option<u8> {
+        match self {
+            SearchTag::Id(id) => Some(*id),
+            SearchTag::Name(_) => None,
+        }
+    }
+
+    /// Is this the tag `id`, or a name that some client uses for it?
+    pub fn is(&self, id: u8, names: &[&str]) -> bool {
+        match self {
+            SearchTag::Id(i) => *i == id,
+            SearchTag::Name(n) => names.iter().any(|x| n.eq_ignore_ascii_case(x)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchNode {
     /// Boolean combinator with two operands
@@ -67,10 +105,10 @@ pub enum SearchNode {
     /// String term: must be a token in the filename
     Term(String),
     /// Meta-tag string: tag_name = value (e.g. type="Video")
-    Meta { tag_name: String, value: String },
+    Meta { tag_name: SearchTag, value: String },
     /// Numeric constraint on a tag (size, bitrate, length…)
     Numeric {
-        tag_name: String,
+        tag_name: SearchTag,
         op: CmpOp,
         value: u64,
     },
@@ -124,7 +162,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
         NODE_META => {
             // value (string), then tag_name (string)
             let value = read_short_string(buf)?;
-            let tag_name = read_short_string(buf)?;
+            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
             Ok(SearchNode::Meta { tag_name, value })
         }
         NODE_NUMERIC32 => {
@@ -134,7 +172,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
             let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
             *buf = &buf[4..];
             let op = read_cmp_op(buf)?;
-            let tag_name = read_short_string(buf)?;
+            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
             Ok(SearchNode::Numeric {
                 tag_name,
                 op,
@@ -150,7 +188,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
             let value = u64::from_le_bytes(arr);
             *buf = &buf[8..];
             let op = read_cmp_op(buf)?;
-            let tag_name = read_short_string(buf)?;
+            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
             Ok(SearchNode::Numeric {
                 tag_name,
                 op,
@@ -161,7 +199,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
     }
 }
 
-fn read_short_string(buf: &mut &[u8]) -> Result<String> {
+fn read_short_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
     if buf.len() < 2 {
         bail!("string length prefix missing");
     }
@@ -170,11 +208,16 @@ fn read_short_string(buf: &mut &[u8]) -> Result<String> {
     if buf.len() < len {
         bail!("string body truncated ({} of {} bytes)", buf.len(), len);
     }
-    let s = std::str::from_utf8(&buf[..len])
-        .map_err(|e| anyhow!("invalid utf-8 in search term: {e}"))?
-        .to_string();
-    *buf = &buf[len..];
-    Ok(s)
+    let (body, rest) = buf.split_at(len);
+    *buf = rest;
+    Ok(body)
+}
+
+/// A search term or meta value. Decoded lossily: one bad byte from an old or
+/// odd client turns into U+FFFD — that word then matches nothing — instead of
+/// failing the whole request.
+fn read_short_string(buf: &mut &[u8]) -> Result<String> {
+    Ok(String::from_utf8_lossy(read_short_bytes(buf)?).into_owned())
 }
 
 fn read_cmp_op(buf: &mut &[u8]) -> Result<CmpOp> {
@@ -706,7 +749,7 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             // the meta-tag ID as a 1-byte name). Match the known search tags:
             //   FT_FILETYPE   (0x03) — value is "Audio"/"Video"/"Pro"/"Doc"/etc.
             //   FT_FILEFORMAT (0x04) — value is a file extension like "avi"
-            let tag_id = tag_name.as_bytes().first().copied().unwrap_or(0);
+            let tag_id = tag_name.id().unwrap_or(0);
             // Folded for the same reason as the term above: the name we are
             // handed is folded, so an unfolded value would never match one.
             let val_lower = crate::state::keyword_index::fold_for_match(value);
@@ -732,10 +775,7 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
         } => {
             // eMule sends the meta-tag ID as a 1-byte name. FT_FILESIZE = 0x02.
             // Some clients send the literal string "size". Handle both.
-            let tag_id = tag_name.as_bytes().first().copied().unwrap_or(0);
-            let is_filesize = tag_id == 0x02
-                || tag_name.eq_ignore_ascii_case("size")
-                || tag_name.eq_ignore_ascii_case("filesize");
+            let is_filesize = tag_name.is(0x02, &["size", "filesize"]);
 
             if is_filesize {
                 op.matches_u64(size, *value)
@@ -901,7 +941,7 @@ mod tests {
             BoolOp::And,
             Box::new(inner),
             Box::new(SearchNode::Numeric {
-                tag_name: "size".into(),
+                tag_name: SearchTag::Name("size".into()),
                 op: CmpOp::Gt,
                 value: 1000,
             }),
@@ -988,7 +1028,7 @@ mod filetype_tests {
             BoolOp::And,
             Box::new(SearchNode::Term("ubuntu".into())),
             Box::new(SearchNode::Meta {
-                tag_name: "\u{03}".into(), // 1-char string holding byte 0x03
+                tag_name: SearchTag::Id(0x03),
                 value: "Iso".into(),
             }),
         );
@@ -1002,11 +1042,88 @@ mod filetype_tests {
         );
     }
 
+    /// eMule's meta-tag name: length 1, then the raw tag ID.
+    fn enc_tag_id(id: u8) -> Vec<u8> {
+        vec![1, 0, id]
+    }
+
+    fn enc_str(s: &str) -> Vec<u8> {
+        let mut out = (s.len() as u16).to_le_bytes().to_vec();
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+
+    #[test]
+    fn media_tag_searches_parse_issue_24() {
+        // AND( "beatles", bitrate >= 128 ), bitrate tag 0xD4 as eMule sends it.
+        let mut data = vec![NODE_BOOL, OP_AND, NODE_STRING];
+        data.extend(enc_str("beatles"));
+        data.push(NODE_NUMERIC32);
+        data.extend_from_slice(&128u32.to_le_bytes());
+        data.push(CMP_GE);
+        data.extend(enc_tag_id(0xD4));
+        let tree = parse(&data).expect("a lone byte >= 0x80 is a tag ID, not text");
+        match &tree {
+            SearchNode::Bool(BoolOp::And, _, r) => assert_eq!(
+                **r,
+                SearchNode::Numeric { tag_name: SearchTag::Id(0xD4), op: CmpOp::Ge, value: 128 }
+            ),
+            other => panic!("unexpected tree {other:?}"),
+        }
+        // Bitrate is not tracked per file: the constraint does not drop files.
+        assert!(evaluate(&tree, "beatles - help.mp3", 4_000_000));
+
+        // Artist (0xD0) as a string meta node.
+        let mut data = vec![NODE_META];
+        data.extend(enc_str("Beatles"));
+        data.extend(enc_tag_id(0xD0));
+        assert_eq!(
+            parse(&data).unwrap(),
+            SearchNode::Meta { tag_name: SearchTag::Id(0xD0), value: "Beatles".into() }
+        );
+
+        // Every media ID 0xD0-0xD5 parses, as a numeric and as a meta node.
+        for id in 0xD0..=0xD5u8 {
+            let mut n = vec![NODE_NUMERIC32, 1, 0, 0, 0, CMP_GT];
+            n.extend(enc_tag_id(id));
+            assert!(parse(&n).is_ok(), "numeric 0x{id:02x}");
+            let mut m = vec![NODE_META];
+            m.extend(enc_str("x"));
+            m.extend(enc_tag_id(id));
+            assert!(parse(&m).is_ok(), "meta 0x{id:02x}");
+        }
+    }
+
+    #[test]
+    fn longer_tag_names_stay_names() {
+        let mut data = vec![NODE_NUMERIC32];
+        data.extend_from_slice(&5u32.to_le_bytes());
+        data.push(CMP_GT);
+        data.extend(enc_str("size"));
+        match parse(&data).unwrap() {
+            SearchNode::Numeric { tag_name, .. } => {
+                assert_eq!(tag_name, SearchTag::Name("size".into()));
+                assert!(tag_name.is(0x02, &["size"]));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_byte_in_a_term_no_longer_fails_the_request() {
+        let mut data = vec![NODE_STRING, 4, 0];
+        data.extend_from_slice(b"ab\xffc");
+        match parse(&data).unwrap() {
+            SearchNode::Term(t) => assert_eq!(t, "ab\u{FFFD}c"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     #[test]
     fn search_filesize_byte_id() {
         // Numeric with tag_name = 1-char string holding byte 0x02 (FT_FILESIZE)
         let tree = SearchNode::Numeric {
-            tag_name: "\u{02}".into(),
+            tag_name: SearchTag::Id(0x02),
             op: CmpOp::Ge,
             value: 1000,
         };

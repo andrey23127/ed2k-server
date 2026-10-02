@@ -292,39 +292,59 @@ pub async fn handle_connection(
 
     if let Some(c) = client {
         info!(ip = %peer.ip(), nick = %c.nick, id = c.assigned_id, "client disconnected");
-        // Only remove from clients if the entry still belongs to OUR session.
-        // If a NEW login from the same user_hash already replaced us (NAT-drop
-        // scenario), we must NOT touch the map nor the LowID counter — the new
-        // session is responsible for both. Without this guard, an old stale task
-        // would erroneously evict the live client and decrement the counter
-        // again, causing user dropouts and LowID-count drift.
-        let should_decrement_lowid = match state.clients.get(&c.user_hash) {
-            Some(entry) => entry.assigned_id == c.assigned_id,
-            None => false,
-        };
-        if should_decrement_lowid {
-            if !c.is_high_id {
-                state
-                    .lowid_count_cached
-                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            state.clients.remove(&c.user_hash);
-            // Drop the IPv6 side entry with the session. Leaving it would let a
-            // departed client's address keep being published as a source, which
-            // is the same defect the stale-IPv4 filter exists for — except a
-            // stale entry here survives indefinitely because nothing else
-            // references it.
-            state.client_ipv6.remove(&c.user_hash);
-            // Retract the id→user mapping. Guarded inside: a HighID client's
-            // assigned_id is its IPv4, so a reconnect from the same address may
-            // already have claimed this id — in that case the entry belongs to
-            // the live session and must survive this one's cleanup.
-            state.unindex_client_id(c.assigned_id, &c.user_hash);
-            state.remove_sources_of(&c.user_hash);
-        }
+        end_session(&state, &c);
     }
 
     Ok(())
+}
+
+/// Undo what a login registered, for a session that has ended — unless a newer
+/// session of the same user has replaced it.
+pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
+    // Only remove from clients if the entry still belongs to OUR session.
+    // If a NEW login from the same user_hash already replaced us (NAT-drop
+    // scenario), we must NOT touch the map nor the LowID counter — the new
+    // session is responsible for both. Without this guard, an old stale task
+    // would erroneously evict the live client and decrement the counter
+    // again, causing user dropouts and LowID-count drift.
+    //
+    // "Ours" is decided by session identity, not by assigned_id (issue
+    // #23): a HighID's id is its IPv4, so a reconnect from the same
+    // address has the same id, and comparing ids let this old task remove
+    // the live session's entry, id index, IPv6 entry and every source it
+    // had just re-published.
+    // Remove the entry only if it is this session — one atomic step, so a
+    // login landing between a check and a remove cannot be evicted.
+    let removed = state
+        .clients
+        .remove_if(&c.user_hash, |_, entry| entry.same_session(&c))
+        .is_some();
+    if removed {
+        if !c.is_high_id {
+            state
+                .lowid_count_cached
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Drop the IPv6 side entry with the session. Leaving it would let a
+        // departed client's address keep being published as a source, which
+        // is the same defect the stale-IPv4 filter exists for — except a
+        // stale entry here survives indefinitely because nothing else
+        // references it.
+        state.client_ipv6.remove(&c.user_hash);
+        // Retract the id→user mapping. Guarded inside by user hash.
+        state.unindex_client_id(c.assigned_id, &c.user_hash);
+        state.remove_sources_of(&c.user_hash);
+    } else {
+        // Replaced, or already gone. If the live session holds a different
+        // id (it is LowID now, or came from a new address), our old id may
+        // still map to this user in the id index: retract that mapping
+        // and nothing else. If it holds the same id (a HighID reconnect
+        // from the same address), everything belongs to it.
+        let live_id = state.clients.get(&c.user_hash).map(|e| e.assigned_id);
+        if live_id.is_some_and(|id| id != c.assigned_id) {
+            state.unindex_client_id(c.assigned_id, &c.user_hash);
+        }
+    }
 }
 
 /// Starting (and target) size of each codec buffer.
@@ -728,5 +748,109 @@ mod admission_tests {
     fn zero_max_clients_means_no_cap() {
         let st = state_with(3);
         assert!(login_admitted(&st, &[0xEE; 16], 0));
+    }
+}
+
+#[cfg(test)]
+mod session_end_tests {
+    //! Issue #23: an ended session must not undo a newer session's login.
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Instant;
+
+    fn state() -> ServerState {
+        ServerState::new(
+            Arc::new(crate::filter::ContentFilter::new()),
+            Arc::new(Config::minimal_test_config()),
+        )
+    }
+
+    /// What a login registers, as `dispatch` does it: a fresh handle (fresh
+    /// session identity), the id index, the client map, and one published file.
+    fn login(st: &ServerState, id: u32, ip: [u8; 4], high: bool, file: u8) -> ClientHandle {
+        let h = ClientHandle {
+            user_hash: [7; 16],
+            assigned_id: id,
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: high,
+            connected_at: Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            shared_files: 0,
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            tx: None,
+            last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        st.index_client_id(h.assigned_id, h.user_hash);
+        st.clients.insert(h.user_hash, h.clone());
+        st.add_file_with_source(
+            [file; 16],
+            1000,
+            format!("clip {file}.avi"),
+            (h.user_hash, h.ip, h.port, true),
+        );
+        h
+    }
+
+    fn sources(st: &ServerState) -> usize {
+        st.user_files.get(&[7; 16]).map_or(0, |s| s.len())
+    }
+
+    #[test]
+    fn a_session_that_ends_unreplaced_is_cleaned_up() {
+        let st = state();
+        let s = login(&st, 0x0A00_0001, [1, 0, 0, 10], true, 1);
+        end_session(&st, &s);
+        assert!(st.clients.get(&[7; 16]).is_none());
+        assert!(st.client_id_index.get(&0x0A00_0001).is_none());
+        assert_eq!(sources(&st), 0);
+    }
+
+    #[test]
+    fn a_highid_reconnect_from_the_same_ip_survives_the_old_sessions_end() {
+        let st = state();
+        let old = login(&st, 0x0A00_0001, [1, 0, 0, 10], true, 1);
+        let new = login(&st, 0x0A00_0001, [1, 0, 0, 10], true, 2);
+        // The old task times out after the new login.
+        end_session(&st, &old);
+        let live = st.clients.get(&[7; 16]).expect("live session evicted");
+        assert!(live.same_session(&new));
+        drop(live);
+        assert_eq!(st.client_id_index.get(&0x0A00_0001).map(|e| *e), Some([7; 16]));
+        assert_eq!(sources(&st), 2, "sources the client re-published must stay");
+        // The new session's own end then cleans up as usual.
+        end_session(&st, &new);
+        assert!(st.clients.get(&[7; 16]).is_none());
+        assert_eq!(sources(&st), 0);
+    }
+
+    #[test]
+    fn a_replaced_session_with_another_id_retracts_only_its_old_id() {
+        let st = state();
+        let old = login(&st, 0x0A00_0001, [1, 0, 0, 10], true, 1);
+        let new = login(&st, 0x0A00_0002, [2, 0, 0, 10], true, 2);
+        end_session(&st, &old);
+        assert!(st.client_id_index.get(&0x0A00_0001).is_none(), "stale id left mapped");
+        assert_eq!(st.client_id_index.get(&0x0A00_0002).map(|e| *e), Some([7; 16]));
+        assert!(st.clients.get(&[7; 16]).unwrap().same_session(&new));
+        assert_eq!(sources(&st), 2);
+    }
+
+    #[test]
+    fn handles_of_one_login_are_the_same_session_and_two_logins_are_not() {
+        let st = state();
+        let a = login(&st, 5, [1, 0, 0, 10], true, 1);
+        let a_copy = st.clients.get(&[7; 16]).unwrap().clone();
+        assert!(a.same_session(&a_copy));
+        let b = login(&st, 5, [1, 0, 0, 10], true, 1);
+        assert!(!a.same_session(&b), "same id, same IP, different session");
     }
 }

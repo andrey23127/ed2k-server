@@ -103,6 +103,15 @@ impl ClientHandle {
             .unwrap_or(0)
     }
 
+    /// Are these two handles the same login session? Copies of one session's
+    /// handle (the connection's own, the one in `clients`) share the
+    /// `last_activity_ms` Arc, which each login allocates afresh. assigned_id
+    /// is not an identity: a HighID's id is its IPv4, and a reconnect from the
+    /// same address gets the same one (issue #23).
+    pub fn same_session(&self, other: &ClientHandle) -> bool {
+        std::sync::Arc::ptr_eq(&self.last_activity_ms, &other.last_activity_ms)
+    }
+
     /// Mark the client active right now (any TCP frame or UDP keepalive).
     pub fn touch_activity(&self) {
         self.last_activity_ms
