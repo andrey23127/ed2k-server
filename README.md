@@ -101,9 +101,14 @@ machine that will *run* the binary:
 
 - `target-cpu=native` — optimize for the build host (safe if you build on the
   same machine you deploy to).
-- `target-cpu=znver3` — AMD Zen 3 (Ryzen 5000 / EPYC 7003). This is what the
-  reference VPS uses. Other values: `znver2`, `znver4`, `skylake`,
-  `icelake-server`, or `x86-64-v3` (portable baseline for most CPUs since ~2015).
+- `target-cpu=x86-64-v3` — any CPU with AVX2 (Intel since 2013, every AMD Zen).
+  **The right choice on a VPS:** the hypervisor may hide instructions the model
+  name promises, so a model-specific value such as `znver3` can crash there.
+- A model name (`znver3`, `znver4`, `icelake-server`, …) — only on a dedicated
+  server whose CPU you know.
+
+**[CPU-TUNING.md](CPU-TUNING.md)** has the full table (AMD, Intel, ARM), how to
+check what a machine supports, and how to trace periodic CPU load.
 
 > A binary built for a specific `target-cpu` must only run on that CPU family or
 > newer, or it will crash with an illegal-instruction error. When in doubt, leave

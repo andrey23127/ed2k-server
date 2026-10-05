@@ -28,11 +28,16 @@ JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzz
 # [build]
 # rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-Wl,--gc-sections"]
 #
-# Example: AMD Zen 3 (Ryzen 5000 / EPYC 7003), as on the reference VPS:
-# [build]
-# target = "x86_64-unknown-linux-gnu"
+# VPS / cloud (recommended there): any CPU with AVX2 — Intel since 2013, every
+# AMD Zen. A hypervisor may hide instructions the CPU model has, so prefer a
+# level over a model name on a VPS:
+# [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=-Wl,--gc-sections"]
+#
+# Dedicated server with a known CPU, e.g. AMD Zen 3 (Ryzen 5000 / EPYC 7003):
 # [target.x86_64-unknown-linux-gnu]
 # rustflags = ["-C", "target-cpu=znver3", "-C", "link-arg=-Wl,--gc-sections"]
 #
-# Other values: znver2 (Zen 2), znver4 (Zen 4), skylake/icelake-server (Intel),
-# or x86-64-v3 (portable baseline for most CPUs since ~2015).
+# Other values: znver2/znver4/znver5, skylake, icelake-server, sapphirerapids,
+# x86-64-v2/v4. Full table and how to check a machine: CPU-TUNING.md.
+# After changing this: cargo clean && cargo build --release
