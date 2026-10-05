@@ -28,9 +28,12 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
 - HighID verified by a client-to-client hello, not only a TCP connect: a port
   forwarded to a *different* client behind the same NAT no longer earns HighID.
 - IP filtering in eMule **guarding.p2p** format, with per-range hit statistics.
-- GeoIP country stats, bot/scanner detection, CSAM-publisher banning.
-- Built-in **admin web panel** (status, clients, peers, filters, blocks,
-  settings) bound to localhost.
+- GeoIP country and provider for IPv4 and IPv6 (MaxMind DB, with the
+  `ip-to-country.csv` fallback), bot/scanner detection, CSAM-publisher banning.
+- **Work admission**: bounded sockets, logins, probes, searches and UDP, sized
+  for 50 000 clients and the reconnect storm after a restart.
+- Built-in **admin web panel** (status, clients with server-side search, peers
+  with their names, filters, bots, blocks, settings) bound to localhost.
 - Hot-reloadable filter lists and config without a restart.
 
 > Status: production-used test/MVP build (v0.9.x). The protocol surface is
@@ -141,6 +144,20 @@ Put your runtime data files here too and point the config at them:
   ```
   Set `storage.country_db_path = "/etc/ed2k-server/ip-to-country.csv"`.
 
+- **`ipinfo_lite.mmdb`** (optional) — a MaxMind DB file, IPv4 **and IPv6**, with
+  each network's provider (ASN and name). IPinfo Lite (`ipinfo_lite.mmdb`) and
+  MaxMind GeoLite2 Country files both work:
+  ```bash
+  cd /etc/ed2k-server
+  curl -O https://ed2k.emule-security.org/pub/ipinfo_lite.mmdb.zip
+  unzip ipinfo_lite.mmdb.zip       # produces ipinfo_lite.mmdb
+  ```
+  Next to `ip-to-country.csv` it is used instead; when it is missing or unreadable the server falls back
+  to the CSV (IPv4 only). Another location: `storage.geoip_mmdb_path`; `"off"`
+  disables it. The whole file is held in memory: about 23 MB for IPinfo Lite,
+  against about 7 MB for the CSV. IPinfo Lite data is CC BY-SA 4.0 and requires
+  attribution to IPinfo.
+
 - **`guarding.p2p`** — IP blocklist in eMule format (same format used by
   emule-security). Set `storage.ipfilter_path = "/etc/ed2k-server/guarding.p2p"`.
 
@@ -201,12 +218,12 @@ WantedBy=multi-user.target
 > listeners, the admin socket, logging) and a transient margin for outbound HighID
 > probes and ephemeral gossip sockets during login storms.
 >
-> Rule of thumb: **`LimitNOFILE` ≈ 2 × `max_clients`**. The shipped `65536` is
-> ample for the default `max_clients = 1000`. For a large public server it is
-> **tight**: at `max_clients = 50000` it leaves only ~15k headroom, which a login
-> burst (each new HighID login opens a short-lived outbound probe socket) can eat
-> into. For 50k clients prefer **`131072`**; scale up from there if you raise
-> `max_clients` further.
+> Size it for the worst moment — the **reconnect storm after a restart**, when
+> every client logs in again at once: open sockets (`max_clients` + 10% +
+> `admission.max_pending_logins`) plus one outbound HighID probe per pending
+> login (`admission.max_probe_jobs`). With the `[admission]` defaults that is
+> about **121 000 for `max_clients = 50000`**, so the shipped unit sets
+> **`262144`**. The server warns at startup if the ceilings exceed the limit.
 
 ### ⚠️ Logging is OFF by default — on purpose
 
@@ -255,7 +272,8 @@ a watched file) or needs a **restart**.
 |---|---|---|
 | `tcp_port` | eD2k TCP port (default 4661). All UDP ports are derived from it (see below) | **restart** |
 | `listen_ip` | Bind address for the listeners | restart |
-| `listen_backlog`, `max_frame_size` | Socket / frame tuning | restart |
+| `listen_backlog`, `max_frame_size` | TCP accept backlog (IPv4 and IPv6 listeners; `0` = 1024; the kernel caps it at `net.core.somaxconn`) / max accepted frame size | restart |
+| `max_decompressed_frame_size` | Max bytes one compressed (`0xD4`) frame may decompress to; `max_frame_size` bounds only its compressed wire length, and zlib expands up to ~1000:1. Default 8 000 000; must be at least 1 | new connections |
 | `login_timeout_ms` | Login handshake timeout | restart |
 | `support_crypt` | Advertise protocol obfuscation support | restart |
 | `hairpin_lan_clients` | Let a client on the server's own network reach HighID (see below). Off by default | live |
@@ -332,10 +350,10 @@ a watched file) or needs a **restart**.
 ### `[limits]`
 | Key | Meaning | Apply |
 |---|---|---|
-| `max_clients` | Max concurrent clients | restart |
-| `max_clients_per_ip` | Per-IP connection cap | restart |
-| `soft_limit_files`, `hard_limit_files` | Per-client offered-file limits | restart |
-| `max_string_size` | Max accepted string length | restart |
+| `max_clients` | Max concurrent logged-in clients, also advertised (`ST_MAXUSERS`). Reserved atomically before the login does any work, so concurrent logins cannot overshoot it. A login beyond it gets "Server full" and is closed; a client replacing its own stale session is always let in. `0` = no cap | live |
+| `max_clients_per_ip` | Max open TCP connections per client IP — per `admission.ipv6_source_prefix_bits` prefix for IPv6 — checked at accept before any work is done. Loopback is exempt; `0` = no cap. The Status tab shows the busiest IP, so you can check the value against real traffic (a provider NAT puts many users behind one address) | live |
+| `soft_limit_files`, `hard_limit_files` | Advertised to clients (`ST_SOFTFILES` / `ST_HARDFILES`) and enforced with Lugdunum semantics. `soft_limit_files` is the per-client indexing budget: new files beyond it are not indexed and the client gets one server message per connection; re-offers of files it already sources and filtered files use no budget; the session stays up. `hard_limit_files` is a per-packet bound: an `OFFERFILES` declaring that many records or more is rejected and the connection closed — keep it well above 200 (the eMule batch size). `0` disables either | live |
+| `max_string_size` | Max bytes STORED for a file name or nick (cut at a character boundary). The content filter always sees the full name first. `0` = no cap | live |
 | `ping_delay_seconds` | Server keep-alive ping interval | restart |
 | `max_search_results` | Results returned per search, across all pages; best-sourced first. Default 200, ceiling 5000. One value for every client — unlike Lugdunum, which varies it by zlib support and halves it for LowID | live |
 | `search_rank_scan` | Candidates examined when ranking one search. Past it, ranking covers only what was seen; the share of searches that hit it is shown on the Status tab. Default 20000, must be ≥ `max_search_results` | live |
@@ -396,7 +414,57 @@ why.
 | Key | Meaning | Apply |
 |---|---|---|
 | `ipfilter_path` | Path to `guarding.p2p` | **live** (SIGHUP reload) |
-| `country_db_path` | Path to `ip-to-country.csv` | restart |
+| `country_db_path` | Path to `ip-to-country.csv` (IPv4) | restart; a new file at the path reloads live |
+| `geoip_mmdb_path` | MaxMind DB tried before the CSV (IPv4 + IPv6). Empty = `ipinfo_lite.mmdb` next to the CSV; `"off"` = CSV only | restart; a new file at the path reloads live |
+
+### `[admission]`
+Server-wide ceilings on the work remote peers can cause, however the load is
+spread across addresses, listeners and address families (issue #25). All are
+**restart-only** (the admin config editor says so when they change, including
+the open-socket ceiling derived from `max_clients`), and none accepts `0` — a
+zero ceiling is refused at startup.
+The whole section is optional; the defaults are below.
+
+The defaults are sized for the load the server is designed for — **50 000
+clients (about 45 000 of them LowID) and 30 000 000 files** — and for its worst
+moment, a restart, after which every client reconnects at once. Each value
+leans high: a ceiling costs memory only while it is in use, whereas one that is
+too low refuses real users. The pending-login pool is the one a restart
+stresses: a login holds its slot through the obfuscation handshake, the login
+and the HighID probe, and for a LowID client, whose port does not answer, the
+probe lasts the whole `network.login_timeout_ms`. On a live server a restart
+with 9 000 clients overflowed 4 096 pending slots, a peak above 0.45 pending per
+client — about 23 000 at 50 000 clients; the default is 32 768. A smaller
+server can lower these to save memory during the storm, but need not.
+
+| Key | Default | When full |
+|---|---|---|
+| `max_open_tcp_connections` | `max_clients` + 10% + `max_pending_logins` (200 000 if `max_clients` = 0) | the socket is closed at accept, before a task exists. Keep it under `LimitNOFILE`; the server warns at startup if it is not |
+| `max_pending_logins` | 32 768 | same — sockets still in handshake or login, including the HighID probe. IP-filtered addresses are dropped before they take a slot. Sized for the reconnect storm after a restart (see below) |
+| `max_pending_logins_per_source` | 32 | same, per source (IPv4 address, IPv6 prefix), so a few sources cannot hold the whole pending pool. Loopback exempt |
+| `max_probe_jobs` | `max_pending_logins` + 64 | HighID probes, at login and in the background together (background checks are at most 64, so logins always find one). A login that finds none free gets **LowID** at once rather than waiting |
+| `max_retry_tasks` | 1024 | hole-punch re-coordination is skipped; one pending retry per (requester, target) pair at most |
+| `session_relay_per_second`, `session_relay_burst` | 10, 200 | per session, callback and hole-punch requests. Over it a callback gets `OP_CALLBACK_FAIL`; a hole-punch request is ignored |
+| `max_search_jobs` | 8 | searches run off the async runtime, at most this many at once |
+| `max_queued_tcp_searches`, `tcp_search_wait_ms` | 512, 2000 | a TCP search waits in arrival order behind at most this many others, for at most this long, then gets an empty result |
+| `max_queued_udp_searches`, `udp_search_wait_ms` | 128, 500 | a UDP search waits the same way, from a task (never in the receive loop), in its own smaller queue so UDP cannot crowd out TCP; beyond it, dropped |
+| `max_rate_state_entries` | 524 288 (≈ 50 MB at most) | UDP sources tracked at once; a new source beyond it is refused. Idle entries are forgotten every 30 s |
+| `ipv6_source_prefix_bits` | 64 | IPv6 addresses sharing this prefix are one source (UDP budgets and the TCP per-IP limit). IPv4 is per address; IPv4-mapped IPv6 counts as its IPv4 |
+| `udp_global_credits_per_second`, `udp_global_burst_credits` | 200 000, 400 000 | server-wide UDP budget, checked first |
+| `udp_source_credits_per_second`, `udp_source_burst_credits` | 60, 1000 | per-source UDP budget, checked second |
+| `udp_rate_enforce` | `false` | **Off = observe:** over-budget UDP packets are counted but still served. Watch the counters on the Status tab, adjust the budgets, then set `true` to drop them |
+| `readiness_window_secs` | 30 | `/api/ready` returns 503 once open sockets, pending logins or search jobs have stayed full this long |
+
+UDP costs, in credits: every datagram 1 on arrival (before any parsing);
+an obfuscated datagram that misses the decode cache +4; a search +9; a source
+request +1 per file hash (up to 64); a server-list request or response +20.
+Every UDP listener and both address families share the same budgets.
+
+`GET /api/admission` returns every gauge and counter (fixed cardinality, no
+addresses); the Status tab shows a one-line summary. `GET /api/ready` is
+readiness, separate from the diagnostic `/api/health`.
+`contrib/overload_test.py` with `contrib/overload_test.toml` drives a running
+server past every ceiling and checks that it stays bounded and recovers.
 
 ### `[admin]`
 | Key | Meaning | Apply |
@@ -409,7 +477,7 @@ why.
 |---|---|---|
 | `log.level`, `log.connection_trace` | Log verbosity (see logging note above) | restart |
 | `welcome.messages` | MOTD lines sent on login | restart |
-| `worker_threads` | Tokio worker threads (0 = auto) | restart |
+| `worker_threads` | Tokio worker threads. Default 1 (single-threaded runtime); 0 is treated as 1 | restart |
 
 **Live changes that take effect without a restart:** the CSAM filter lists —
 **L1 jargon**, **L3 ban list(s)**, **L4 extra terms**, **L5 filter list(s)** and
@@ -673,6 +741,16 @@ Rules the server applies:
 - Answers carrying IPv6 records bypass the source cache, which is shared with
   clients that cannot parse them.
 
+What else covers IPv6:
+
+- **Country and provider** — from a MaxMind DB (`ipinfo_lite.mmdb`); the CSV
+  knows IPv4 only. See *Installing on a VPS* → *Configuration and data files*.
+- **Bot detection and its 24-hour bans, the per-IP connection limit and the
+  UDP budgets** count an IPv6 client by its /64 (`admission.ipv6_source_prefix_bits`):
+  a host has a whole /64 to rotate through, so per-address counting would never
+  see a flood. An IPv4-mapped address counts as its IPv4.
+- **Not covered: the IP filter.** `guarding.p2p` carries IPv4 ranges only.
+
 ---
 
 ## Server lists & IP filter
@@ -717,6 +795,23 @@ in-use bytes and per-file cost). The Status tab also carries search counters
 (ranking cap hits, unknown words dropped), IPv6 clients and publishers, and the
 HighID hello-check counters.
 
+The *Clients* tab searches on the server: free text matches an address or a
+nick (case-insensitive), an IPv4 CIDR such as `82.48.0.0/16` matches by
+network, and country, software and High/LowID narrow it further; results are
+sorted and paged 100 at a time. The same filter is available as
+`GET /api/clients/search?q=&country=&software=&id=high|low&sort=connected|files|ip|nick|country|software&dir=asc|desc&offset=&limit=`
+(limit at most 500). `GET /api/clients` still returns every connected client
+for scripts.
+
+The *Peers* tab shows each listed server's name, description and version (its
+answer to UDP `0xA2`), its user and file counts (`0x96`), and its country. Each
+peer is asked at most once an hour on UDP `TCP+4`; a peer that answers only
+obfuscated UDP shows "no answer".
+
+Country flags are drawn with a font built into the binary (a 78 KB Twemoji
+subset), because Windows has no flag glyphs and Chrome, Edge and Opera there
+showed two letters instead. The page loads nothing from other hosts.
+
 `GET /api/highid_mismatches` exports the recent wrong-hash cases of the HighID
 check (the last 1000) with a summary: which answering clients are connected
 from the same address, repeated addresses and hashes, and whether a mark was
@@ -735,3 +830,9 @@ Released under the **MIT License** — see [`LICENSE`](LICENSE).
   eserver and the broader **eMule / eDonkey2000** community.
 - GeoIP and server-list data courtesy of emule-security.org and
   [peerates.net](https://peerates.net/).
+- IP address data in `ipinfo_lite.mmdb`, when used, is powered by
+  [IPinfo](https://ipinfo.io) (CC BY-SA 4.0).
+- Country flags in the admin panel: [Twemoji](https://github.com/twitter/twemoji)
+  graphics (CC-BY 4.0), as subset into the "Twemoji Country Flags" font by
+  [country-flag-emoji-polyfill](https://github.com/talkjs/country-flag-emoji-polyfill)
+  (MIT); see `assets/TwemojiCountryFlags-LICENSE.md`.

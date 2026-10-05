@@ -220,56 +220,69 @@ impl AdmissionConfig {
     }
 }
 
+// [admission] defaults are sized for the load the server is designed for —
+// 50 000 clients (about 45 000 of them LowID) and 30 000 000 files — and for
+// its worst moment: a restart, after which every client reconnects at once.
+// A ceiling that is too high costs memory only while it is used; one that is
+// too low refuses real users, so every value leans high.
+//
+// The login storm, measured on a live server: a restart with 9 000 clients
+// overflowed 4 096 pending logins (1 157 refused), i.e. it peaked above 0.45
+// pending per client. A pending login lives through the obfuscation
+// handshake, the login and the HighID probe, which for a LowID client — whose
+// port does not answer — lasts the whole login_timeout_ms. At 50 000 clients
+// that ratio is ~23 000 at once; 32 768 leaves a margin. Every pending login
+// may run one probe, so the probe pool (pending + 64) matches it.
 fn default_adm_ready_window() -> u64 {
     30
 }
 fn default_adm_pending() -> u32 {
-    4096
+    32_768
 }
 fn default_adm_pending_per_source() -> u32 {
-    8
-}
-fn default_adm_udp_search_queue() -> u32 {
     32
 }
+fn default_adm_udp_search_queue() -> u32 {
+    128
+}
 fn default_adm_udp_search_wait() -> u64 {
-    250
+    500
 }
 fn default_adm_retries() -> u32 {
-    256
+    1024
 }
 fn default_adm_relay_rate() -> u32 {
-    5
+    10
 }
 fn default_adm_relay_burst() -> u32 {
-    100
+    200
 }
 fn default_adm_search_jobs() -> u32 {
-    4
+    8
 }
 fn default_adm_search_queue() -> u32 {
-    128
+    512
 }
 fn default_adm_search_wait() -> u64 {
     2000
 }
 fn default_adm_rate_entries() -> u32 {
-    262_144
+    524_288
 }
 fn default_adm_v6_bits() -> u8 {
     64
 }
 fn default_adm_udp_global_rate() -> u32 {
-    100_000
-}
-fn default_adm_udp_global_burst() -> u32 {
     200_000
 }
+fn default_adm_udp_global_burst() -> u32 {
+    400_000
+}
 fn default_adm_udp_source_rate() -> u32 {
-    20
+    60
 }
 fn default_adm_udp_source_burst() -> u32 {
-    200
+    1000
 }
 
 /// Update service for the filter data files.
@@ -376,6 +389,10 @@ pub struct UpdateUrls {
     pub hash_filter: String,
     #[serde(default)]
     pub whitelist_hashes: String,
+    /// MaxMind DB for GeoIP (IPv4 + IPv6), e.g. a zipped ipinfo_lite.mmdb.
+    /// No compiled-in default: set it to the file you publish.
+    #[serde(default)]
+    pub geoip_mmdb: String,
 }
 
 impl Default for UpdatesConfig {
@@ -437,6 +454,7 @@ impl UpdatesConfig {
             T::HashBanlist => &self.urls.hash_banlist,
             T::HashFilter => &self.urls.hash_filter,
             T::WhitelistHashes => &self.urls.whitelist_hashes,
+            T::GeoipMmdb => &self.urls.geoip_mmdb,
         };
         if configured.trim().is_empty() {
             t.default_url().to_string()
@@ -482,6 +500,12 @@ pub struct StorageConfig {
     /// Format: start_int,end_int,ISO2,CountryName. Leave empty to disable.
     #[serde(default)]
     pub country_db_path: String,
+    /// MaxMind DB file for GeoIP (IPv4 and IPv6, with provider names), tried
+    /// before `country_db_path`. Empty = `ipinfo_lite.mmdb` in the same
+    /// directory as `country_db_path`; `"off"` = use the CSV only. When the
+    /// file is missing or unreadable the CSV is used.
+    #[serde(default)]
+    pub geoip_mmdb_path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1060,6 +1084,8 @@ export_interval_secs = 3600
 # The two public files have compiled-in defaults and need no credentials.
 guarding_p2p = "https://ed2k.emule-security.org/pub/guarding.p2p"
 ip_to_country = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# GeoIP for IPv4 + IPv6 (MaxMind DB). Public data, no default URL.
+geoip_mmdb = ""
 # The rest identify material and are fetched with the access key above.
 csam_jargon = ""
 csam_terms_extra = ""
@@ -1220,6 +1246,8 @@ export_interval_secs = 3600
 # The two public files have compiled-in defaults and need no credentials.
 guarding_p2p = "https://ed2k.emule-security.org/pub/guarding.p2p"
 ip_to_country = "https://ed2k.emule-security.org/pub/ip-to-country.csv.zip"
+# GeoIP for IPv4 + IPv6 (MaxMind DB). Public data, no default URL.
+geoip_mmdb = ""
 # The rest identify material and are fetched with the access key above.
 csam_jargon = ""
 csam_terms_extra = ""

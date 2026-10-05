@@ -91,8 +91,9 @@ chown -R updauth:updauth /srv/updates/state
 chmod 700 /srv/updates/state
 ```
 
-`public/` holds `guarding.p2p` and `ip-to-country.csv.zip` — public data, no
-credentials. `private/` holds the six files that describe detection or index
+`public/` holds `guarding.p2p`, `ip-to-country.csv.zip` and, optionally,
+`ipinfo_lite.mmdb.zip` (GeoIP for IPv4 + IPv6) — public data, no credentials.
+IPinfo Lite is CC BY-SA 4.0: publishing it means crediting IPinfo. `private/` holds the six files that describe detection or index
 material. Each file sits next to its `.sig`.
 
 ---
@@ -206,6 +207,7 @@ export_interval_secs = 3600
 [updates.urls]
 guarding_p2p     = "https://ed2k.example.org/pub/guarding.p2p"
 ip_to_country    = "https://ed2k.example.org/pub/ip-to-country.csv.zip"
+geoip_mmdb       = "https://ed2k.example.org/pub/ipinfo_lite.mmdb.zip"
 csam_jargon      = "https://ed2k.example.org/files/csam_jargon.txt"
 csam_terms_extra = "https://ed2k.example.org/files/csam_terms_extra.txt"
 layer2_terms     = "https://ed2k.example.org/files/layer2_terms.txt"

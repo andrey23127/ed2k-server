@@ -59,11 +59,18 @@ pub struct FileRecord {
 
 impl FileRecord {
     /// Number of sources that hold a complete copy, for the FT_COMPLETE_SOURCES
-    /// (0x30) search-result tag. We count every source: most clients share
-    /// downloads-in-progress, and a file's lifetime source set is the useful
-    /// signal for the downloader. (Moved here from the former FileEntry.)
+    /// (0x30) search-result tag (issue #28).
+    ///
+    /// Only sources offered as complete count. eMule and aMule offer a part
+    /// file with the incomplete marker (0xFCFCFCFC/0xFCFC), and aMule also
+    /// uses it for a complete file whose local verify found corrupt parts;
+    /// a re-offer updates the flag. A source offered without markers (old
+    /// clients, a real HighID id) is stored as complete. Lugdunum counts the
+    /// same way: a file only partial downloaders hold shows no complete
+    /// source, which is what eMule's "complete sources" column and aMule's
+    /// "total (complete)" are for. This server used to count every source.
     pub fn complete_source_count(&self) -> u32 {
-        self.sources.len() as u32
+        self.sources.iter().filter(|s| s.complete()).count() as u32
     }
 }
 
@@ -786,6 +793,30 @@ mod tests {
 
     fn src() -> Source {
         Source::new([1u8; 16], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, true)
+    }
+
+    #[test]
+    fn complete_sources_count_only_complete_copies_and_follow_re_offers() {
+        // Issue #28: a part file offered with the incomplete marker is a
+        // source, but not a complete one.
+        let slab = FileSlab::new();
+        let h = [9u8; 16];
+        let partial = |uh: u8| Source::new([uh; 16], IpAddr::V4(Ipv4Addr::new(10, 0, 0, uh)), 4662, false);
+        let complete = |uh: u8| Source::new([uh; 16], IpAddr::V4(Ipv4Addr::new(10, 0, 0, uh)), 4662, true);
+        slab.get_or_insert(h, 100, "f".into(), partial(1));
+        let r = slab.get_by_hash(&h).unwrap();
+        assert_eq!((r.sources.len(), r.complete_source_count()), (1, 0));
+        slab.add_or_refresh_source(&h, complete(2));
+        slab.add_or_refresh_source(&h, partial(3));
+        let r = slab.get_by_hash(&h).unwrap();
+        assert_eq!((r.sources.len(), r.complete_source_count()), (3, 1));
+        // The download finishes and the client re-offers: it counts now.
+        slab.add_or_refresh_source(&h, complete(1));
+        assert_eq!(slab.get_by_hash(&h).unwrap().complete_source_count(), 2);
+        // A complete copy re-offered as incomplete (aMule, corrupt parts).
+        slab.add_or_refresh_source(&h, partial(2));
+        let r = slab.get_by_hash(&h).unwrap();
+        assert_eq!((r.sources.len(), r.complete_source_count()), (3, 1));
     }
 
     #[test]

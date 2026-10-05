@@ -58,10 +58,12 @@ pub enum Target {
     HashBanlist,
     HashFilter,
     WhitelistHashes,
+    /// MaxMind DB (IPinfo Lite or GeoLite2 Country): GeoIP for IPv4 and IPv6.
+    GeoipMmdb,
 }
 
 impl Target {
-    pub const ALL: [Target; 8] = [
+    pub const ALL: [Target; 9] = [
         Target::CsamJargon,
         Target::CsamTermsExtra,
         Target::Layer2Terms,
@@ -70,6 +72,7 @@ impl Target {
         Target::HashBanlist,
         Target::HashFilter,
         Target::WhitelistHashes,
+        Target::GeoipMmdb,
     ];
 
     /// Stable identifier used in the URL of the admin endpoint and as the config
@@ -85,6 +88,7 @@ impl Target {
             Target::HashBanlist => "hash_banlist",
             Target::HashFilter => "hash_filter",
             Target::WhitelistHashes => "whitelist_hashes",
+            Target::GeoipMmdb => "geoip_mmdb",
         }
     }
 
@@ -99,6 +103,9 @@ impl Target {
             Target::HashBanlist => "hash_banlist.txt",
             Target::HashFilter => "hash_filter.txt",
             Target::WhitelistHashes => "whitelist_hashes.txt",
+            // Must match geoip::DEFAULT_MMDB_NAME: the server looks for this
+            // name next to the CSV.
+            Target::GeoipMmdb => crate::filter::geoip::DEFAULT_MMDB_NAME,
         }
     }
 
@@ -112,6 +119,7 @@ impl Target {
             Target::HashBanlist => "hash banlist (L3)",
             Target::HashFilter => "filter list (L5)",
             Target::WhitelistHashes => "hash whitelist",
+            Target::GeoipMmdb => "GeoIP database, IPv4 + IPv6 (mmdb)",
         }
     }
 
@@ -128,12 +136,15 @@ impl Target {
         )
     }
 
-    /// Two files are public by design and carry no access control:
-    ///   * the poison/decoy list, which is harmless to leak and useful to share;
-    ///   * third-party data (IP ranges, country ranges) that is public anyway.
+    /// Third-party data that is public anyway carries no access control: the
+    /// IP filter and the two GeoIP databases (CSV and MaxMind DB).
+    ///
     /// Everything else identifies material and is fetched with credentials.
     pub fn needs_credentials(self) -> bool {
-        !matches!(self, Target::GuardingP2p | Target::IpToCountry)
+        !matches!(
+            self,
+            Target::GuardingP2p | Target::IpToCountry | Target::GeoipMmdb
+        )
     }
 
     /// Compiled-in default URL, used when config leaves the entry empty.
@@ -522,6 +533,22 @@ fn u32le(b: &[u8], at: usize) -> Result<u32, UpdateError> {
 /// section in the vocabulary file exists for exactly this reason and must be
 /// exercised here, before the file is installed, not after.
 pub fn validate(target: Target, bytes: &[u8]) -> Result<u64, UpdateError> {
+    // The one binary format: open it with the runtime reader and resolve a
+    // couple of addresses. Entries = search-tree nodes, which is what the
+    // collapse guard compares.
+    if target == Target::GeoipMmdb {
+        let db = crate::filter::mmdb::Mmdb::from_bytes(bytes.to_vec())
+            .map_err(|e| UpdateError(format!("not a usable MaxMind DB: {e}")))?;
+        let probes = ["8.8.8.8", "1.1.1.1", "82.48.45.246", "2001:4860:4860::8888"];
+        if !probes.iter().any(|p| {
+            db.lookup(p.parse().expect("literal"))
+                .and_then(|r| r.country_code)
+                .is_some()
+        }) {
+            bail!("MaxMind DB opened but resolves no country for well-known addresses");
+        }
+        return Ok(db.node_count() as u64);
+    }
     // Every one of these formats is line-oriented text. Binary content is a
     // wrong-URL accident (an HTML error page, an unextracted archive) and is
     // worth catching early with a clear message.
@@ -609,6 +636,9 @@ pub fn validate(target: Target, bytes: &[u8]) -> Result<u64, UpdateError> {
             }
             Ok(ranges)
         }
+
+        // Handled before the text checks above.
+        Target::GeoipMmdb => bail!("internal: the MaxMind DB is validated as binary"),
 
         Target::IpToCountry => {
             let mut n = 0u64;
@@ -1127,6 +1157,16 @@ mod tests {
         assert!(validate(Target::IpToCountry, b"nope\n").is_err());
         assert!(validate(Target::IpToCountry, b"16777216,16777471,AU,Australia\n").is_ok());
         assert!(validate(Target::GuardingP2p, b"Some range:1.2.3.4-1.2.3.9\n").is_ok());
+    }
+
+    #[test]
+    fn mmdb_validation_rejects_text_and_garbage() {
+        assert!(validate(Target::GeoipMmdb, b"16777216,16777471,AU,Australia\n").is_err());
+        assert!(validate(Target::GeoipMmdb, b"").is_err());
+        assert!(validate(Target::GeoipMmdb, b"\xAB\xCD\xEFMaxMind.com\xe0").is_err());
+        assert!(!Target::GeoipMmdb.needs_credentials());
+        assert!(!Target::GeoipMmdb.supports_merge());
+        assert_eq!(Target::GeoipMmdb.filename(), "ipinfo_lite.mmdb");
     }
 
     #[test]

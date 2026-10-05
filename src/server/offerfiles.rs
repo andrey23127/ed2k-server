@@ -181,9 +181,10 @@ pub fn handle_offerfiles(
                         .entry(layer.stat_key().to_string())
                         .or_insert(0) += 1;
                     if counts {
-                        if let std::net::IpAddr::V4(v4) = client.ip {
-                            *state.csam_unique_ips.entry(v4).or_insert(0) += 1;
-                        }
+                        *state
+                            .csam_unique_ips
+                            .entry(state.source_key(client.ip))
+                            .or_insert(0) += 1;
                     }
                 }
                 // Q1: ban CSAM publishers by USER_HASH (stable across the IP
@@ -511,7 +512,6 @@ mod soft_limit_tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),
@@ -720,7 +720,6 @@ mod string_size_tests {
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),

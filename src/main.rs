@@ -405,6 +405,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
     // process can actually hold that many descriptors.
     {
         let open_tcp = state.admission.open_tcp.cap() as u64;
+        // Each HighID probe is an outbound socket on top of the inbound ones;
+        // in a reconnect storm every pending login may hold one.
+        let probes = state.admission.probes.cap() as u64;
         let mut rl = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -413,12 +416,14 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
             #[allow(clippy::unnecessary_cast)] // rlim_t's width differs by platform
             let fds = rl.rlim_cur as u64;
-            if open_tcp + 1024 > fds {
+            if open_tcp + probes + 1024 > fds {
                 warn!(
                     open_tcp_ceiling = open_tcp,
+                    probe_ceiling = probes,
                     fd_limit = fds,
-                    "admission.max_open_tcp_connections is near or above the file-descriptor limit; \
-                     raise LimitNOFILE or lower the ceiling, or accept() will fail before admission refuses"
+                    "admission: open sockets plus HighID probes can exceed the file-descriptor limit; \
+                     raise LimitNOFILE (see README) or lower the ceilings, or accept() and probes \
+                     will fail before admission refuses"
                 );
             }
         }
@@ -440,11 +445,18 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         let f = IpFilter::load(ipfilter_path);
         *state.ip_filter.write().await = f;
     }
-    // Country database (ip-to-country.csv). Used for stats only, not blocking.
+    // Country database: the MaxMind DB (IPv4 + IPv6) if present, else
+    // ip-to-country.csv (IPv4). Used for display and stats only, not blocking.
     {
-        use ed2k_server::filter::geoip::CountryDb;
-        let country_path = std::path::Path::new(&cfg.storage.country_db_path);
-        *state.country_db.write().await = CountryDb::load(country_path);
+        use ed2k_server::filter::geoip::{mmdb_path, CountryDb};
+        let mmdb = mmdb_path(&cfg.storage.geoip_mmdb_path, &cfg.storage.country_db_path);
+        let csv = cfg.storage.country_db_path.clone();
+        let db = tokio::task::spawn_blocking(move || {
+            CountryDb::load(mmdb.as_deref(), std::path::Path::new(&csv))
+        })
+        .await
+        .unwrap_or_default();
+        *state.country_db.write().await = db;
     }
 
     // The file index is NOT persisted across restarts (snapshots were removed):
@@ -1270,6 +1282,59 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         info!("server_list verification probe started (60s interval, 50/batch)");
     }
 
+    // Peer self-descriptions for the admin Peers tab. Each listed server is
+    // asked, at most once an hour, for its name and description (UDP 0xA2)
+    // and its user/file counts (0x96), on UDP TCP+4 from the main socket; the
+    // replies (0xA3, 0x97) are recorded by the UDP handlers into
+    // state.peer_info. A short challenge without the 0x55AA marker asks for
+    // the plain 0x97 only, so this never touches the gossip ServerKeys.
+    // Cost: two small datagrams per peer per hour.
+    {
+        let state_pi = Arc::clone(&state);
+        let sock_pi = Arc::clone(&udp_socket);
+        tokio::spawn(async move {
+            const BATCH: usize = 50;
+            const REASK: std::time::Duration = std::time::Duration::from_secs(3600);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await;
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            loop {
+                let list: Vec<std::net::SocketAddrV4> =
+                    state_pi.server_list.read().await.iter().copied().collect();
+                let listed: std::collections::HashSet<_> = list.iter().copied().collect();
+                // Peers that left the list take their entry with them.
+                state_pi.peer_info.retain(|k, _| listed.contains(k));
+                let now = std::time::Instant::now();
+                let mut due: Vec<(Option<std::time::Instant>, std::net::SocketAddrV4)> = list
+                    .iter()
+                    .map(|a| (state_pi.peer_info.get(a).and_then(|e| e.asked_at), *a))
+                    .filter(|(at, _)| at.map_or(true, |t| now.duration_since(t) >= REASK))
+                    .collect();
+                // Never asked first, then the longest ago.
+                due.sort_by_key(|(at, _)| *at);
+                for (_, addr) in due.into_iter().take(BATCH) {
+                    let r = rand_u16_simple() as u32;
+                    let desc_challenge = (r << 16) | 0xF0FF;
+                    state_pi.peer_info.entry(addr).or_default().desc_challenge = desc_challenge;
+                    if let Some(mut e) = state_pi.peer_info.get_mut(&addr) {
+                        e.asked_at = Some(now);
+                    }
+                    let dst = std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+                        *addr.ip(),
+                        addr.port().wrapping_add(4),
+                    ));
+                    let mut a2 = vec![0xE3u8, 0xA2];
+                    a2.extend_from_slice(&desc_challenge.to_le_bytes());
+                    let mut ping = vec![0xE3u8, 0x96];
+                    ping.extend_from_slice(&(0x1234_0000 | r).to_le_bytes());
+                    let _ = sock_pi.send_to(&a2, dst).await;
+                    let _ = sock_pi.send_to(&ping, dst).await;
+                }
+                tick.tick().await;
+            }
+        });
+    }
+
     // Helper for the probe task — tiny xorshift since we don't need crypto-grade randomness.
     fn rand_u16_simple() -> u16 {
         use std::cell::Cell;
@@ -1479,23 +1544,24 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // A failed load returns an empty database, which would silently
                 // wipe the stats, so the swap only happens when the new table
                 // actually has ranges.
-                if !cfg_reload.storage.country_db_path.is_empty() {
-                    use ed2k_server::filter::geoip::CountryDb;
-                    let path = std::path::Path::new(&cfg_reload.storage.country_db_path);
-                    let new_db = CountryDb::load(path);
-                    let ranges = new_db.range_count();
-                    if ranges > 0 {
+                {
+                    use ed2k_server::filter::geoip::{mmdb_path, CountryDb};
+                    let mmdb = mmdb_path(
+                        &cfg_reload.storage.geoip_mmdb_path,
+                        &cfg_reload.storage.country_db_path,
+                    );
+                    let csv = cfg_reload.storage.country_db_path.clone();
+                    let new_db = tokio::task::spawn_blocking(move || {
+                        CountryDb::load(mmdb.as_deref(), std::path::Path::new(&csv))
+                    })
+                    .await
+                    .unwrap_or_default();
+                    if new_db.is_loaded() {
+                        let what = new_db.describe();
                         *state_reload.country_db.write().await = new_db;
-                        info!(
-                            ranges,
-                            path = &cfg_reload.storage.country_db_path,
-                            "GeoIP database reloaded"
-                        );
-                    } else {
-                        warn!(
-                            path = &cfg_reload.storage.country_db_path,
-                            "GeoIP reload produced no ranges; keeping current table"
-                        );
+                        info!(db = %what, "GeoIP database reloaded");
+                    } else if state_reload.country_db.read().await.is_loaded() {
+                        warn!("GeoIP reload found no usable database; keeping the current one");
                     }
                 }
             }

@@ -474,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "ed2k-server"
-version = "0.9.76"
+version = "0.9.77"
 dependencies = [
  "anyhow",
  "arc-swap",

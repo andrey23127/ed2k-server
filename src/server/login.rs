@@ -996,14 +996,14 @@ pub async fn handle_login(
     }
 
     // ─── Country lookup (for per-client field, shown in web UI) ──────────
-    let country = if let IpAddr::V4(v4) = peer_ip {
-        let db = state.country_db.read().await;
-        db.lookup(v4)
-            .map(|(code, _)| code)
-            .unwrap_or_else(|| "??".to_string())
-    } else {
-        "??".to_string()
-    };
+    // IPv4 and IPv6 alike when a MaxMind DB is loaded; the CSV knows IPv4 only.
+    let country = state
+        .country_db
+        .read()
+        .await
+        .lookup(peer_ip)
+        .map(|(code, _)| code)
+        .unwrap_or_else(|| "??".to_string());
 
     // ─── Client software detection ────────────────────────────────────────
     // Multi-pass detection using all available tags:
@@ -1171,7 +1171,6 @@ pub async fn handle_login(
         connected_at: Instant::now(),
         country: country.clone(),
         software: software.clone(),
-        shared_files: 0,
         csam_attempts: 0,
         soft_limit_warned: false,
         slot: Default::default(),
@@ -1247,7 +1246,6 @@ mod tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),
@@ -1357,7 +1355,6 @@ mod tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),

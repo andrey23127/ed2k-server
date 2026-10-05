@@ -195,33 +195,64 @@ pub async fn handle_admitted_connection(
     // dark on BOTH TCP and UDP for that whole span AND the socket somehow never
     // closed — effectively never, but bounds truly leaked sessions.
     let logged_in_backstop = std::time::Duration::from_secs(6 * 3600);
+    // A session that a newer login of the same user has replaced is no
+    // longer in `clients`: it gets no server pings, its files and sources
+    // belong to the new session, and it holds nothing but a socket and a
+    // per-IP slot. When the peer abandons such a socket without closing it
+    // (seen live: one address kept 100 of them open, silent for 3-5 hours,
+    // each until the 6 h backstop), only a short silence limit frees it. It
+    // is not closed outright: two installs sharing one user hash would then
+    // knock each other off in a loop, and a copy that still talks is kept.
+    let replaced_idle = std::time::Duration::from_secs(10 * 60);
+    // How often a logged-in session re-checks whether it has been replaced.
+    let replaced_recheck = std::time::Duration::from_secs(60);
     let mut last_activity = tokio::time::Instant::now();
 
     loop {
         // The next deadline depends on whether the client has logged in yet.
-        let deadline = if client.is_none() {
+        let mut replaced = false;
+        let (deadline, wake) = if let Some(c) = &client {
+            let now = tokio::time::Instant::now();
+            let tcp_idle = last_activity.elapsed();
+            replaced = !state
+                .clients
+                .get(&c.user_hash)
+                .is_some_and(|e| e.same_session(c));
+            let deadline = if replaced {
+                // Only this socket's own traffic counts: the shared UDP clock
+                // is bumped through the live session's handle, not this one.
+                now + replaced_idle.saturating_sub(tcp_idle)
+            } else {
+                // Logged in: rely on the socket for liveness. Use the loose
+                // backstop, refreshed by the more recent of TCP / UDP activity,
+                // so a NAT-T LowID source that only speaks UDP — or a plain
+                // client that is simply quiet — is NOT evicted while its TCP
+                // link is alive.
+                let udp_idle = std::time::Duration::from_millis(c.idle_ms());
+                now + logged_in_backstop.saturating_sub(tcp_idle.min(udp_idle))
+            };
+            (deadline, deadline.min(now + replaced_recheck))
+        } else {
             // Not logged in: tight timeout guards against half-open / scanner
             // sockets that complete the crypto handshake but never LOGINREQUEST.
-            login_deadline
-        } else {
-            // Logged in: rely on the socket for liveness. Use the loose backstop,
-            // refreshed by the more recent of TCP / UDP activity, so a NAT-T
-            // LowID source that only speaks UDP — or a plain client that is
-            // simply quiet — is NOT evicted while its TCP link is alive.
-            let udp_idle = client
-                .as_ref()
-                .map(|c| std::time::Duration::from_millis(c.idle_ms()))
-                .unwrap_or(logged_in_backstop);
-            let tcp_idle = last_activity.elapsed();
-            let effective_idle = tcp_idle.min(udp_idle);
-            tokio::time::Instant::now() + logged_in_backstop.saturating_sub(effective_idle)
+            (login_deadline, login_deadline)
         };
 
         tokio::select! {
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = tokio::time::sleep_until(wake) => {
+                if tokio::time::Instant::now() < deadline {
+                    // A re-check tick, not a timeout.
+                    continue;
+                }
                 if client.is_none() {
                     debug!(ip = %peer.ip(),
                            "login timeout — no LOGINREQUEST received, dropping");
+                } else if replaced {
+                    debug!(ip = %peer.ip(), idle_s = replaced_idle.as_secs(),
+                           "replaced session silent — closing its socket");
+                    state
+                        .replaced_sessions_closed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     // DIAGNOSTIC: info-level so the operator can see exactly when
                     // and why a logged-in client is evicted, and which clock was
@@ -874,7 +905,6 @@ mod session_end_tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),

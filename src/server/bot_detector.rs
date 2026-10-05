@@ -12,7 +12,7 @@
 //! and the expensive variance computation only runs once per 5 seconds per IP.
 
 use crate::state::{BotDetection, BotTracker, ServerState};
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -31,7 +31,11 @@ const DETECTION_COOLDOWN: Duration = Duration::from_secs(30);
 /// Record a single search/sources query from `ip`. Cheap on most packets:
 /// pushes a timestamp and bails. Heavy work (stddev + insert) is gated by
 /// DETECTION_COOLDOWN.
-pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
+///
+/// `ip` may be either family; it is keyed by source (IPv4 address, IPv6 /64 by
+/// default), so a flood spread across one IPv6 prefix is one bot.
+pub fn record_query(state: &Arc<ServerState>, ip: IpAddr) {
+    let ip = state.source_key(ip);
     let now = Instant::now();
     let tracker = state.bot_query_log.entry(ip).or_default();
     let mut times = tracker.query_times.lock().unwrap();
@@ -137,3 +141,47 @@ pub fn record_query(state: &Arc<ServerState>, ip: Ipv4Addr) {
 const _: fn() = || {
     let _: fn() -> BotTracker = BotTracker::default;
 };
+
+#[cfg(test)]
+mod source_key_tests {
+    use super::*;
+
+    fn flood(state: &Arc<ServerState>, ips: impl Iterator<Item = IpAddr>) {
+        for ip in ips {
+            record_query(state, ip);
+        }
+    }
+
+    #[test]
+    fn an_ipv6_flood_spread_over_one_prefix_is_one_banned_bot() {
+        let st = Arc::new(ServerState::for_test());
+        // 40 queries, each from a different address in 2001:db8:1:2::/64.
+        flood(&st, (1..=40u16).map(|i| {
+            IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 7, i))
+        }));
+        assert_eq!(st.bot_detections.len(), 1, "one source, one detection");
+        let same_prefix: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        let other_prefix: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert!(st.is_bot_banned(same_prefix));
+        assert!(!st.is_bot_banned(other_prefix));
+    }
+
+    #[test]
+    fn ipv4_and_mapped_ipv4_are_the_same_source() {
+        let st = Arc::new(ServerState::for_test());
+        let v4: IpAddr = "203.0.113.9".parse().unwrap();
+        let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
+        flood(&st, (0..20).map(|_| v4).chain((0..20).map(|_| mapped)));
+        assert!(st.is_bot_banned(v4));
+        assert!(st.is_bot_banned(mapped));
+        assert!(!st.is_bot_banned("203.0.113.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_slow_querier_is_not_flagged() {
+        let st = Arc::new(ServerState::for_test());
+        flood(&st, (0..10).map(|_| "2001:db8::1".parse().unwrap()));
+        assert!(st.bot_detections.is_empty());
+        assert!(!st.is_bot_banned("2001:db8::1".parse().unwrap()));
+    }
+}

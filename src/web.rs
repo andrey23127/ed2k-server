@@ -195,6 +195,8 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/stats", get(api_stats))
             .route("/api/highid_mismatches", get(api_highid_mismatches))
             .route("/api/clients", get(api_clients))
+            .route("/api/clients/search", get(api_clients_search))
+            .route("/assets/flags.woff2", get(asset_flags_font))
             .route("/api/peers", get(api_peers))
             .route("/api/reload", post(api_reload))
             .route("/api/client_stats", get(api_client_stats))
@@ -333,6 +335,7 @@ struct StatsResp {
     soft_limit_files: u32,
     /// OFFERFILES packets rejected at `limits.hard_limit_files` (connection closed).
     offer_over_hard_packets: u64,
+    replaced_sessions_closed: u64,
     /// Admission gauges and counters (issue #25), as /api/admission.
     admission: serde_json::Value,
     hard_limit_files: u32,
@@ -343,6 +346,8 @@ struct StatsResp {
     busiest_ip: Option<String>,
     busiest_ip_country: Option<String>,
     busiest_ip_logged_in: u32,
+    /// "AS3269 Telecom Italia S.p.A." when the GeoIP database carries it.
+    busiest_ip_provider: Option<String>,
     max_clients_per_ip: u32,
     /// `network.highid_verify_observe`: whether the counters below are live.
     highid_observe_enabled: bool,
@@ -424,6 +429,10 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         offer_over_soft_records: s.server.offer_over_soft_stats().1,
         soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
         offer_over_hard_packets: s.server.offer_over_hard_count(),
+        replaced_sessions_closed: s
+            .server
+            .replaced_sessions_closed
+            .load(std::sync::atomic::Ordering::Relaxed),
         admission: s.server.admission.metrics(),
         hard_limit_files: s.server.live_cfg.load().limits.hard_limit_files,
         busiest_ip_connections: busiest.map_or(0, |(_, n)| n),
@@ -433,14 +442,15 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
             }
             v4 => v4.to_string(),
         }),
-        busiest_ip_country: busiest.and_then(|(ip, _)| match ip {
-            std::net::IpAddr::V4(v4) => s
-                .server
+        busiest_ip_country: busiest.and_then(|(ip, _)| {
+            s.server
                 .country_db
                 .try_read()
                 .ok()
-                .and_then(|db| db.lookup(v4).map(|(c, _)| c)),
-            _ => None,
+                .and_then(|db| db.lookup(ip).map(|(c, _)| c))
+        }),
+        busiest_ip_provider: busiest.and_then(|(ip, _)| {
+            s.server.country_db.try_read().ok().and_then(|db| db.provider(ip))
         }),
         busiest_ip_logged_in: busiest.map_or(0, |(ip, _)| {
             let bits = s.server.admission.cfg.ipv6_source_prefix_bits;
@@ -559,8 +569,39 @@ struct ClientRow {
     /// tag. The only distinguishing signal is the address itself, so that is
     /// what gets shown rather than a guess at a product name.
     ipv6: Option<String>,
+    /// The network's provider ("AS3269 Telecom Italia S.p.A."), filled for
+    /// the rows of a search page when the GeoIP database carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
+fn client_row(s: &WebState, c: &crate::state::ClientHandle, now: Instant) -> ClientRow {
+    ClientRow {
+        ip: c.ip.to_string(),
+        nick: c.nick.clone(),
+        country: c.country.clone(),
+        software: c.software.clone(),
+        // Counted from the source index, the same count the soft limit uses.
+        // The handle had its own counter that nothing ever incremented, so
+        // this column read 0 for everyone.
+        shared_files: shared_files_of(s, c),
+        high_id: c.is_high_id,
+        connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
+        ipv6_capable: c.ipv6_capable,
+        ipv6: c.ipv6.map(|a| a.to_string()),
+        provider: None,
+    }
+}
+
+fn shared_files_of(s: &WebState, c: &crate::state::ClientHandle) -> u32 {
+    s.server
+        .user_files
+        .get(&c.user_hash)
+        .map_or(0, |f| f.len() as u32)
+}
+
+/// Every connected client, unfiltered. Kept for scripts; the admin page uses
+/// /api/clients/search, which pages on the server.
 async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
     // Take a snapshot of current clients. DashMap iteration is consistent
     // enough for an admin view — we accept a touch of staleness.
@@ -569,22 +610,200 @@ async fn api_clients(State(s): State<WebState>) -> Json<Vec<ClientRow>> {
         .server
         .clients
         .iter()
-        .map(|entry| {
-            let c = entry.value();
-            ClientRow {
-                ip: c.ip.to_string(),
-                nick: c.nick.clone(),
-                country: c.country.clone(),
-                software: c.software.clone(),
-                shared_files: c.shared_files,
-                high_id: c.is_high_id,
-                connected_seconds: now.saturating_duration_since(c.connected_at).as_secs(),
-                ipv6_capable: c.ipv6_capable,
-                ipv6: c.ipv6.map(|a| a.to_string()),
-            }
-        })
+        .map(|entry| client_row(&s, entry.value(), now))
         .collect();
     Json(rows)
+}
+
+/// Decode one query-string value: `+` is a space, `%XX` a byte; invalid
+/// escapes are kept as written. Lossy UTF-8.
+fn url_decode(v: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        (c as char).to_digit(16).map(|d| d as u8)
+    }
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' => match (b.get(i + 1).and_then(|&c| hex(c)), b.get(i + 2).and_then(|&c| hex(c))) {
+                (Some(h), Some(l)) => {
+                    out.push(h << 4 | l);
+                    i += 2;
+                }
+                _ => out.push(b'%'),
+            },
+            x => out.push(x),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// What the Clients tab asks for. Every field is optional; an empty query
+/// matches everyone.
+#[derive(Debug, Default, PartialEq)]
+struct ClientQuery {
+    /// Free text, lowercased: a substring of the IPv4/IPv6 address or the
+    /// nick, or — when it parses as one — an IPv4 CIDR such as 82.48.0.0/16.
+    text: String,
+    cidr: Option<(u32, u32)>,
+    /// Exact country code, upper case.
+    country: String,
+    /// Exact software name, as in the Software chart.
+    software: String,
+    /// Some(true) HighID only, Some(false) LowID only.
+    high_id: Option<bool>,
+    ipv6_only: bool,
+    sort: ClientSort,
+    descending: bool,
+    offset: usize,
+    limit: usize,
+}
+
+#[derive(Debug, Default, PartialEq, Clone, Copy)]
+enum ClientSort {
+    #[default]
+    Connected,
+    Files,
+    Ip,
+    Nick,
+    Country,
+    Software,
+}
+
+impl ClientQuery {
+    const MAX_LIMIT: usize = 500;
+
+    fn parse(qs: &str) -> Self {
+        let mut q = ClientQuery {
+            descending: true,
+            limit: 100,
+            ..Default::default()
+        };
+        for kv in qs.split('&') {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            let v = url_decode(v);
+            let v = v.trim();
+            match k {
+                "q" => {
+                    q.text = v.to_lowercase();
+                    q.cidr = parse_cidr_v4(v);
+                }
+                "country" => q.country = v.to_uppercase(),
+                "software" => q.software = v.to_string(),
+                "id" => {
+                    q.high_id = match v {
+                        "high" => Some(true),
+                        "low" => Some(false),
+                        _ => None,
+                    }
+                }
+                "ipv6" => q.ipv6_only = v == "1",
+                "sort" => {
+                    q.sort = match v {
+                        "files" => ClientSort::Files,
+                        "ip" => ClientSort::Ip,
+                        "nick" => ClientSort::Nick,
+                        "country" => ClientSort::Country,
+                        "software" => ClientSort::Software,
+                        _ => ClientSort::Connected,
+                    }
+                }
+                "dir" => q.descending = v != "asc",
+                "offset" => q.offset = v.parse().unwrap_or(0),
+                "limit" => q.limit = v.parse().unwrap_or(100).clamp(1, Self::MAX_LIMIT),
+                _ => {}
+            }
+        }
+        q
+    }
+
+    fn matches(&self, c: &crate::state::ClientHandle) -> bool {
+        if !self.country.is_empty() && !c.country.eq_ignore_ascii_case(&self.country) {
+            return false;
+        }
+        if !self.software.is_empty() && c.software != self.software {
+            return false;
+        }
+        if self.high_id.is_some_and(|h| h != c.is_high_id) {
+            return false;
+        }
+        if self.ipv6_only && !c.ipv6_capable {
+            return false;
+        }
+        if self.text.is_empty() {
+            return true;
+        }
+        if let Some((net, mask)) = self.cidr {
+            return match c.ip {
+                std::net::IpAddr::V4(v4) => u32::from(v4) & mask == net,
+                _ => false,
+            };
+        }
+        c.ip.to_string().contains(&self.text)
+            || c.nick.to_lowercase().contains(&self.text)
+            || c.ipv6.is_some_and(|a| a.to_string().contains(&self.text))
+    }
+}
+
+/// `a.b.c.d/n` → (network, mask). Anything else → None.
+fn parse_cidr_v4(v: &str) -> Option<(u32, u32)> {
+    let (ip, bits) = v.split_once('/')?;
+    let ip: std::net::Ipv4Addr = ip.trim().parse().ok()?;
+    let bits: u32 = bits.trim().parse().ok()?;
+    if bits > 32 {
+        return None;
+    }
+    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+    Some((u32::from(ip) & mask, mask))
+}
+
+/// The Clients tab: filtered, sorted and paged on the server, so the page
+/// receives one screen of rows instead of every connected client.
+async fn api_clients_search(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> Json<serde_json::Value> {
+    let q = ClientQuery::parse(qs.as_deref().unwrap_or(""));
+    let now = Instant::now();
+    let total = s.server.clients.len();
+    let mut rows: Vec<ClientRow> = s
+        .server
+        .clients
+        .iter()
+        .filter(|e| q.matches(e.value()))
+        .map(|e| client_row(&s, e.value(), now))
+        .collect();
+    let matched = rows.len();
+    match q.sort {
+        ClientSort::Connected => rows.sort_by_key(|r| r.connected_seconds),
+        ClientSort::Files => rows.sort_by_key(|r| r.shared_files),
+        ClientSort::Ip => rows.sort_by_key(|r| r.ip.parse::<std::net::IpAddr>().ok()),
+        ClientSort::Nick => rows.sort_by_cached_key(|r| r.nick.to_lowercase()),
+        ClientSort::Country => rows.sort_by(|a, b| a.country.cmp(&b.country)),
+        ClientSort::Software => rows.sort_by(|a, b| a.software.cmp(&b.software)),
+    }
+    if q.descending {
+        rows.reverse();
+    }
+    let mut page: Vec<ClientRow> = rows.into_iter().skip(q.offset).take(q.limit).collect();
+    {
+        let geo = s.server.country_db.read().await;
+        for r in &mut page {
+            if let Ok(ip) = r.ip.parse::<std::net::IpAddr>() {
+                r.provider = geo.provider(ip);
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "total": total,
+        "matched": matched,
+        "offset": q.offset,
+        "limit": q.limit,
+        "rows": page,
+    }))
 }
 
 #[derive(Serialize)]
@@ -596,21 +815,59 @@ struct PeerRow {
     /// clients). Unverified entries are kept here for the operator to see but
     /// are NOT propagated — the mldonkey filter.
     verified: bool,
+    country: Option<String>,
+    /// From the peer's own OP_SERVER_DESC_RES, once it has answered.
+    name: Option<String>,
+    desc: Option<String>,
+    version: Option<String>,
+    /// From the peer's 0x97 ping reply.
+    users: Option<u32>,
+    files: Option<u32>,
+    /// We have asked it at least once (name/desc missing after that = it does
+    /// not answer plain UDP on TCP+4).
+    asked: bool,
 }
 
 async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
     let list = s.server.server_list.read().await;
+    let geo = s.server.country_db.read().await;
     let rows: Vec<PeerRow> = list
         .iter()
-        .map(|addr| PeerRow {
-            ip: addr.ip().to_string(),
-            port: addr.port(),
-            has_server_key: s.server.seed_server_keys.contains_key(addr.ip()),
-            verified: s.server.verified_servers.contains_key(addr.ip())
-                || s.server.seed_server_keys.contains_key(addr.ip()),
+        .map(|addr| {
+            let info = s.server.peer_info.get(addr).map(|e| e.value().clone());
+            let info = info.unwrap_or_default();
+            PeerRow {
+                ip: addr.ip().to_string(),
+                port: addr.port(),
+                has_server_key: s.server.seed_server_keys.contains_key(addr.ip()),
+                verified: s.server.verified_servers.contains_key(addr.ip())
+                    || s.server.seed_server_keys.contains_key(addr.ip()),
+                country: geo.lookup(*addr.ip()).map(|(c, _)| c),
+                name: info.name,
+                desc: info.desc,
+                version: info.version,
+                users: info.users,
+                files: info.files,
+                asked: info.asked_at.is_some(),
+            }
         })
         .collect();
     Json(rows)
+}
+
+/// The country-flag font for the admin page. Windows has no flag glyphs, so
+/// Chrome, Edge and Opera there showed two letters instead of a flag. The
+/// font is a 78 KB subset of Twemoji (CC-BY 4.0, see
+/// assets/TwemojiCountryFlags-LICENSE.md), built into the binary so the
+/// admin page never loads anything from another host.
+async fn asset_flags_font() -> impl IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "font/woff2"),
+            (axum::http::header::CACHE_CONTROL, "public, max-age=604800"),
+        ],
+        &include_bytes!("../assets/TwemojiCountryFlags.woff2")[..],
+    )
 }
 
 /// What the Updates panel needs to draw itself: per-file URL, whether it can be
@@ -837,14 +1094,19 @@ async fn api_country_stats(State(s): State<WebState>) -> Json<Vec<CountryStatEnt
 struct FilterInfoResp {
     ipfilter_ranges: usize,
     country_db_loaded: bool,
+    /// Which GeoIP source is loaded and what it covers.
+    country_db: String,
+    country_db_ipv6: bool,
 }
 
 async fn api_filter_info(State(s): State<WebState>) -> Json<FilterInfoResp> {
     let ipfilter_ranges = s.server.ip_filter.read().await.len();
-    let country_db_loaded = s.server.country_db.read().await.is_loaded();
+    let geo = s.server.country_db.read().await;
     Json(FilterInfoResp {
         ipfilter_ranges,
-        country_db_loaded,
+        country_db_loaded: geo.is_loaded(),
+        country_db: geo.describe(),
+        country_db_ipv6: geo.supports_ipv6(),
     })
 }
 
@@ -1064,7 +1326,13 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                 -1.0
             }; // sentinel: "not measured"
             BotRow {
-                ip: e.key().to_string(),
+                // An IPv6 bot is a prefix (its source key), shown as such.
+                ip: match e.key() {
+                    std::net::IpAddr::V6(v6) => {
+                        format!("{v6}/{}", s.server.admission.cfg.ipv6_source_prefix_bits)
+                    }
+                    v4 => v4.to_string(),
+                },
                 country: d.country.clone(),
                 query_count: d.query_count,
                 queries_per_minute: qpm,
@@ -1078,7 +1346,7 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                     .duration_since(d.last_seen)
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
-                banned: s.server.is_bot_banned(e.key()),
+                banned: s.server.is_bot_banned(*e.key()),
             }
         })
         .collect();
@@ -2170,8 +2438,15 @@ async fn api_block_stats(State(s): State<WebState>) -> Json<Vec<BlockStatRow>> {
 }
 
 /// Single-page dashboard. Plain HTML + a tiny bit of JS — no build step.
-async fn dashboard() -> Html<&'static str> {
-    Html(DASHBOARD_HTML)
+/// The page is compiled into the binary, so a browser must not keep an old
+/// copy across an upgrade: an old page against a new API shows stale tabs
+/// (seen after 0.9.77: no search box, no peer names, letters for flags
+/// until the cache was cleared). `no-cache` makes it revalidate every load.
+async fn dashboard() -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")],
+        Html(DASHBOARD_HTML),
+    )
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -2180,7 +2455,8 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 <title>ed2k-server admin</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
+@font-face{font-family:"Twemoji Country Flags";unicode-range:U+1F1E6-1F1FF,U+1F3F4,U+E0062-E0063,U+E0065,U+E0067,U+E006C,U+E006E,U+E0073-E0074,U+E0077,U+E007F;src:url('/assets/flags.woff2') format('woff2');font-display:swap}
+body{font-family:"Twemoji Country Flags",system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
 header{background:#1a1d27;border-bottom:1px solid #2d3148;padding:14px 24px;display:flex;align-items:center;gap:12px}
 header h1{font-size:1.1rem;font-weight:600;color:#fff}
 header .ver{font-size:.75rem;color:#6b7280;margin-left:auto}
@@ -2214,6 +2490,13 @@ tr:hover td{background:#1e2035}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:640px){.grid2{grid-template-columns:1fr}}
 .empty{color:#4b5563;font-size:.83rem;padding:12px 0}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+.filters input,.filters select{background:#0f1117;color:#e2e8f0;border:1px solid #2d3148;border-radius:6px;padding:7px 10px;font-size:.82rem;font-family:inherit}
+.filters input[type=search]{min-width:260px;flex:1 1 260px}
+.filters button{background:#252840;color:#a5b4fc;border:1px solid #2d3148;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:.8rem}
+.filters button:disabled{opacity:.4;cursor:default}
+.filters .count{font-size:.78rem;color:#9ca3af;margin-left:auto}
+.sub{color:#6b7280;font-size:.75rem}
 </style>
 </head>
 <body>
@@ -2256,6 +2539,21 @@ tr:hover td{background:#1e2035}
   </div>
   <div class="section">
     <h3>Connected Now</h3>
+    <div class="filters">
+      <input type="search" id="cf-q" placeholder="IP, 82.48.0.0/16, nick, IPv6…" oninput="clientsFilterChanged()">
+      <select id="cf-country" onchange="clientsFilterChanged()"><option value="">all countries</option></select>
+      <select id="cf-software" onchange="clientsFilterChanged()"><option value="">all software</option></select>
+      <select id="cf-id" onchange="clientsFilterChanged()"><option value="">High + Low</option><option value="high">HighID</option><option value="low">LowID</option></select>
+      <select id="cf-sort" onchange="clientsFilterChanged()">
+        <option value="connected">sort: connected time</option><option value="files">sort: files</option>
+        <option value="ip">sort: IP</option><option value="nick">sort: nick</option>
+        <option value="country">sort: country</option><option value="software">sort: software</option>
+      </select>
+      <select id="cf-dir" onchange="clientsFilterChanged()"><option value="desc">↓ desc</option><option value="asc">↑ asc</option></select>
+      <button id="cf-prev" onclick="clientsPage(-1)">‹ prev</button>
+      <button id="cf-next" onclick="clientsPage(1)">next ›</button>
+      <span class="count" id="cf-count"></span>
+    </div>
     <div id="clients-table"></div>
   </div>
 </div>
@@ -2389,6 +2687,7 @@ tr:hover td{background:#1e2035}
 </div>
 
 <div id="refreshed" style="padding:0 20px 10px"></div>
+<div style="padding:0 20px 14px;font-size:.68rem;color:#374151;text-align:right">Flag images: <a href="https://github.com/twitter/twemoji" style="color:#4b5563">Twemoji</a>, CC-BY 4.0</div>
 
 <script>
 function showTab(name, btn) {
@@ -2435,7 +2734,8 @@ async function refreshStatus() {
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
-     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_connections)} connections${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+sys.busiest_ip_country+')' : ''} · ${fmt(sys.busiest_ip_logged_in)} logged in` : ''} <span style="color:#6b7280;font-size:.75rem">most TCP connections one IP holds right now; limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'}, loopback exempt</span></td></tr>
+     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_connections)} connections${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_logged_in)} logged in` : ''} <span style="color:#6b7280;font-size:.75rem">most TCP connections one IP holds right now; limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'}, loopback exempt</span></td></tr>
+     <tr><td>Replaced sessions closed</td><td>${fmt(sys.replaced_sessions_closed)} <span style="color:#6b7280;font-size:.75rem">sockets a newer login of the same user took over, closed after 10 min without traffic of their own; a copy that still talks keeps its socket</span></td></tr>
      <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
      <tr><td>Admission</td><td>${(()=>{const a=sys.admission||{};const p=x=>x?`${fmt(x.in_use)}/${fmt(x.cap)}${x.rejected?` · ${fmt(x.rejected)} refused`:''}`:'–';const u=a.udp||{};return `<b style="color:${a.ready?'#16a34a':'#dc2626'}">${a.ready?'ready':'NOT READY: '+(a.saturated||[]).join(', ')}</b> · sockets ${p(a.open_tcp)} · pending logins ${p(a.pending_login)} · probes ${p(a.probes)} (${fmt(a.probe_shed_lowid||0)} → LowID) · search jobs ${p(a.search_jobs)}, queue ${p(a.search_queue)} · UDP ${u.enforce?'enforced':'observe'}: refused ${fmt((u.refused_global||0)+(u.refused_source||0)+(u.refused_table_full||0))} (global ${fmt(u.refused_global||0)}, source ${fmt(u.refused_source||0)}, table ${fmt(u.refused_table_full||0)}), sources ${fmt(u.source_entries||0)}/${fmt(u.source_entries_cap||0)}`})()} <span style="color:#6b7280;font-size:.75rem">[admission] — details at /api/admission</span></td></tr>
      <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
@@ -2455,8 +2755,7 @@ function card(lbl, val, sub) {
 }
 
 async function refreshClients() {
-  const [rows, sw, countries] = await Promise.all([
-    fetch('/api/clients').then(r=>r.json()),
+  const [sw, countries] = await Promise.all([
     fetch('/api/client_stats').then(r=>r.json()),
     fetch('/api/country_stats').then(r=>r.json()),
   ]);
@@ -2467,7 +2766,7 @@ async function refreshClients() {
         const pct = total ? (e.count/total*100).toFixed(1) : 0;
         return `<div style="margin-bottom:10px">
           <div style="display:flex;justify-content:space-between;margin-bottom:3px">
-            <span class="tag">${e.software}</span>
+            <span class="tag">${escapeHtml(e.software)}</span>
             <span style="font-size:.78rem;color:#9ca3af">${e.count} (${pct}%)</span>
           </div>
           <div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div>
@@ -2486,29 +2785,80 @@ async function refreshClients() {
           <div class="bar-wrap"><div class="bar" style="width:${pct}%;background:#818cf8"></div></div>
         </div>`;
       }).join('');
+  fillSelect('cf-country', countries.map(e => [e.code, countryFlag(e.code) + ' ' + e.code + ' (' + e.count + ')']));
+  fillSelect('cf-software', sw.map(e => [e.software, e.software + ' (' + e.count + ')']));
+  const res = await fetch('/api/clients/search?' + clientsQuery()).then(r=>r.json());
+  const rows = res.rows;
+  const from = res.matched ? res.offset + 1 : 0, to = res.offset + rows.length;
+  document.getElementById('cf-count').textContent =
+    `${from}–${to} of ${res.matched.toLocaleString()}` + (res.matched !== res.total ? ` (filtered from ${res.total.toLocaleString()})` : '');
+  document.getElementById('cf-prev').disabled = res.offset === 0;
+  document.getElementById('cf-next').disabled = to >= res.matched;
   document.getElementById('clients-table').innerHTML = rows.length === 0
-    ? '<div class="empty">No clients connected.</div>'
+    ? '<div class="empty">' + (res.total ? 'No client matches the filter.' : 'No clients connected.') + '</div>'
     : '<table><thead><tr><th>IP</th><th>Country</th><th>Software</th><th>Nick</th><th>Files</th><th>ID</th><th>IPv6</th><th>Connected</th></tr></thead><tbody>'
-      + rows.slice(0,100).map(c =>
-          `<tr><td>${c.ip}</td>`
-          + `<td>${countryFlag(c.country)} ${c.country}</td>`
-          + `<td><span class="tag">${c.software||'?'}</span></td>`
-          + `<td>${c.nick}</td>`
-          + `<td>${c.shared_files||0}</td>`
+      + rows.map(c =>
+          `<tr><td><a href="#" style="color:inherit" title="${escapeHtml(c.provider||'')}" onclick="return clientsSearchFor('${escapeHtml(c.ip)}')">${escapeHtml(c.ip)}</a>`
+          + `${c.provider ? `<br><span class="sub">${escapeHtml(c.provider)}</span>` : ''}</td>`
+          + `<td>${countryFlag(c.country)} ${escapeHtml(c.country)}</td>`
+          + `<td><span class="tag">${escapeHtml(c.software||'?')}</span></td>`
+          + `<td>${escapeHtml(c.nick)}</td>`
+          + `<td>${(c.shared_files||0).toLocaleString()}</td>`
           + `<td><span class="badge ${c.high_id?'yes':'no'}">${c.high_id?'High':'Low'}</span></td>`
-          + `<td>${c.ipv6 ? `<code style="font-size:11px">${c.ipv6}</code>`
+          + `<td>${c.ipv6 ? `<code style="font-size:11px">${escapeHtml(c.ipv6)}</code>`
                           : (c.ipv6_capable ? '<span style="opacity:.6">capable</span>' : '')}</td>`
           + `<td>${fmtDur(c.connected_seconds)}</td></tr>`).join('')
-      + (rows.length>100?`<tr><td colspan="8" style="color:#6b7280">… and ${rows.length-100} more</td></tr>`:'')
       + '</tbody></table>';
+}
+
+// Clients tab: the filter lives in the controls; the server filters, sorts
+// and pages. Typing waits 300 ms so a search is one request, not one per key.
+let clientsOffset = 0, clientsTimer = null;
+const CLIENTS_PAGE = 100;
+function clientsQuery() {
+  const v = id => document.getElementById(id).value;
+  const p = new URLSearchParams({q: v('cf-q'), country: v('cf-country'), software: v('cf-software'),
+    id: v('cf-id'), sort: v('cf-sort'), dir: v('cf-dir'), offset: clientsOffset, limit: CLIENTS_PAGE});
+  return p.toString();
+}
+function clientsFilterChanged() {
+  clientsOffset = 0;
+  clearTimeout(clientsTimer);
+  clientsTimer = setTimeout(refreshClients, 300);
+}
+function clientsPage(d) {
+  clientsOffset = Math.max(0, clientsOffset + d * CLIENTS_PAGE);
+  refreshClients();
+}
+function clientsSearchFor(text) {
+  document.getElementById('cf-q').value = text;
+  clientsFilterChanged();
+  return false;
+}
+// Refill a <select> from [value, label] pairs, keeping the current choice
+// (and keeping it listed even if its count dropped to zero).
+function fillSelect(id, items) {
+  const el = document.getElementById(id);
+  const cur = el.value, first = el.options[0].outerHTML;
+  if (cur && !items.some(([v]) => v === cur)) items = [[cur, cur], ...items];
+  const html = first + items.map(([v, l]) => `<option value="${escapeHtml(v)}">${escapeHtml(l)}</option>`).join('');
+  if (el.dataset.html !== html) { el.innerHTML = html; el.dataset.html = html; el.value = cur; }
 }
 
 async function refreshPeers() {
   const r = await fetch('/api/peers').then(r=>r.json());
+  r.sort((a, b) => (b.users ?? -1) - (a.users ?? -1));
+  const num = v => v == null ? '<span class="sub">—</span>' : v.toLocaleString();
   document.getElementById('peers-table').innerHTML = r.length === 0
     ? '<div class="empty">No peer servers known yet.</div>'
-    : '<table><thead><tr><th>IP</th><th>Port</th><th>ServerKey</th></tr></thead><tbody>'
-      + r.map(p => `<tr><td>${p.ip}</td><td>${p.port}</td>`
+    : '<table><thead><tr><th>Server</th><th>Address</th><th>Country</th><th>Users</th><th>Files</th><th>Version</th><th>Verified</th><th>ServerKey</th></tr></thead><tbody>'
+      + r.map(p => `<tr><td>${p.name ? escapeHtml(p.name) : `<span class="sub">${p.asked ? 'no answer' : 'not asked yet'}</span>`}`
+               + `${p.desc ? `<br><span class="sub">${escapeHtml(p.desc)}</span>` : ''}</td>`
+               + `<td><code style="font-size:11px">${escapeHtml(p.ip)}:${p.port}</code></td>`
+               + `<td>${p.country ? countryFlag(p.country) + ' ' + escapeHtml(p.country) : ''}</td>`
+               + `<td>${num(p.users)}</td><td>${num(p.files)}</td>`
+               + `<td>${p.version ? escapeHtml(p.version) : ''}</td>`
+               + `<td><span class="badge ${p.verified?'yes':'no'}">${p.verified?'yes':'no'}</span></td>`
                + `<td><span class="badge ${p.has_server_key?'yes':'no'}">${p.has_server_key?'✓ known':'pending'}</span></td></tr>`).join('')
       + '</tbody></table>';
 }
@@ -2518,7 +2868,7 @@ async function refreshFilter() {
   document.getElementById('filter-info').innerHTML =
     `<table><tr><th>Setting</th><th>Value</th></tr>
      <tr><td>IP filter ranges</td><td>${f.ipfilter_ranges === 0 ? '<span class="badge no">not loaded</span>' : '<span class="badge yes">'+f.ipfilter_ranges.toLocaleString()+' ranges</span>'}</td></tr>
-     <tr><td>Country DB</td><td><span class="badge ${f.country_db_loaded?'yes':'no'}">${f.country_db_loaded?'loaded':'not loaded'}</span></td></tr>
+     <tr><td>Country DB</td><td><span class="badge ${f.country_db_loaded?'yes':'no'}">${f.country_db_loaded?(f.country_db_ipv6?'IPv4 + IPv6':'IPv4 only'):'not loaded'}</span> <span class="sub">${escapeHtml(f.country_db||'')}</span></td></tr>
      </table>`;
 }
 
@@ -2901,5 +3251,86 @@ mod highid_mismatch_endpoint_tests {
         );
         assert_ne!(ips[0], ips[2], "different addresses must not collide here");
         assert_eq!(v["summary"]["distinct_ips"], 2);
+    }
+}
+
+#[cfg(test)]
+mod client_search_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn client(ip: [u8; 4], nick: &str, country: &str, sw: &str, high: bool) -> crate::state::ClientHandle {
+        crate::state::ClientHandle {
+            user_hash: [ip[3]; 16],
+            assigned_id: 1,
+            ip: IpAddr::V4(Ipv4Addr::from(ip)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: nick.into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: high,
+            connected_at: Instant::now(),
+            country: country.into(),
+            software: sw.into(),
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            slot: Default::default(),
+            tx: None,
+            last_activity_ms: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn url_decoding() {
+        assert_eq!(url_decode("82.48.0.0%2F16"), "82.48.0.0/16");
+        assert_eq!(url_decode("a+b%20c"), "a b c");
+        assert_eq!(url_decode("100%"), "100%");
+        assert_eq!(url_decode("%zz%4"), "%zz%4");
+        assert_eq!(url_decode("%D0%BF%D1%80"), "пр");
+    }
+
+    #[test]
+    fn query_defaults_and_limits() {
+        let q = ClientQuery::parse("");
+        assert_eq!((q.sort, q.descending, q.offset, q.limit), (ClientSort::Connected, true, 0, 100));
+        let q = ClientQuery::parse("limit=100000&offset=200&sort=files&dir=asc&id=low&country=it");
+        assert_eq!(q.limit, ClientQuery::MAX_LIMIT);
+        assert_eq!((q.offset, q.sort, q.descending, q.high_id), (200, ClientSort::Files, false, Some(false)));
+        assert_eq!(q.country, "IT");
+        assert_eq!(ClientQuery::parse("limit=0").limit, 1);
+        assert_eq!(ClientQuery::parse("limit=x").limit, 100);
+    }
+
+    #[test]
+    fn text_matches_ip_and_nick_case_insensitively() {
+        let c = client([82, 48, 45, 246], "http://www.aMule.org", "IT", "aMule", false);
+        assert!(ClientQuery::parse("q=82.48.").matches(&c));
+        assert!(ClientQuery::parse("q=AMULE").matches(&c));
+        assert!(!ClientQuery::parse("q=emule-project").matches(&c));
+        assert!(ClientQuery::parse("").matches(&c));
+    }
+
+    #[test]
+    fn cidr_matches_by_network_not_by_text() {
+        let c = client([82, 48, 45, 246], "x", "IT", "aMule", false);
+        assert!(ClientQuery::parse("q=82.48.0.0%2F16").matches(&c));
+        assert!(ClientQuery::parse("q=82.48.45.0/24").matches(&c));
+        assert!(!ClientQuery::parse("q=82.49.0.0/16").matches(&c));
+        assert!(ClientQuery::parse("q=0.0.0.0/0").matches(&c));
+        assert_eq!(parse_cidr_v4("1.2.3.4/33"), None);
+        assert_eq!(parse_cidr_v4("1.2.3.4"), None);
+    }
+
+    #[test]
+    fn exact_filters_combine() {
+        let c = client([1, 2, 3, 4], "n", "ES", "eMule", true);
+        assert!(ClientQuery::parse("country=es&software=eMule&id=high").matches(&c));
+        assert!(!ClientQuery::parse("country=IT").matches(&c));
+        assert!(!ClientQuery::parse("software=aMule").matches(&c));
+        assert!(!ClientQuery::parse("id=low").matches(&c));
+        assert!(!ClientQuery::parse("ipv6=1").matches(&c));
     }
 }

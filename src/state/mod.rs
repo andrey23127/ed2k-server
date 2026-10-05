@@ -67,9 +67,6 @@ pub struct ClientHandle {
     /// Client software name: "eMule", "aMule", "mldonkey", "Shareaza", etc.
     /// Derived from CT_EMULE_VERSION (0xFB) top byte in the login packet.
     pub software: String,
-    /// Number of files the client has offered via OFFERFILES. Starts at 0,
-    /// incremented by the OFFERFILES handler. Used for the "Files" column.
-    pub shared_files: u32,
     /// Counters for §7.6 enforcement
     pub csam_attempts: u32,
     /// The soft-limit server message has been sent on this connection.
@@ -625,6 +622,13 @@ pub struct ServerState {
     /// and from a successful obfuscated handshake, where we know the seed's TCP port
     /// because we initiated to it.
     pub verified_sockets: DashMap<SocketAddrV4, std::time::Instant>,
+    /// What the peer servers in `server_list` say about themselves, for the
+    /// admin Peers tab: name and description (UDP 0xA2/0xA3) and user/file
+    /// counts (0x96/0x97). Keyed by the peer's TCP address. An entry is created
+    /// only when we ask a listed peer, so a reply can update but never add
+    /// one, and entries for peers that left the list are dropped. See
+    /// [`PeerInfo`].
+    pub peer_info: DashMap<SocketAddrV4, PeerInfo>,
     /// Live sum of every connection's Framed read+write buffer CAPACITY.
     ///
     /// These buffers are per-connection heap that /api/memsize could not see (they
@@ -639,7 +643,9 @@ pub struct ServerState {
     /// Per-IP CSAM tracker: counts unique IPs that hit CSAM at least once.
     /// Used to compute "unique users blocked" stat — distinct from total file
     /// blocks (which can be many per user).
-    pub csam_unique_ips: DashMap<std::net::Ipv4Addr, u64>,
+    /// Keyed by source (IPv4 address, IPv6 /64 by default; see
+    /// [`ServerState::source_key`]).
+    pub csam_unique_ips: DashMap<std::net::IpAddr, u64>,
     /// Distinct file hashes that have been blocked by the CSAM filter since
     /// startup. A client that republishes the same blocked file every
     /// keepalive cycle should not inflate the "blocked files" metric — we
@@ -663,16 +669,22 @@ pub struct ServerState {
     pub live_cfg: arc_swap::ArcSwap<crate::config::Config>,
     /// Per-IP query-rate tracker. Records a sliding 60-second window of UDP
     /// search/sources requests from each client IP. Used by the bot detector.
-    pub bot_query_log: DashMap<std::net::Ipv4Addr, BotTracker>,
+    ///
+    /// This map, `bot_detections` and `banned_bots` are keyed by SOURCE: an
+    /// IPv4 address, or an IPv6 prefix (/64 by default, as for the admission
+    /// budgets) — a host with a /64 has 2^64 addresses to rotate through, so
+    /// a per-address key would never see the flood. See
+    /// [`ServerState::source_key`].
+    pub bot_query_log: DashMap<std::net::IpAddr, BotTracker>,
     /// Aggregated bot detections, for display in the admin UI.
-    pub bot_detections: DashMap<std::net::Ipv4Addr, BotDetection>,
+    pub bot_detections: DashMap<std::net::IpAddr, BotDetection>,
     /// Temporarily-banned flood bots. Keyed by IP, value = ban start instant.
     /// Entries older than BOT_BAN_TTL are swept by the 60s cleanup task. We use
     /// a time-boxed in-memory ban (not the static ipfilter) because flood-bot
     /// IPs are dynamic — a permanent rule is pointless, but dropping the active
     /// IP for 24h kills the current flood, and a rotated IP is re-flagged and
     /// re-banned the same way.
-    pub banned_bots: DashMap<std::net::Ipv4Addr, std::time::Instant>,
+    pub banned_bots: DashMap<std::net::IpAddr, std::time::Instant>,
     /// CSAM publishers banned by USER_HASH (not IP). IP is dynamic for most
     /// clients (changes ~every few days), while user_hash only changes on eMule
     /// reinstall — a far more stable identifier. Value = ban start time. Checked
@@ -750,6 +762,9 @@ pub struct ServerState {
     /// OFFERFILES packets rejected (and their connections closed) because the
     /// declared record count reached `limits.hard_limit_files`.
     pub offer_over_hard_packets: std::sync::atomic::AtomicU64,
+    /// Sockets of replaced sessions (a newer login of the same user took
+    /// over) closed after replaced-session silence. See handle_connection.
+    pub replaced_sessions_closed: std::sync::atomic::AtomicU64,
 
     /// See `network.highid_verify_observe`.
     pub highid_observe: std::sync::Arc<HighIdObserve>,
@@ -781,6 +796,42 @@ pub struct BotDetection {
     pub country: String,
     /// Why we flagged this IP as a bot.
     pub reason: String,
+}
+
+/// A peer server's self-description, as shown in the admin Peers tab.
+#[derive(Debug, Clone, Default)]
+pub struct PeerInfo {
+    /// The challenge of our last OP_SERVER_DESC_REQ; a new-format reply must
+    /// echo it.
+    pub desc_challenge: u32,
+    /// When we last asked (0xA2 and 0x96 go out together).
+    pub asked_at: Option<Instant>,
+    pub name: Option<String>,
+    pub desc: Option<String>,
+    pub version: Option<String>,
+    /// When a description last arrived.
+    pub desc_at: Option<Instant>,
+    pub users: Option<u32>,
+    pub files: Option<u32>,
+    /// When the user/file counts last arrived.
+    pub stats_at: Option<Instant>,
+}
+
+impl PeerInfo {
+    /// Longest name or description kept, in characters. Anything a remote
+    /// server sends is bounded and stripped of control characters before it
+    /// is stored.
+    pub const MAX_TEXT_CHARS: usize = 160;
+
+    pub fn clean_text(raw: &str) -> Option<String> {
+        let t: String = raw
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(Self::MAX_TEXT_CHARS)
+            .collect();
+        let t = t.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
 }
 
 /// One open TCP connection counted against its IP. Dropping it releases the
@@ -886,7 +937,6 @@ impl ServerState {
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),
@@ -933,10 +983,10 @@ impl ServerState {
     /// 24h window. Cheap — one DashMap insert. Called from the bot detector.
     /// The `bot_ban` block_stats counter is bumped only on the not-banned →
     /// banned transition, so it reflects distinct ban events, not refreshes.
-    pub fn ban_bot(&self, ip: std::net::Ipv4Addr) {
+    pub fn ban_bot(&self, ip: std::net::IpAddr) {
         let was_new = self
             .banned_bots
-            .insert(ip, std::time::Instant::now())
+            .insert(self.source_key(ip), std::time::Instant::now())
             .is_none();
         if was_new {
             *self.block_stats.entry("bot_ban".to_string()).or_insert(0) += 1;
@@ -947,11 +997,19 @@ impl ServerState {
     /// hot path before any parsing, so it must stay a single cheap lookup.
     /// Expired entries are not removed here (the 60s cleanup task sweeps them);
     /// we just treat them as not-banned.
-    pub fn is_bot_banned(&self, ip: &std::net::Ipv4Addr) -> bool {
+    pub fn is_bot_banned(&self, ip: std::net::IpAddr) -> bool {
         self.banned_bots
-            .get(ip)
+            .get(&self.source_key(ip))
             .map(|since| since.elapsed() < Self::BOT_BAN_TTL)
             .unwrap_or(false)
+    }
+
+    /// The key the bot detector, its bans and the unique-IP statistics use for
+    /// `ip`: the IPv4 address (an IPv4-mapped IPv6 one counts as IPv4), or the
+    /// IPv6 address masked to `admission.ipv6_source_prefix_bits` (/64 by
+    /// default) — the same source the admission budgets count by.
+    pub fn source_key(&self, ip: std::net::IpAddr) -> std::net::IpAddr {
+        crate::admission::SourceKey::of(ip, self.admission.cfg.ipv6_source_prefix_bits).as_ip()
     }
 
     /// Record a DISTINCT blocked CSAM file hash for a publisher's user_hash and
@@ -1095,6 +1153,7 @@ impl ServerState {
             recent_client_ips: DashMap::new(),
             verified_servers: DashMap::new(),
             verified_sockets: DashMap::new(),
+            peer_info: DashMap::new(),
             framed_buffer_bytes: std::sync::atomic::AtomicI64::new(0),
             server_list_added_at: DashMap::new(),
             csam_unique_ips: DashMap::new(),
@@ -1117,6 +1176,7 @@ impl ServerState {
             offer_over_soft_batches: std::sync::atomic::AtomicU64::new(0),
             offer_over_soft_records: std::sync::atomic::AtomicU64::new(0),
             offer_over_hard_packets: std::sync::atomic::AtomicU64::new(0),
+            replaced_sessions_closed: std::sync::atomic::AtomicU64::new(0),
             highid_observe: std::sync::Arc::new(HighIdObserve::new()),
             admission,
         }
@@ -1506,7 +1566,6 @@ impl ServerState {
             connected_at: std::time::Instant::now(),
             country,
             software,
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),
@@ -1623,6 +1682,7 @@ impl ServerState {
             (cap * (key + val + 1)) as u64
         }
         const IPV4: usize = 4;
+        const IPADDR: usize = size_of::<std::net::IpAddr>();
         const UHASH: usize = 16;
         const INSTANT: usize = 16;
 
@@ -1706,15 +1766,15 @@ impl ServerState {
         misc += dm_slots(self.recent_client_ips.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.verified_servers.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
-        misc += dm_slots(self.csam_unique_ips.capacity(), IPV4, 8);
+        misc += dm_slots(self.csam_unique_ips.capacity(), IPADDR, 8);
         misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 16);
         misc += dm_slots(self.obf_decode_cache.capacity(), IPV4, 5);
-        misc += dm_slots(self.banned_bots.capacity(), IPV4, INSTANT);
+        misc += dm_slots(self.banned_bots.capacity(), IPADDR, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
-        misc += dm_slots(self.bot_query_log.capacity(), IPV4, size_of::<BotTracker>());
+        misc += dm_slots(self.bot_query_log.capacity(), IPADDR, size_of::<BotTracker>());
         misc += dm_slots(
             self.bot_detections.capacity(),
-            IPV4,
+            IPADDR,
             size_of::<BotDetection>(),
         );
         misc += dm_slots(
@@ -1853,7 +1913,6 @@ mod callback_tests {
             connected_at: Instant::now(),
             country: "??".to_string(),
             software: "test".to_string(),
-            shared_files: 0,
             csam_attempts: 0,
             soft_limit_warned: false,
             slot: Default::default(),

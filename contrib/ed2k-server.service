@@ -7,8 +7,8 @@
 #                        fatally low. Fd usage tracks CONCURRENT CLIENTS, not the
 #                        file index (the index is in RAM, costs zero fds). Budget
 #                        ~1 fd per client + ~20 fixed (listeners/admin/log) +
-#                        a margin for transient HighID-probe / gossip sockets.
-#                        Rule of thumb: ~2 x max_clients. See README.
+#                        one outbound HighID-probe socket per pending login
+#                        during a reconnect storm. See README.
 #   Restart=on-failure — auto-restart if the process exits unexpectedly.
 #   Environment=RUST_LOG — log verbosity. NOTE: stdout/stderr are sent to
 #                        /dev/null below (logs are OFF by default — they grow
@@ -35,9 +35,12 @@ StandardError=null
 # File-descriptor limit. Each TCP client costs ~1 fd; the server also keeps
 # the TCP + 5 UDP listeners, the admin TCP listener, log handles, and transient
 # outbound sockets (HighID probes, gossip). The file index is in RAM and costs
-# no fds. 65536 suits the default max_clients=1000 with huge margin. For a large
-# server raise it to ~2 x max_clients (e.g. 131072 for max_clients=50000).
-LimitNOFILE=65536
+# no fds. Size it for the worst moment, the reconnect storm after a restart:
+# open sockets (max_clients + 10% + admission.max_pending_logins) plus one
+# outbound probe per pending login (admission.max_probe_jobs). With the
+# [admission] defaults that is ~121 000 for max_clients = 50000; 262144 covers
+# it with room. The server warns at startup when the ceilings exceed the limit.
+LimitNOFILE=262144
 
 # Optional log level. Default is info; uncomment for verbose tracing.
 # (Has no visible effect while StandardOutput/Error are "null" above.)

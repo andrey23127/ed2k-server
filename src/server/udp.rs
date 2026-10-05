@@ -401,10 +401,8 @@ impl UdpServer {
             // parsing, crypto, or response. One DashMap lookup; the bot's entire
             // flood becomes essentially free. Ban is set by the bot detector
             // (24h TTL, swept by the 60s cleanup task).
-            if let std::net::IpAddr::V4(v4) = peer.ip() {
-                if self.state.is_bot_banned(&v4) {
-                    continue;
-                }
+            if self.state.is_bot_banned(peer.ip()) {
+                continue;
             }
 
             // admission (issue #25): every datagram is charged on arrival,
@@ -712,26 +710,18 @@ impl UdpServer {
         match opcode {
             OP_GLOB_GETSOURCES | OP_GLOB_GETSOURCES2 | OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2
             | OP_GLOB_SEARCHREQ3 => {
-                // ⚠ IPv4 ONLY, and it is worth being explicit about what an
-                //   IPv6 querier therefore escapes: the bot-rate detector, the
-                //   recent-client record that keeps a UDP-only client out of the
-                //   gossip server list, and the observed-port record used for
-                //   hole punching. All three are keyed on `Ipv4Addr` through
-                //   several structures each.
-                //
-                //   Left as is deliberately for now. Widening those keys is a
-                //   change to the bot detector and to the gossip filter — two
-                //   things that took real work to get right — and it should be
-                //   done on its own, measured, not folded into the IPv6 wiring.
-                //   Until then an IPv6 querier is unmetered, which is acceptable
-                //   while v6 clients number in the handful and every one of them
-                //   is also subject to the per-connection limits on TCP.
+                // Bot detector: track query rate and interval patterns, for
+                // both families. Keyed by source, so an IPv6 querier counts
+                // by its /64 (see ServerState::source_key).
+                crate::server::bot_detector::record_query(&self.state, peer.ip());
+                // The other two records stay IPv4-only, and need nothing more:
+                // the gossip server list holds IPv4 servers only, so an IPv6
+                // client can never leak into it; and hole punching is for
+                // clients behind IPv4 NAT.
                 if let std::net::IpAddr::V4(v4) = peer.ip() {
                     self.state
                         .recent_client_ips
                         .insert(v4, std::time::Instant::now());
-                    // Bot detector: track query rate and interval patterns.
-                    crate::server::bot_detector::record_query(&self.state, v4);
                     // NAT-traversal: remember the EXTERNAL (post-NAT) UDP port this
                     // client just sent from. handle_holepunch_request prefers this
                     // observed port over the client-announced (internal) one when
@@ -796,6 +786,8 @@ impl UdpServer {
             // 0x97 = GLOBSERVSTATRES — seed server responding to our keepalive ping
             0x97 => self.handle_pingreply(payload, peer).await,
             OP_SERVER_DESC_REQ => self.handle_server_desc(payload, peer, obf).await,
+            // A peer server's answer to our own 0xA2 (Peers tab).
+            OP_SERVER_DESC_RES => self.handle_server_desc_res(payload, peer),
             // 0x92 and 0x98 carry the same payload — a bare expression tree. See
             // the note on OP_GLOB_SEARCHREQ2.
             OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 => self.handle_search(payload, peer, obf).await,
@@ -1436,6 +1428,16 @@ impl UdpServer {
                     std::net::SocketAddrV4::new(v4, tcp),
                     std::time::Instant::now(),
                 );
+                // Users and files for the Peers tab, for a peer we asked.
+                if let Some(mut info) = self
+                    .state
+                    .peer_info
+                    .get_mut(&std::net::SocketAddrV4::new(v4, tcp))
+                {
+                    info.users = Some(users);
+                    info.files = Some(files);
+                    info.stats_at = Some(std::time::Instant::now());
+                }
             }
         }
 
@@ -1756,6 +1758,32 @@ impl UdpServer {
         Ok(())
     }
 
+    /// A peer server's OP_SERVER_DESC_RES, the answer to the 0xA2 the peer
+    /// probe sends to listed servers. Recorded for the admin Peers tab only.
+    ///
+    /// Accepted only for a peer we asked: the entry must already exist (the
+    /// probe creates it), so an unsolicited datagram can neither add entries
+    /// nor grow memory. A new-format reply must echo our challenge.
+    fn handle_server_desc_res(&self, payload: &[u8], peer: SocketAddr) -> Result<()> {
+        let SocketAddr::V4(from) = peer else { return Ok(()) };
+        // We ask on the peer's UDP port, TCP+4, and the reply comes from it.
+        let Some(tcp) = from.port().checked_sub(4) else { return Ok(()) };
+        let key = std::net::SocketAddrV4::new(*from.ip(), tcp);
+        let Some(mut info) = self.state.peer_info.get_mut(&key) else {
+            debug!(ip = %peer.ip(), "unsolicited server description — ignored");
+            return Ok(());
+        };
+        let Some(desc) = parse_server_desc_res(payload, info.desc_challenge) else {
+            debug!(ip = %peer.ip(), "server description: unparseable or wrong challenge");
+            return Ok(());
+        };
+        info.name = desc.name.as_deref().and_then(crate::state::PeerInfo::clean_text);
+        info.desc = desc.desc.as_deref().and_then(crate::state::PeerInfo::clean_text);
+        info.version = desc.version.as_deref().and_then(crate::state::PeerInfo::clean_text);
+        info.desc_at = Some(std::time::Instant::now());
+        Ok(())
+    }
+
     // ─── GLOBSEARCHREQ (0x98) ───────────────────────────────────────────────
 
     /// UDP global search — one result per datagram (SPEC.md §2.3.4).
@@ -1955,9 +1983,8 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     ));
     // FT_COMPLETE_SOURCES (0x30) MUST be sent or eMule's "Complete"
     // column stays at "0% (0)" forever — the UDP search response path
-    // was missing this tag before v0.9.40. Server-side we use the
-    // Lugdunum convention: total sources == complete sources (see
-    // FileEntry::complete_source_count in state/mod.rs for full rationale).
+    // was missing this tag before v0.9.40. It counts only sources offered
+    // as complete (issue #28; see FileRecord::complete_source_count).
     tags.push(Tag::byte(
         FT_COMPLETE_SOURCES,
         TagValue::U32(entry.complete_source_count()),
@@ -2006,6 +2033,70 @@ const OP_SERVER_NATT_KEEPALIVE: u8 = 0x9F;
 const OP_GLOB_FOUNDSOURCES: u8 = 0x9B;
 const OP_GLOB_SERVSTATRES: u8 = 0x97;
 const OP_SERVER_DESC_RES: u8 = 0xA3;
+
+/// Name, description and version from an OP_SERVER_DESC_RES payload (after
+/// the opcode).
+#[derive(Debug, Default, PartialEq)]
+pub struct ServerDesc {
+    pub name: Option<String>,
+    pub desc: Option<String>,
+    pub version: Option<String>,
+}
+
+/// Parse an OP_SERVER_DESC_RES as eMule does.
+///
+/// New format, the answer to a challenge whose low 16 bits are 0xF0FF:
+/// `[challenge u32][tag count u32][tags]`, with ST_SERVERNAME,
+/// ST_DESCRIPTION and ST_VERSION (a "major.minor" string, or a u32 with the
+/// major in the high 16 bits). It must echo `challenge`.
+///
+/// Old format: `[u16 len][name][u16 len][description]`. A real name cannot
+/// start with the length 0xF0FF, which is how the two are told apart. Text is
+/// decoded lossily: servers send whatever code page they were set up with.
+pub fn parse_server_desc_res(payload: &[u8], challenge: u32) -> Option<ServerDesc> {
+    if payload.len() >= 2 && payload[0..2] == [0xFF, 0xF0] {
+        if payload.len() < 8 {
+            return None;
+        }
+        let echoed = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+        if echoed != challenge {
+            return None;
+        }
+        let count = u32::from_le_bytes(payload[4..8].try_into().ok()?);
+        let mut rest = &payload[8..];
+        let mut out = ServerDesc::default();
+        for tag in crate::proto::tags::read_tag_list(&mut rest, count) {
+            match tag.name.as_byte() {
+                Some(ST_SERVERNAME) => out.name = tag.str_value().map(str::to_string),
+                Some(ST_DESCRIPTION) => out.desc = tag.str_value().map(str::to_string),
+                Some(ST_VERSION) => {
+                    out.version = tag.str_value().map(str::to_string).or_else(|| {
+                        tag.as_u32().map(|v| format!("{}.{}", v >> 16, v & 0xFFFF))
+                    })
+                }
+                _ => {}
+            }
+        }
+        return Some(out);
+    }
+    fn read_str(buf: &mut &[u8]) -> Option<String> {
+        if buf.len() < 2 {
+            return None;
+        }
+        let n = u16::from_le_bytes([buf[0], buf[1]]) as usize;
+        let bytes = buf.get(2..2 + n)?;
+        *buf = &buf[2 + n..];
+        Some(String::from_utf8_lossy(bytes).into_owned())
+    }
+    let mut buf = payload;
+    let name = read_str(&mut buf)?;
+    let desc = read_str(&mut buf);
+    Some(ServerDesc {
+        name: Some(name),
+        desc,
+        version: None,
+    })
+}
 const OP_GLOB_SEARCHRES: u8 = 0x99;
 
 /// Send a UDP reply, obfuscated the way the request was. A free function so
@@ -2054,5 +2145,64 @@ async fn send_reply(
             };
             socket.send_to(&wire, peer).await
         }
+    }
+}
+
+#[cfg(test)]
+mod server_desc_res_tests {
+    use super::*;
+
+    fn str_tag(id: u8, v: &str) -> Vec<u8> {
+        let mut t = vec![0x02, 0x01, 0x00, id];
+        t.extend_from_slice(&(v.len() as u16).to_le_bytes());
+        t.extend_from_slice(v.as_bytes());
+        t
+    }
+
+    #[test]
+    fn new_format_reads_tags_and_checks_the_challenge() {
+        let ch: u32 = 0xABCD_F0FF;
+        let mut p = ch.to_le_bytes().to_vec();
+        p.extend_from_slice(&3u32.to_le_bytes());
+        p.extend(str_tag(ST_SERVERNAME, "eMule Security"));
+        p.extend(str_tag(ST_DESCRIPTION, "no fakes"));
+        p.extend(str_tag(ST_VERSION, "17.15"));
+        let d = parse_server_desc_res(&p, ch).unwrap();
+        assert_eq!(d.name.as_deref(), Some("eMule Security"));
+        assert_eq!(d.desc.as_deref(), Some("no fakes"));
+        assert_eq!(d.version.as_deref(), Some("17.15"));
+        assert_eq!(parse_server_desc_res(&p, 0x1111_F0FF), None, "wrong challenge");
+    }
+
+    #[test]
+    fn numeric_version_is_major_dot_minor() {
+        let ch: u32 = 0x0001_F0FF;
+        let mut p = ch.to_le_bytes().to_vec();
+        p.extend_from_slice(&1u32.to_le_bytes());
+        p.extend_from_slice(&[0x03, 0x01, 0x00, ST_VERSION]);
+        p.extend_from_slice(&((17u32 << 16) | 15).to_le_bytes());
+        assert_eq!(parse_server_desc_res(&p, ch).unwrap().version.as_deref(), Some("17.15"));
+    }
+
+    #[test]
+    fn old_format_is_name_then_description() {
+        let mut p = vec![4, 0];
+        p.extend_from_slice(b"Name");
+        p.extend_from_slice(&[3, 0]);
+        p.extend_from_slice(b"Dsc");
+        let d = parse_server_desc_res(&p, 0xDEAD_F0FF).unwrap();
+        assert_eq!((d.name.as_deref(), d.desc.as_deref()), (Some("Name"), Some("Dsc")));
+        // A length running past the datagram is rejected, not over-read.
+        assert_eq!(parse_server_desc_res(&[200, 0, b'x'], 0), None);
+        assert_eq!(parse_server_desc_res(&[], 0), None);
+    }
+
+    #[test]
+    fn stored_text_is_bounded_and_clean() {
+        use crate::state::PeerInfo;
+        assert_eq!(PeerInfo::clean_text(" a\u{0}b\n "), Some("ab".into()));
+        assert_eq!(PeerInfo::clean_text("\u{7}\u{7}"), None);
+        let long = "x".repeat(1000);
+        assert_eq!(PeerInfo::clean_text(&long).unwrap().chars().count(), PeerInfo::MAX_TEXT_CHARS);
     }
 }

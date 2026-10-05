@@ -7,6 +7,7 @@
 
 mod age_pattern;
 pub mod geoip;
+pub mod mmdb;
 pub mod ipfilter;
 mod jargon;
 pub mod layer2_terms;
