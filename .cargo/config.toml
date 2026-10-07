@@ -13,11 +13,20 @@
 #   muzzy_decay_ms:1000     — same for muzzy pages; 1000 keeps RSS close to the
 #                             in-use bytes without the extra purge syscalls that
 #                             muzzy_decay_ms:0 costs (measured: ~+0.2% CPU).
+#   thp:never               — no transparent huge pages for jemalloc's memory.
+#                             With THP "always" (many VPS images) the kernel backs
+#                             the heap with 2 MB pages and counts a whole one as
+#                             resident as soon as any byte of it is used, so the
+#                             partly empty pages left by connects, disconnects
+#                             and evictions all stay in RSS. Measured on a live
+#                             server (3.6M files, 8k clients): AnonHugePages
+#                             938 MB, RSS 1.20 GB against 0.94 GB that jemalloc
+#                             itself held.
 #
 # Verify at runtime: `ps -T -p $(pgrep -f ed2k-server) | grep jemalloc`
 # (a `jemalloc_bg_thd` thread means the config was embedded).
 [env]
-JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000"
+JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,thp:never"
 
 # ── Optional CPU optimization (uncomment ONE that matches YOUR build host) ───
 # Commented out so the project builds portably everywhere. Enabling a specific

@@ -142,7 +142,7 @@ periodic jobs, or the machine is being slowed by something outside the server.
 
 | Interval | Work | Grows with |
 |---|---|---|
-| every `limits.ping_delay_seconds` (300 s in the VPS template) | `OP_SERVERSTATUS` to every connected client | number of clients |
+| every `limits.ping_delay_seconds` (300 s in the config template) | `OP_SERVERSTATUS` to every connected client, spread over 60 slices across the interval (since 0.9.78; up to 0.9.77, all at once) | number of clients |
 | every 10 min (first run 30 min after start) | sweep of the whole file index for entries left without sources | number of indexed files — the largest periodic job on a big server |
 | every 60 s | housekeeping: expired bans, bot trackers, stale server-list entries, peer descriptions | small |
 | every 30 s | change checks of the filter lists and other data files; a changed file is re-read and re-parsed (the IP filter and GeoIP database are the large ones) | file size, only when a file changed |
@@ -177,8 +177,9 @@ perf top -p $(pgrep -f ed2k-server)
 ```
 
 The admin panel helps to match a burst with a cause: the *Status* tab
-(searches, admission pools and queues, clients), *Bots* and *Health*. A burst
-every 5 minutes points at the client keepalive, one every 10 minutes at the
+(searches, admission pools and queues, clients), *Bots* and *Health*. Up to
+0.9.77 a burst every 5 minutes points at the client keepalive; one every 10
+minutes points at the
 index sweep, an irregular one with many refused or queued searches at search
 load.
 

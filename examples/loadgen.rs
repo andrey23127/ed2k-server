@@ -157,6 +157,10 @@ fn report(files: u64, baseline_kb: u64) {
     );
 }
 
+/// Files published between two keyword-index compactions — roughly what a busy
+/// server takes in over its 10-minute compaction interval.
+const COMPACT_EVERY: u64 = 1_000_000;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let num_files: u64 = args
@@ -211,11 +215,20 @@ fn main() {
 
         state.add_file_with_source(hash, h1, name, (uh, ip, port, true));
 
+        // The server merges the keyword index's uncompressed hot tier into the
+        // compressed cold tier every 10 minutes. Without doing the same here the
+        // whole index stayed in the hot tier and the measured memory was not
+        // what a running server holds.
+        if (i + 1) % COMPACT_EVERY == 0 {
+            state.keyword_index.compact();
+        }
+
         if (i + 1) % report_every == 0 {
             report(i + 1, baseline_kb);
         }
     }
 
+    state.keyword_index.compact();
     let elapsed = t0.elapsed();
     let rss_after_files = status_kb("VmRSS");
     println!("\n=== after files ===");
@@ -266,6 +279,13 @@ fn main() {
     println!("\n--- structures ---");
     for (k, v) in state.memory_report() {
         println!("{:>28} = {}", k, v);
+    }
+
+    // Byte breakdown by container (the same data /api/memsize exposes), per
+    // file, so a change can be attributed to the structure it touched.
+    println!("\n--- memsize (bytes, bytes/file) ---");
+    for (k, v) in state.memsize_report() {
+        println!("{:>36} = {:>14}  {:>8.1}", k, v, v as f64 / num_files.max(1) as f64);
     }
 
     // Extrapolation helper to the real target.

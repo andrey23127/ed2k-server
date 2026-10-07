@@ -162,23 +162,26 @@ fn orphan_sweep(state: &ed2k_server::state::ServerState) {
     // Collect orphan FileIds (no sources) via the slab. We collect first, then
     // evict, so we never hold a shard read lock while taking the write locks
     // tombstone/remove_file need.
-    // NOTE: Arc<str> (a DST behind the pointer) must be the LAST tuple element,
-    // so the layout is (id, hash, name).
-    let mut to_evict: Vec<(FileId, [u8; 16], std::sync::Arc<str>)> = Vec::new();
+    // Only the ids are collected: the name needed for the keyword removal is
+    // returned by the tombstone itself, so nothing is cloned here.
+    let mut to_evict: Vec<FileId> = Vec::new();
     state.file_slab.for_each_live(|id, r| {
         if r.sources.is_empty() {
-            to_evict.push((id, r.hash, r.name.clone()));
+            to_evict.push(id);
         }
     });
     let scanned_ms = t0.elapsed().as_millis();
 
     let t1 = std::time::Instant::now();
-    let evicted_ids: Vec<FileId> = to_evict.iter().map(|(id, _, _)| *id).collect();
-    for (fid, _h, name) in to_evict {
-        // Remove the keyword postings, then tombstone the slab slot (id retired,
-        // never reused).
-        state.keyword_index.remove_file(fid, &name);
-        if state.file_slab.tombstone(fid) {
+    let mut evicted_ids: Vec<FileId> = Vec::with_capacity(to_evict.len());
+    for fid in to_evict {
+        // Tombstone only if still sourceless — a publisher may have added a
+        // source since the scan — then remove the keyword postings of what was
+        // actually tombstoned. Searches skip a tombstoned id, so the short gap
+        // before the postings go is harmless.
+        if let Some(name) = state.file_slab.tombstone_if_sourceless(fid) {
+            state.keyword_index.remove_file(fid, &name);
+            evicted_ids.push(fid);
             removed += 1;
         }
     }
@@ -401,6 +404,10 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    // Raise the descriptor limit to what the system allows before anything
+    // checks it. See raise_fd_limit.
+    raise_fd_limit();
+
     // admission (issue #25): the open-socket ceiling is only a ceiling if the
     // process can actually hold that many descriptors.
     {
@@ -943,7 +950,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     if Some(mtime) == last_mtime {
                         continue;
                     }
-                    let text = match std::fs::read_to_string(&path) {
+                    let text = match read_to_string_off(&path).await {
                         Ok(t) => t,
                         Err(e) => {
                             warn!(error = %e, "L2 vocabulary read failed; keeping current lists");
@@ -999,7 +1006,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         Err(_) => continue,
                     };
                     if Some(mtime) != last_mtime {
-                        match ed2k_server::filter::ContentFilter::load_terms_file(&path) {
+                        match load_terms_file_off(&path).await {
                             Ok(terms) => {
                                 let n = terms.len();
                                 state_terms.filter.reload_extra_terms(terms);
@@ -1041,7 +1048,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         Err(_) => continue,
                     };
                     if Some(mtime) != last_mtime {
-                        match ed2k_server::filter::ContentFilter::load_terms_file(&path) {
+                        match load_terms_file_off(&path).await {
                             Ok(terms) => {
                                 let n = terms.len();
                                 state_jargon.filter.reload_jargon_terms(terms);
@@ -1096,7 +1103,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         let mut all: Vec<[u8; 16]> = Vec::new();
                         let mut ok = true;
                         for p in &paths {
-                            match ed2k_server::filter::ContentFilter::load_hash_file(p) {
+                            match load_hash_file_off(p).await {
                                 Ok(h) => all.extend(h),
                                 Err(e) => {
                                     warn!(path = %p.display(), error = %e,
@@ -1154,7 +1161,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         let mut all: Vec<[u8; 16]> = Vec::new();
                         let mut ok = true;
                         for p in &paths {
-                            match ed2k_server::filter::ContentFilter::load_hash_file(p) {
+                            match load_hash_file_off(p).await {
                                 Ok(h) => all.extend(h),
                                 Err(e) => {
                                     warn!(path = %p.display(), error = %e,
@@ -1206,7 +1213,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         None => continue, // unreadable right now; retry next tick
                     };
                     if Some(now) != last_mtime {
-                        match ed2k_server::filter::ContentFilter::load_hash_file(&path) {
+                        match load_hash_file_off(&path).await {
                             Ok(h) => {
                                 let n = h.len();
                                 // An empty file is applied as written: clearing the
@@ -1404,9 +1411,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let mut all: Vec<[u8; 16]> = Vec::new();
                     let mut ok = true;
                     for path in &cfg_reload.content_filter.hash_banlist {
-                        match ed2k_server::filter::ContentFilter::load_hash_file(
-                            std::path::Path::new(path),
-                        ) {
+                        match load_hash_file_off(std::path::Path::new(path)).await {
                             Ok(h) => all.extend(h),
                             Err(e) => {
                                 warn!(path, error = %e, "failed to reload hash blocklist");
@@ -1426,9 +1431,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let mut all: Vec<[u8; 16]> = Vec::new();
                     let mut ok = true;
                     for path in &cfg_reload.content_filter.hash_filter {
-                        match ed2k_server::filter::ContentFilter::load_hash_file(
-                            std::path::Path::new(path),
-                        ) {
+                        match load_hash_file_off(std::path::Path::new(path)).await {
                             Ok(h) => all.extend(h),
                             Err(e) => {
                                 warn!(path, error = %e, "failed to reload poison hash list");
@@ -1449,7 +1452,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // has since been fixed — the watcher will not retry a file whose
                 // mtime it has already seen.
                 if let Some(path) = &cfg_reload.content_filter.layer2_terms_file {
-                    match std::fs::read_to_string(path) {
+                    match read_to_string_off(path).await {
                         Ok(text) => {
                             match ed2k_server::filter::layer2_terms::Layer2Terms::parse(&text) {
                                 Ok(terms) => {
@@ -1472,9 +1475,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // /api/reload) and the standalone mtime watcher call
                 // reload_extra_terms; either applies without a restart.
                 if let Some(path) = &cfg_reload.content_filter.extra_terms_file {
-                    match ed2k_server::filter::ContentFilter::load_terms_file(std::path::Path::new(
+                    match load_terms_file_off(std::path::Path::new(
                         path,
-                    )) {
+                    )).await {
                         Ok(terms) => {
                             let n = terms.len();
                             state_reload.filter.reload_extra_terms(terms);
@@ -1486,9 +1489,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Reload L1 jargon list live, same as L4.
                 if let Some(path) = &cfg_reload.content_filter.jargon_terms_file {
-                    match ed2k_server::filter::ContentFilter::load_terms_file(std::path::Path::new(
+                    match load_terms_file_off(std::path::Path::new(
                         path,
-                    )) {
+                    )).await {
                         Ok(terms) => {
                             let n = terms.len();
                             state_reload.filter.reload_jargon_terms(terms);
@@ -1500,9 +1503,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Hash whitelist (false-positive overrides).
                 if let Some(path) = &cfg_reload.content_filter.whitelist_hashes_file {
-                    match ed2k_server::filter::ContentFilter::load_hash_file(std::path::Path::new(
+                    match load_hash_file_off(std::path::Path::new(
                         path,
-                    )) {
+                    )).await {
                         Ok(h) => {
                             let n = h.len();
                             state_reload.filter.reload_hash_whitelist(h);
@@ -1521,14 +1524,21 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 if !cfg_reload.storage.ipfilter_path.is_empty() {
                     use ed2k_server::filter::ipfilter::IpFilter;
                     let path = std::path::Path::new(&cfg_reload.storage.ipfilter_path);
-                    let new_filter = IpFilter::load(path);
-                    let ranges = new_filter.len();
-                    *state_reload.ip_filter.write().await = new_filter;
-                    info!(
-                        ranges,
-                        path = &cfg_reload.storage.ipfilter_path,
-                        "IP filter reloaded"
-                    );
+                    // Parsed off the runtime (the file runs to hundreds of
+                    // thousands of ranges); only the swap happens here.
+                    let owned = path.to_path_buf();
+                    match tokio::task::spawn_blocking(move || IpFilter::load(&owned)).await {
+                        Ok(new_filter) => {
+                            let ranges = new_filter.len();
+                            *state_reload.ip_filter.write().await = new_filter;
+                            info!(
+                                ranges,
+                                path = &cfg_reload.storage.ipfilter_path,
+                                "IP filter reloaded"
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "IP filter reload failed; keeping current filter"),
+                    }
                 }
 
                 // Hot-reload the country database.
@@ -1858,6 +1868,28 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         tracing::debug!(ip = %peer.ip(), error = %e,
                             "failed to enable TCP keepalive on client socket");
                     }
+                    // TCP_USER_TIMEOUT: give up on a connection whose sent data
+                    // has gone unacknowledged for as long as keepalive tolerates
+                    // silence (the 5 minutes above). Without it the kernel kept
+                    // retransmitting for ~15 minutes (tcp_retries2), and the
+                    // session behind it stayed open as long.
+                    //
+                    // The case that showed it: a client behind a firewall that
+                    // drops an eD2k flow a few seconds after login. The client
+                    // reconnects every ~22 s; every abandoned connection kept
+                    // retransmitting the server's welcome frames, and one client
+                    // held 27 sockets. With this the kernel aborts each one after
+                    // 5 minutes and the task ends.
+                    //
+                    // Equal to the keepalive budget on purpose: with keepalive
+                    // on, this timeout also decides when unanswered probes kill
+                    // the connection, so a shorter value would cut the 5-minute
+                    // tolerance that keeps clients behind overloaded NATs.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if let Err(e) = sref.set_tcp_user_timeout(Some(TCP_USER_TIMEOUT)) {
+                        tracing::debug!(ip = %peer.ip(), error = %e,
+                            "failed to set TCP_USER_TIMEOUT on client socket");
+                    }
                 }
                 let cfg = Arc::clone(&cfg);
                 let state = Arc::clone(&state);
@@ -1933,7 +1965,12 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     continue;
                 }
                 let (open_permit, pending_permit) = permits.take().expect("set above");
-                tokio::spawn(async move {
+                // Counted for /api/memsize: live connection tasks, and the size
+                // of one task's future (per-client memory for the whole session).
+                let task_gauge = ConnTaskGauge::new(Arc::clone(&state));
+                let sizes = Arc::clone(&state);
+                let task = async move {
+                    let _task_gauge = task_gauge;
                     let _ip_slot = ip_slot;
                     let _open_permit = open_permit;
                     // Bound the setup phase (TCP accept → obfuscation
@@ -1977,11 +2014,132 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     {
                         tracing::debug!(ip = %peer.ip(), error = %e, "connection ended");
                     }
-                });
+                };
+                sizes.conn_task_bytes.store(
+                    std::mem::size_of_val(&task) as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                tokio::spawn(task);
             }
             Err(e) => {
-                error!(error = %e, "accept failed");
+                // Out of descriptors (or kernel memory): the pending connection
+                // stays in the listen queue, so the next accept() fails again at
+                // once. Retrying immediately turned that into a busy loop — one
+                // core at 100% and no client admitted, which is what a server at
+                // the default 1024-descriptor limit showed at ~900-1000 clients.
+                // Pause so the loop yields while sockets close, as servers
+                // usually do on EMFILE.
+                let exhausted = matches!(
+                    e.raw_os_error(),
+                    Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                );
+                let key = if exhausted { "accept_exhausted" } else { "accept_failed" };
+                if let Some(sup) = ed2k_server::health::throttle().allow(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    key,
+                    std::time::Duration::from_secs(60),
+                ) {
+                    if exhausted {
+                        error!(error = %e, suppressed = sup,
+                            "accept failed: out of file descriptors — raise LimitNOFILE \
+                             (see contrib/ed2k-server.service); pausing accepts briefly");
+                    } else {
+                        error!(error = %e, suppressed = sup, "accept failed");
+                    }
+                }
+                if exhausted {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
     }
 }
+
+/// Set the soft open-files limit to the hard limit.
+///
+/// Every client is a socket. The usual soft limit is 1024 — what a service
+/// gets when its unit has no LimitNOFILE, or a server started from a shell,
+/// screen or a container — and it runs out at roughly 900-1000 clients, below
+/// any configured max_clients. The hard limit is normally far higher (524288
+/// under current systemd), and raising the soft limit up to it needs no
+/// privilege, so the server does it itself. An explicit LimitNOFILE still
+/// decides: it sets both limits.
+fn raise_fd_limit() {
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit/setrlimit read and write only the struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } != 0 {
+        return;
+    }
+    // An "unlimited" hard limit is not a valid soft value for NOFILE (the
+    // kernel caps it at fs.nr_open); 1M is the usual nr_open default.
+    let target = if rl.rlim_max == libc::RLIM_INFINITY {
+        1 << 20
+    } else {
+        rl.rlim_max
+    };
+    if rl.rlim_cur >= target {
+        return;
+    }
+    let before = rl.rlim_cur;
+    rl.rlim_cur = target;
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rl) } == 0 {
+        #[allow(clippy::unnecessary_cast)] // rlim_t's width differs by platform
+        let (before, after) = (before as u64, target as u64);
+        info!(before, after, "raised the open-files limit to the hard limit");
+    }
+}
+
+// ── File loads off the runtime ──────────────────────────────────────────────
+//
+// The hot-reload watchers and the SIGHUP / /api/reload path run as tasks on the
+// runtime. Reading and parsing a list there (a hash list of 130k lines, the IP
+// filter) stalled every connection for its duration at the default single
+// worker thread. These run the same loaders on the blocking pool; the swap
+// into the filter stays where it was, so what is applied, and when a failed
+// read keeps the current list, is unchanged.
+
+async fn load_hash_file_off(p: &std::path::Path) -> std::io::Result<Vec<[u8; 16]>> {
+    let p = p.to_path_buf();
+    tokio::task::spawn_blocking(move || ed2k_server::filter::ContentFilter::load_hash_file(&p))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+async fn load_terms_file_off(p: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let p = p.to_path_buf();
+    tokio::task::spawn_blocking(move || ed2k_server::filter::ContentFilter::load_terms_file(&p))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+async fn read_to_string_off(p: impl AsRef<std::path::Path>) -> std::io::Result<String> {
+    let p = p.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::read_to_string(&p))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+}
+
+/// Counts a live connection task in `ServerState::conn_tasks` for as long as it
+/// exists (created before the spawn, dropped with the task's future).
+struct ConnTaskGauge(Arc<ed2k_server::state::ServerState>);
+
+impl ConnTaskGauge {
+    fn new(state: Arc<ed2k_server::state::ServerState>) -> Self {
+        state.conn_tasks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(state)
+    }
+}
+
+impl Drop for ConnTaskGauge {
+    fn drop(&mut self) {
+        self.0.conn_tasks.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Unacknowledged-data limit for client sockets (TCP_USER_TIMEOUT). Matches the
+/// keepalive tolerance set at accept: 60 s + 8 probes x 30 s.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);

@@ -951,7 +951,9 @@ fn default_version_minor() -> u8 {
     15
 }
 fn default_max_clients() -> u32 {
-    1024
+    // Was 1024. Enforced since 0.9.77, so a config without the key capped the
+    // server at ~1000 users without saying so. 5000 matches config/config.toml.
+    5000
 }
 fn default_soft_limit() -> u32 {
     1000
@@ -1100,6 +1102,18 @@ whitelist_hashes = ""
     /// Enforce the SPEC.md §1.2 rule: refuse public deployment without
     /// a hash blocklist configured.
     pub fn validate(&self) -> Result<()> {
+        // The shipped template marks what must be filled in with CHANGE_ME. A
+        // server started from it unedited would announce itself to the network
+        // as "CHANGE_ME" and run with a degraded obfuscation key (this_ip is
+        // what it derives from), so it stops here instead, saying what to fix.
+        for (key, value) in [("server.name", &self.server.name), ("server.this_ip", &self.server.this_ip)] {
+            if value.contains("CHANGE_ME") {
+                bail!(
+                    "{key} is still \"{value}\" from the template: set it in the config file \
+                     (see README, \"Installing on a VPS\"). Refusing to start."
+                );
+            }
+        }
         if self.server.public && self.content_filter.hash_banlist.is_empty() {
             bail!(
                 "server.public = true requires content_filter.hash_banlist \
@@ -1170,6 +1184,23 @@ mod tests {
         assert_eq!(cfg.network.tcp_port, 4661);
         // Protocol-fixed offset: main UDP is always TCP+4.
         assert_eq!(cfg.network.udp_port(), 4665);
+    }
+
+    #[test]
+    fn the_shipped_template_parses_and_refuses_until_edited() {
+        let text = include_str!("../config/config.toml");
+        let cfg: Config = toml::from_str(text).expect("config/config.toml must parse");
+        let err = cfg.validate().expect_err("CHANGE_ME must stop the server").to_string();
+        assert!(err.contains("server.name"), "{err}");
+        assert_eq!(cfg.limits.max_clients, 5000);
+        assert!(cfg.server.public);
+
+        // Filled in, it is a valid public configuration.
+        let edited = text
+            .replacen("name = \"CHANGE_ME\"", "name = \"Example\"", 1)
+            .replacen("this_ip = \"CHANGE_ME\"", "this_ip = \"203.0.113.7\"", 1);
+        let cfg: Config = toml::from_str(&edited).unwrap();
+        cfg.validate().expect("an edited template is valid");
     }
 
     #[test]

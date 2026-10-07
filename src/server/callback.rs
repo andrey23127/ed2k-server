@@ -20,7 +20,7 @@ use std::net::IpAddr;
 
 use tokio_util::codec::Framed;
 
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Handle OP_CALLBACKREQUEST from a client.
 /// `target_id` is the LowID of the client the requester wants to reach.
@@ -45,7 +45,10 @@ pub async fn handle_callback_request(
     let target = state.client_by_assigned_id(target_id);
 
     let Some(target) = target else {
-        warn!(
+        // Debug, not warn: a target that left between the source list and the
+        // callback is routine, and clients retry, so at warn level this was a
+        // steady stream of lines on a busy server.
+        debug!(
             requester = %requester.ip,
             target_id,
             "CALLBACKREQUEST: target not connected"

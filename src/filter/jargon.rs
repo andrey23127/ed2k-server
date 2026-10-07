@@ -308,9 +308,16 @@ fn contains_bounded(lowered: &str, term: &str, right: RightRule) -> bool {
 ///
 /// The returned term is the list entry VERBATIM, `$` included, so an operator
 /// reading a review can find the exact line that fired.
-pub(super) fn matches_terms<'a>(lowered: &str, terms: &'a [String]) -> Option<&'a str> {
-    for term in terms {
-        if term.is_empty() {
+pub(super) fn matches_terms<'a>(lowered: &str, list: &'a TermList) -> Option<&'a str> {
+    let terms = &list.terms;
+    if terms.is_empty() {
+        return None;
+    }
+    // Which terms can match at all — see TermList. Exact: a term is skipped
+    // only when a piece of text it cannot match without is absent from the name.
+    let candidates = list.candidates(lowered);
+    for (i, term) in terms.iter().enumerate() {
+        if term.is_empty() || !candidates.contains(i) {
             continue;
         }
         let (text, anchored) = split_anchor(term);
@@ -328,14 +335,145 @@ pub(super) fn matches_terms<'a>(lowered: &str, terms: &'a [String]) -> Option<&'
     None
 }
 
+/// A term list with a prefilter.
+///
+/// `matches_terms` used to run the full boundary-aware search for every term
+/// against every name: ~1000 terms, each a fresh substring search over the
+/// name. On the live server that was over a quarter of all CPU time — every
+/// GETSOURCES, UDP source query, OFFERFILES record and served search result
+/// passes through it.
+///
+/// Every term has a literal it cannot match without:
+///   * a term without a space, or with non-ASCII text, is searched for
+///     verbatim (`find_flexible`'s plain path), so the whole term is it;
+///   * an ASCII term with spaces matches each space against one or more
+///     separators, so each space-separated piece must appear verbatim — the
+///     longest piece is used.
+///
+/// One Aho-Corasick pass over the name finds which literals occur. Only the
+/// terms whose literal occurs are given to the unchanged boundary-aware search,
+/// still in list order, so the first match — and the term reported — is
+/// exactly what the full scan found. A term with no literal (only spaces) is
+/// always checked.
+pub(super) struct TermList {
+    terms: Vec<String>,
+    /// Automaton over the distinct literals; None when there are none.
+    ac: Option<aho_corasick::AhoCorasick>,
+    /// For each automaton pattern, the terms using that literal.
+    by_pattern: Vec<Vec<u32>>,
+    /// Terms checked on every name (no literal).
+    always: Vec<u32>,
+}
+
+/// The literal a term cannot match without; None if it has none.
+fn required_literal(term: &str) -> Option<&str> {
+    let (text, _) = split_anchor(term);
+    if text.is_empty() {
+        return None;
+    }
+    if !text.contains(' ') || !text.is_ascii() {
+        return Some(text);
+    }
+    text.split(' ').filter(|p| !p.is_empty()).max_by_key(|p| p.len())
+}
+
+/// Set of term indices (bitset).
+pub(super) struct Candidates(Vec<u64>);
+
+impl Candidates {
+    fn insert(&mut self, i: u32) {
+        self.0[(i / 64) as usize] |= 1u64 << (i % 64);
+    }
+    fn contains(&self, i: usize) -> bool {
+        self.0[i / 64] & (1u64 << (i % 64)) != 0
+    }
+}
+
+impl TermList {
+    pub(super) fn new(terms: Vec<String>) -> Self {
+        let mut literals: Vec<&str> = Vec::new();
+        let mut by_pattern: Vec<Vec<u32>> = Vec::new();
+        let mut index: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        let mut always = Vec::new();
+        for (i, term) in terms.iter().enumerate() {
+            if term.is_empty() {
+                continue;
+            }
+            match required_literal(term) {
+                Some(lit) => {
+                    let p = *index.entry(lit).or_insert_with(|| {
+                        literals.push(lit);
+                        by_pattern.push(Vec::new());
+                        literals.len() - 1
+                    });
+                    by_pattern[p].push(i as u32);
+                }
+                None => always.push(i as u32),
+            }
+        }
+        // Standard match semantics: required for overlapping search, which
+        // reports every literal that occurs, wherever it overlaps another.
+        let ac = if literals.is_empty() {
+            None
+        } else {
+            match aho_corasick::AhoCorasick::new(&literals) {
+                Ok(ac) => Some(ac),
+                Err(_) => {
+                    // Cannot happen for a few thousand short literals; if it
+                    // ever did, check every term rather than skip any.
+                    always = (0..terms.len() as u32).collect();
+                    by_pattern.clear();
+                    None
+                }
+            }
+        };
+        TermList { terms, ac, by_pattern, always }
+    }
+
+    fn candidates(&self, lowered: &str) -> Candidates {
+        let mut c = Candidates(vec![0u64; self.terms.len().div_ceil(64)]);
+        for &i in &self.always {
+            c.insert(i);
+        }
+        if let Some(ac) = &self.ac {
+            for m in ac.find_overlapping_iter(lowered) {
+                for &i in &self.by_pattern[m.pattern().as_usize()] {
+                    c.insert(i);
+                }
+            }
+        }
+        c
+    }
+
+    /// Heap bytes of the term strings (for /api/memsize).
+    pub(super) fn heap_bytes(&self) -> usize {
+        self.terms.capacity() * std::mem::size_of::<String>()
+            + self.terms.iter().map(|t| t.capacity()).sum::<usize>()
+            + self.ac.as_ref().map_or(0, |a| a.memory_usage())
+    }
+}
+
+impl Default for TermList {
+    fn default() -> Self {
+        TermList::new(Vec::new())
+    }
+}
+
+impl std::ops::Deref for TermList {
+    type Target = [String];
+    fn deref(&self) -> &[String] {
+        &self.terms
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // Synthetic, non-real terms exercise the LOGIC without embedding any real
     // vocabulary: "longmarker" (≥6 → substring), "shrt" (≤5 → word-bounded).
-    fn sample() -> Vec<String> {
-        vec!["longmarker".to_string(), "shrt".to_string()]
+    fn sample() -> TermList {
+        TermList::new(vec!["longmarker".to_string(), "shrt".to_string()])
     }
 
     #[test]
@@ -353,7 +491,7 @@ mod tests {
     fn long_term_does_not_start_inside_an_english_word() {
         // THE REGRESSION: a term that is a suffix of an ordinary word must not
         // fire. Mirrors the live "fibrosis" false positive with a synthetic term.
-        let t = vec!["marker".to_string()];
+        let t = TermList::new(vec!["marker".to_string()]);
         assert!(matches_terms("biomarker discovery in plasma.pdf", &t).is_none());
         assert!(matches_terms("xmarker.zip", &t).is_none());
         // ...but the same term still fires when it starts a word.
@@ -365,7 +503,7 @@ mod tests {
     fn concatenated_form_is_covered_by_its_own_term() {
         // A site name gluing a prefix onto a term is reachable by listing the
         // concatenation — this is how the left anchor stays lossless.
-        let t = vec!["marker".to_string(), "biomarker".to_string()];
+        let t = TermList::new(vec!["marker".to_string(), "biomarker".to_string()]);
         assert!(matches_terms("biomarker discovery.pdf", &t).is_some());
     }
 
@@ -399,7 +537,7 @@ mod tests {
         // A multi-word brand is written every way there is. Carrying only the
         // spaced form let 25 files of the hyphenated form through on one
         // measurement, three of them live in search results.
-        let t = vec!["shrt marker".to_string()];
+        let t = TermList::new(vec!["shrt marker".to_string()]);
         for name in [
             "shrt marker - ann 015.mp4",
             "shrt-marker_ann-015_1080p.mp4",
@@ -419,7 +557,7 @@ mod tests {
         // must not reach the same two words separated by a space — for one term
         // in the live L1 list that is the difference between a brand and an
         // ordinary vehicle name.
-        let t = vec!["shrt-marker".to_string()];
+        let t = TermList::new(vec!["shrt-marker".to_string()]);
         assert!(matches_terms("shrt-marker issue 15.rar", &t).is_some());
         assert!(matches_terms("shrt marker rover 2004 review.avi", &t).is_none());
         assert!(matches_terms("shrt_marker.avi", &t).is_none());
@@ -429,11 +567,11 @@ mod tests {
     #[test]
     fn flexible_matching_keeps_the_boundary_rules() {
         // The separator is flexible; the edges are not.
-        let t = vec!["shrt marker".to_string()];
+        let t = TermList::new(vec!["shrt marker".to_string()]);
         assert!(matches_terms("ashrt-marker.mp4", &t).is_none());
         assert!(matches_terms("shrt-markerish.mp4", &t).is_some()); // long term: tail free
                                                                     // And a right anchor still applies to the end of the whole term.
-        let anchored = vec!["shrt marker$".to_string()];
+        let anchored = TermList::new(vec!["shrt marker$".to_string()]);
         assert!(matches_terms("shrt-markers of the world.pdf", &anchored).is_none());
         assert!(matches_terms("shrt-marker - vixen.mp4", &anchored).is_some());
         assert!(matches_terms("shrt.marker_01.mp4", &anchored).is_none());
@@ -445,11 +583,11 @@ mod tests {
         // inside the French word for "elephant"; before the fix its left
         // neighbour `é` was not an ASCII letter, so the boundary check passed
         // and 21 legitimate files were blocked and then hash-banned.
-        let t = vec!["shrt".to_string()];
+        let t = TermList::new(vec!["shrt".to_string()]);
         assert!(matches_terms("le grand éshrt blanc.mp4", &t).is_none());
         assert!(matches_terms("l'éshrt aveugle.mp3", &t).is_none());
         // A long term is protected on the left by the same rule.
-        let long = vec!["marker".to_string()];
+        let long = TermList::new(vec!["marker".to_string()]);
         assert!(matches_terms("télémarker sur la piste.avi", &long).is_none());
         // Right side too: no Latin letter may follow a short term.
         assert!(matches_terms("shrté.mp4", &t).is_none());
@@ -465,7 +603,7 @@ mod tests {
         // and the rule read it as a boundary — the third time this word came
         // through. Tested here against the matcher alone, WITHOUT the
         // recomposition pass, so this holds even for a mark nfc.rs cannot fold.
-        let t = vec!["shrt".to_string()];
+        let t = TermList::new(vec!["shrt".to_string()]);
         assert!(matches_terms("l'e\u{301}le\u{301}shrt.cbr", &t).is_none());
         assert!(matches_terms("l'x\u{301}shrt.cbr", &t).is_none());
         // A mark AFTER a short term modifies its last letter: not the term.
@@ -481,10 +619,10 @@ mod tests {
         // marker was glued straight onto Chinese text. CJK and Cyrillic are
         // written without word separators, so an adjacent character there says
         // nothing about word membership.
-        let t = vec!["shrt".to_string()];
+        let t = TermList::new(vec!["shrt".to_string()]);
         assert!(matches_terms("最新最牛逼shrt+兽皇合集.torrent", &t).is_some());
         assert!(matches_terms("shrt么么哒.mp4", &t).is_some());
-        let long = vec!["marker".to_string()];
+        let long = TermList::new(vec!["marker".to_string()]);
         assert!(matches_terms("正太shota么么哒marker+boy.mp4", &long).is_some());
         assert!(matches_terms("порноmarker.avi", &long).is_some());
     }
@@ -492,12 +630,12 @@ mod tests {
     #[test]
     fn right_anchor_is_opt_in() {
         // Without `$` a long term ignores what follows.
-        let free = vec!["art of zoo".to_string()];
+        let free = TermList::new(vec!["art of zoo".to_string()]);
         assert!(matches_terms("the art of zoology (bbc).mkv", &free).is_some());
 
         // With `$` it must stop at a boundary — which is what separates the
         // brand from the innocent word that starts the same way.
-        let anchored = vec!["art of zoo$".to_string()];
+        let anchored = TermList::new(vec!["art of zoo$".to_string()]);
         assert!(matches_terms("the art of zoology (bbc).mkv", &anchored).is_none());
         assert!(matches_terms("art of zoological illustration.pdf", &anchored).is_none());
         assert!(matches_terms("art of zoo - vixen.mp4", &anchored).is_some());
@@ -513,12 +651,12 @@ mod tests {
 
         // `$` also tightens the right side of a SHORT term from letters to all
         // word characters.
-        let short = vec!["abc$".to_string()];
+        let short = TermList::new(vec!["abc$".to_string()]);
         assert!(matches_terms("abc_1.mp4", &short).is_none());
         assert!(matches_terms("abc-1.mp4", &short).is_some());
 
         // A bare "$" is a term, not an anchor request.
-        let dollar = vec!["$".to_string()];
+        let dollar = TermList::new(vec!["$".to_string()]);
         assert!(matches_terms("price $5.mp4", &dollar).is_some());
     }
 
@@ -527,7 +665,7 @@ mod tests {
         // A CJK term has no ASCII word edges, so neither boundary rule applies:
         // it behaves as a plain substring, which is the only correct reading for
         // a script written without word separators.
-        let t = vec!["幼女".to_string()];
+        let t = TermList::new(vec!["幼女".to_string()]);
         assert!(matches_terms("中国 幼女 幼童.avi", &t).is_some());
         assert!(matches_terms("欧美无码幼女学生.avi", &t).is_some());
         // THE REGRESSION: an ASCII digit directly before the term. Byte-wise
@@ -536,19 +674,85 @@ mod tests {
         assert!(matches_terms("小陈头星选10-19幼女大奶妹子.mp4", &t).is_some());
         assert!(matches_terms("x幼女y.avi", &t).is_some());
         // Long CJK terms take the substring path and must not be left-anchored.
-        let t2 = vec!["ロリータ写真集".to_string()];
+        let t2 = TermList::new(vec!["ロリータ写真集".to_string()]);
         assert!(matches_terms("abcロリータ写真集.zip", &t2).is_some());
     }
 
     #[test]
     fn empty_list_matches_nothing() {
-        assert!(matches_terms("anything at all.mp4", &[]).is_none());
+        assert!(matches_terms("anything at all.mp4", &TermList::default()).is_none());
     }
 
     #[test]
     fn empty_term_is_skipped() {
-        let t = vec!["".to_string(), "longmarker".to_string()];
+        let t = TermList::new(vec!["".to_string(), "longmarker".to_string()]);
         assert!(matches_terms("nothing here.mp4", &t).is_none());
         assert!(matches_terms("longmarker.mp4", &t).is_some());
+    }
+
+    /// The prefilter must never change the answer: same term, or none, as
+    /// testing every term in order.
+    #[test]
+    fn the_prefilter_answers_exactly_like_the_full_scan() {
+        fn full_scan<'a>(lowered: &str, terms: &'a [String]) -> Option<&'a str> {
+            terms.iter().find_map(|term| {
+                if term.is_empty() {
+                    return None;
+                }
+                let (text, anchored) = split_anchor(term);
+                let right = if anchored {
+                    RightRule::NotWordChar
+                } else if text.chars().count() >= SUBSTRING_MIN_CHARS {
+                    RightRule::Free
+                } else {
+                    RightRule::NotLetter
+                };
+                contains_bounded(lowered, text, right).then_some(term.as_str())
+            })
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let words = ["ab", "abc", "qxz", "qxzmarker", "longmarker", "mark", "é", "幼", "z", "1"];
+        let seps = [" ", "-", "_", ".", "", "  ", "é", "x"];
+        for _ in 0..3000 {
+            let mut terms: Vec<String> = Vec::new();
+            for _ in 0..1 + rnd(6) {
+                let mut t = String::new();
+                for k in 0..1 + rnd(3) {
+                    if k > 0 {
+                        t.push_str([" ", "-", ""][rnd(3)]);
+                    }
+                    t.push_str(words[rnd(words.len())]);
+                }
+                match rnd(6) {
+                    0 => t.push('$'),
+                    1 => t.insert(0, ' '),
+                    2 => t.push(' '),
+                    _ => {}
+                }
+                terms.push(t);
+            }
+            if rnd(10) == 0 {
+                terms.push(" ".to_string());
+            }
+            let list = TermList::new(terms.clone());
+            for _ in 0..8 {
+                let mut name = String::new();
+                for _ in 0..1 + rnd(6) {
+                    name.push_str(seps[rnd(seps.len())]);
+                    name.push_str(words[rnd(words.len())]);
+                }
+                assert_eq!(
+                    matches_terms(&name, &list),
+                    full_scan(&name, &terms),
+                    "terms {terms:?} name {name:?}"
+                );
+            }
+        }
     }
 }

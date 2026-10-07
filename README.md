@@ -120,6 +120,15 @@ You can confirm the jemalloc tuning was embedded at runtime:
 ps -T -p $(pgrep -f ed2k-server) | grep jemalloc   # a jemalloc_bg_thd thread = OK
 ```
 
+The tuning includes `thp:never`: jemalloc's memory is kept out of transparent
+huge pages. On a system with THP set to `always` (`cat
+/sys/kernel/mm/transparent_hugepage/enabled`) the kernel otherwise counts every
+partly used 2 MB page as resident, and RSS ran ~25% above what the server held
+(live: 1.20 GB RSS, 0.94 GB held, `AnonHugePages` 938 MB). Check with
+`grep AnonHugePages /proc/$(pidof ed2k-server)/smaps_rollup` — near 0 with the
+tuning in place. A binary built without it gets the same effect from
+`Environment=_RJEM_MALLOC_CONF=thp:never` in the service unit.
+
 ---
 
 ## Installing on a VPS
@@ -134,10 +143,37 @@ sudo install -m 0755 target/release/ed2k-server /usr/local/bin/ed2k-server
 
 ```bash
 sudo mkdir -p /etc/ed2k-server
-sudo cp config/config.vps.toml /etc/ed2k-server/config.toml   # then edit the CHANGE_ME fields
+sudo cp config/config.toml /etc/ed2k-server/config.toml
+sudo nano /etc/ed2k-server/config.toml      # replace every CHANGE_ME
 ```
 
-Put your runtime data files here too and point the config at them:
+`config/config.toml` is the only template, and it is set up for a public
+server: `public = true`, `max_clients = 5000`, the seed servers, IPv6, and every
+data file under `/etc/ed2k-server`, kept current by `[updates]`. (Up to 0.9.77
+there were two templates; `config.toml` was a small local test setup — not
+public, 1000 clients — and servers started from it by mistake stopped at 1000
+users. `config.vps.toml` is gone; its content is `config.toml` now.)
+
+Fill in at least:
+
+| Key | What |
+|---|---|
+| `server.name`, `server.desc` | how the server appears in eMule server lists |
+| `server.this_ip` | the server's public IPv4 |
+| `welcome.messages` | the greeting clients see |
+| `network.tcp_port` | 4661 in the template; UDP is this + 4, the admin panel is on `admin.port` (8080, localhost only) |
+| `limits.max_clients` | 5000 in the template; raise it for a large server (see `LimitNOFILE` below) |
+
+The server **refuses to start** while `server.name` or `server.this_ip` still
+read `CHANGE_ME`. Because the unit below discards the server's output, run it
+once by hand to see any configuration error before installing the service:
+
+```bash
+sudo /usr/local/bin/ed2k-server --config /etc/ed2k-server/config.toml
+# Ctrl+C once it is running
+```
+
+Put your runtime data files here too (the template already points at them):
 
 - **`ip-to-country.csv`** — GeoIP database for the admin panel's country stats.
   Download and unpack it from
@@ -147,7 +183,7 @@ Put your runtime data files here too and point the config at them:
   curl -O https://upd.emule-security.org/ip-to-country.csv.zip
   unzip ip-to-country.csv.zip      # produces ip-to-country.csv
   ```
-  Set `storage.country_db_path = "/etc/ed2k-server/ip-to-country.csv"`.
+  The template's `storage.country_db_path` already points here.
 
 - **`ipinfo_lite.mmdb`** (optional) — a MaxMind DB file, IPv4 **and IPv6**, with
   each network's provider (ASN and name). IPinfo Lite (`ipinfo_lite.mmdb`) and
@@ -164,7 +200,7 @@ Put your runtime data files here too and point the config at them:
   attribution to IPinfo.
 
 - **`guarding.p2p`** — IP blocklist in eMule format (same format used by
-  emule-security). Set `storage.ipfilter_path = "/etc/ed2k-server/guarding.p2p"`.
+  emule-security). The template's `storage.ipfilter_path` already points here.
 
 - **Content filter lists** (optional but recommended — see *Content filter*).
 
@@ -208,8 +244,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=null
 StandardError=null
-LimitNOFILE=1048576
-OOMScoreAdjust=-500
+LimitNOFILE=262144
 
 [Install]
 WantedBy=multi-user.target
@@ -229,6 +264,14 @@ WantedBy=multi-user.target
 > login (`admission.max_probe_jobs`). With the `[admission]` defaults that is
 > about **121 000 for `max_clients = 50000`**, so the shipped unit sets
 > **`262144`**. The server warns at startup if the ceilings exceed the limit.
+>
+> At startup the server raises its own soft limit to the hard limit (no
+> privilege needed), so a unit without `LimitNOFILE`, or a server started from
+> a shell or a container, gets the system's hard limit (524288 under current
+> systemd) instead of 1024. An explicit `LimitNOFILE` still sets both. If the
+> descriptors do run out, accepts pause briefly and the Health tab shows
+> "accept failed: out of file descriptors". At 1024 that used to happen at
+> ~900–1000 clients, with one core at 100%.
 
 ### ⚠️ Logging is OFF by default — on purpose
 
@@ -356,7 +399,7 @@ a watched file) or needs a **restart**.
 | Key | Meaning | Apply |
 |---|---|---|
 | `max_clients` | Max concurrent logged-in clients, also advertised (`ST_MAXUSERS`). Reserved atomically before the login does any work, so concurrent logins cannot overshoot it. A login beyond it gets "Server full" and is closed; a client replacing its own stale session is always let in. `0` = no cap | live |
-| `max_clients_per_ip` | Max open TCP connections per client IP — per `admission.ipv6_source_prefix_bits` prefix for IPv6 — checked at accept before any work is done. Loopback is exempt; `0` = no cap. The Status tab shows the busiest IP, so you can check the value against real traffic (a provider NAT puts many users behind one address) | live |
+| `max_clients_per_ip` | Max open TCP connections per client IP — per `admission.ipv6_source_prefix_bits` prefix for IPv6 — checked at accept before any work is done. Loopback is exempt; `0` = no cap. The Status tab shows the busiest IP — the address with the most logged-in clients, with its open connections — so you can check the value against real traffic (a provider NAT puts many users behind one address) | live |
 | `soft_limit_files`, `hard_limit_files` | Advertised to clients (`ST_SOFTFILES` / `ST_HARDFILES`) and enforced with Lugdunum semantics. `soft_limit_files` is the per-client indexing budget: new files beyond it are not indexed and the client gets one server message per connection; re-offers of files it already sources and filtered files use no budget; the session stays up. `hard_limit_files` is a per-packet bound: an `OFFERFILES` declaring that many records or more is rejected and the connection closed — keep it well above 200 (the eMule batch size). `0` disables either | live |
 | `max_string_size` | Max bytes STORED for a file name or nick (cut at a character boundary). The content filter always sees the full name first. `0` = no cap | live |
 | `ping_delay_seconds` | Server keep-alive ping interval | restart |
@@ -694,7 +737,10 @@ activity against the session idle timer (idle backstop is 900 s, refreshed by an
 TCP frame *or* the UDP keepalive), **(b)** enabling OS TCP keepalive on the accepted
 socket (first probe at 60 s, then every 30 s, give up after 8 → ~5 min) to keep the
 NAT mapping warm and reap a genuinely dead peer, and **(c)** tolerating a multi-minute
-NAT outage during a heavy transfer before reaping. Your only obligation is to keep
+NAT outage during a heavy transfer before reaping. The same 5 minutes bound data the
+server has sent and the client has not acknowledged (`TCP_USER_TIMEOUT`, Linux): a
+connection whose path has gone dark is dropped then, not after the ~15 minutes of
+kernel retransmission. Your only obligation is to keep
 sending the `0x9F` keepalive; the rest is the server's bookkeeping. Get the cadence
 wrong and a live share-only source is silently evicted after a few minutes — the
 symptom is identical to a successful connection, which makes it easy to misdiagnose.
@@ -797,8 +843,16 @@ ssh -N -L 8080:127.0.0.1:8080 user@your-vps
 The panel shows live status, connected clients, peers/servers, filter info and
 per-range IP-filter hits, blocks, and memory metrics (RSS plus the non-evictable
 in-use bytes and per-file cost). The Status tab also carries search counters
-(ranking cap hits, unknown words dropped), IPv6 clients and publishers, and the
-HighID hello-check counters.
+(ranking cap hits, unknown words dropped), IPv6 clients and publishers, the
+HighID hello-check counters, and the busiest IP: the address with the most
+logged-in clients behind it (a NAT or CGNAT), with its open connections, to
+check `limits.max_clients_per_ip` against.
+
+`GET /api/memsize` breaks memory down by structure. Per connection it reports
+the codec buffers (`clients_framed_buffers`), the obfuscation buffers and keys
+(`clients_crypt_buffers`), the connection tasks (`clients_tasks_est`: live
+tasks × the size of one, measured at spawn) and the push channels of logged-in
+clients (`clients_push_channels_est`).
 
 The *Clients* tab searches on the server: free text matches an address or a
 nick (case-insensitive), an IPv4 CIDR such as `82.48.0.0/16` matches by

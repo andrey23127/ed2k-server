@@ -498,7 +498,7 @@ async fn search_cap_returns_best_sourced_not_first_published() {
     );
     // Named explicitly, because the counts alone would also be satisfied by a
     // lucky ordering: these are files 9, 8 and 7, the three published LAST.
-    let names: Vec<String> = results.iter().map(|r| r.name.to_string()).collect();
+    let names: Vec<String> = results.iter().map(|r| r.name().to_string()).collect();
     assert_eq!(
         names,
         vec![

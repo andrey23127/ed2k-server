@@ -6,14 +6,14 @@
 
 use crate::proto::{
     opcodes::*,
-    search::{collect_terms, evaluate, parse, SearchNode},
+    search::{collect_terms, evaluate_prepared, parse, prepare, SearchNode},
     tags::{Tag, TagValue},
     write_tag_list, Frame,
 };
 use crate::state::ServerState;
 use anyhow::Result;
 use bytes::{BufMut, BytesMut};
-use tracing::{debug, info};
+use tracing::debug;
 
 /// One match together with the key it is ranked by.
 ///
@@ -231,18 +231,13 @@ pub fn handle_search(
 
     // Test one candidate. Returns false once the examination budget is spent.
     // Shared by both paths below so they cannot drift apart.
+    // Terms folded once for the whole search, not once per candidate.
+    let prepared = prepare(&tree);
     let mut consider = |id: crate::state::file_id::FileId,
                         entry: &crate::state::file_id::FileRecord,
                         heap: &mut std::collections::BinaryHeap<Ranked>|
      -> bool {
         scanned += 1;
-        // The FULL filter applies to what is SERVED, not only to what is
-        // published — see ContentFilter::is_withheld. A term added today has to
-        // remove the copies indexed yesterday, or the term lists are prospective
-        // only and the index keeps serving what the filter already rejects.
-        if state.filter.is_withheld(&entry.hash, &entry.name) {
-            return true;
-        }
         // Skip orphans (no live source). These exist transiently when a source
         // removal races a concurrent re-publish, until the periodic cleanup
         // evicts them (or a client republishes). They're useless to return —
@@ -253,8 +248,8 @@ pub fn handle_search(
         }
         // Folded, so the predicate compares like with like — see the warning
         // at `evaluate`.
-        let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
-        if evaluate(&tree, &name_lower, entry.size) {
+        let name_lower = crate::state::keyword_index::fold_for_match(entry.name());
+        if evaluate_prepared(&prepared, &name_lower, entry.size) {
             total_matched += 1;
             // Cheap rejection before the clone: once the heap is full, anything
             // no better than its worst entry cannot survive, and cloning a
@@ -268,7 +263,19 @@ pub fn handle_search(
                 }
                 _ => true,
             };
-            if keep {
+            // The FULL filter applies to what is SERVED, not only to what is
+            // published — see ContentFilter::is_withheld. A term added today
+            // has to remove the copies indexed yesterday, or the term lists are
+            // prospective only and the index keeps serving what the filter
+            // already rejects.
+            //
+            // Run last, only for a record about to enter the result heap. It is
+            // the costliest test (NFC, folding, every term layer) and a common
+            // word reaches it up to search_rank_scan times per search, nearly
+            // all of them matches that the heap then turns away. `check` is
+            // pure, so testing it later changes nothing about what is served:
+            // a withheld record still never enters the heap.
+            if keep && !state.filter.is_withheld(&entry.hash, entry.name()) {
                 heap.push(Ranked {
                     sources: entry.sources.len() as u32,
                     id,
@@ -290,7 +297,11 @@ pub fn handle_search(
     };
 
     if keyword_filtered {
-        let ids = state.keyword_index.find_grouped(&groups);
+        // Headroom over the scan budget: a tombstoned id is skipped without
+        // being counted, so a few more than rank_scan are taken.
+        let ids = state
+            .keyword_index
+            .find_grouped_capped(&groups, rank_scan.saturating_mul(2).saturating_add(1));
         n_candidates = ids.len();
         for fid in ids {
             // A tombstoned id yields None and is skipped — it can't be a live
@@ -352,7 +363,7 @@ pub fn handle_search(
         );
     }
 
-    info!(
+    debug!(
         token_count = tokens.len(),
         indexed_tokens = token_lower.len(),
         keyword_filtered,
@@ -428,7 +439,7 @@ pub fn build_search_result_page(
         let size_lo = file.size as u32;
         let size_hi = (file.size >> 32) as u32;
         let mut tags = vec![
-            Tag::byte(FT_FILENAME, TagValue::String(file.name.to_string())),
+            Tag::byte(FT_FILENAME, TagValue::String(file.name().to_string())),
             Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
         ];
         if size_hi > 0 {
@@ -452,7 +463,7 @@ pub fn build_search_result_page(
         // Only sent when the extension actually classifies: ANY (0) means "no
         // opinion", and a client filtering by type would read a literal 0 as a
         // category that matches nothing.
-        let ftype = crate::proto::search::ed2k_file_type_id(&file.name.to_lowercase());
+        let ftype = crate::proto::search::ed2k_file_type_id(&file.name().to_lowercase());
         if ftype != crate::proto::search::ed2k_file_type::ANY {
             tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
         }
@@ -589,20 +600,18 @@ mod pagination_and_largefile_tests {
     }
 
     fn entry(name: &str, size: u64) -> FileRecord {
-        FileRecord {
-            hash: [0u8; 16],
+        FileRecord::new(
+            [0u8; 16],
             size,
-            name: name.into(),
-            sources: vec![crate::state::Source::new(
+            name,
+            vec![crate::state::Source::new(
                 [1u8; 16],
                 IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
                 4662,
                 true,
             )]
             .into(),
-            last_seen: 0,
-            alive: true,
-        }
+        )
     }
 
     #[test]

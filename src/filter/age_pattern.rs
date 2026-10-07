@@ -720,6 +720,7 @@ pub(super) fn matches_layer2(original: &str, lowered: &str, t: &Layer2Terms) -> 
 ///
 /// So this pairs the two independently, the same shape as the age rule. The
 /// safety comes entirely from how narrow both lists are — see the notes on each.
+#[allow(dead_code)] // kept with its tests; not called (see filter::check)
 pub(super) fn matches_zoo_cooccurrence(lowered: &str, t: &Layer2Terms) -> Option<String> {
     if t.zoo_guard.iter().any(|g| lowered.contains(g.as_str())) {
         return None;

@@ -2,6 +2,7 @@
 //!
 //! Maps lowercase tokens to file hashes for SEARCHREQUEST lookup.
 
+use crate::state::cold_store::{self, ColdStore};
 use crate::state::file_id::FileId;
 use crate::state::posting_codec;
 use dashmap::DashMap;
@@ -197,6 +198,13 @@ fn fold_char(c: char) -> Option<char> {
 /// the same footing as the index. Both must use it or a folded lookup is undone
 /// by an unfolded comparison.
 pub fn fold_for_match(s: &str) -> String {
+    // ASCII fast path: fold_char leaves every ASCII character as it is, and an
+    // ASCII character's lowercase is its ASCII lowercase, so this is the same
+    // result without the per-character walk. Most names are plain ASCII, and
+    // a search folds every candidate's name.
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match fold_char(c) {
@@ -446,7 +454,7 @@ pub struct KeywordIndex {
     /// 24 B): a cold blob is rebuilt whole by `compact()` and never grown in place,
     /// so the spare-capacity field a `Vec` carries is pure waste — 8 B per keyword
     /// (~7.6 MB now, ~180 MB projected at 33M keys).
-    cold: DashMap<TokenHash, Box<[u8]>>,
+    cold: ColdStore,
     /// Recent additions not yet merged into `cold`, as plain sorted+deduped Vecs.
     hot: DashMap<TokenHash, Vec<FileId>>,
     /// Deletions not yet applied to `cold`, as plain sorted+deduped Vecs.
@@ -467,6 +475,8 @@ pub struct KeywordIndex {
     /// `visit_subtokens`). Fixed at construction: `add_file` and `remove_file`
     /// must tokenise identically for the life of the index, or postings leak.
     subtokens: bool,
+    /// Serialises `compact()` (see there).
+    compact_lock: std::sync::Mutex<()>,
 }
 
 /// Shrink a DashMap only when it has at least 2x more slots than entries.
@@ -483,6 +493,50 @@ where
     if map.capacity() > std::cmp::max(len * 2, 64) {
         map.shrink_to_fit();
     }
+}
+
+/// merge(cold − pending, hot), all three ascending and deduped. `hot` and
+/// `pending` are disjoint (see the invariant on `pending_removals`), so a
+/// delete-then-re-add ends up present.
+fn merge_tiers(cold: &[FileId], hot: &[FileId], pend: &[FileId]) -> Vec<FileId> {
+    let mut merged = Vec::with_capacity(cold.len() + hot.len());
+    // Cold ids are tested for deletion in ascending order, so the deletion
+    // list is walked once alongside them. It used to be binary-searched for
+    // every cold id — a third of all compaction time on a live server.
+    let mut k = 0usize;
+    let mut deleted = |id: FileId| -> bool {
+        while k < pend.len() && pend[k].0 < id.0 {
+            k += 1;
+        }
+        k < pend.len() && pend[k] == id
+    };
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < cold.len() && j < hot.len() {
+        match cold[i].0.cmp(&hot[j].0) {
+            std::cmp::Ordering::Less => {
+                if !deleted(cold[i]) {
+                    merged.push(cold[i]);
+                }
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                merged.push(hot[j]);
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                merged.push(cold[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    for &id in &cold[i..] {
+        if !deleted(id) {
+            merged.push(id);
+        }
+    }
+    merged.extend_from_slice(&hot[j..]);
+    merged
 }
 
 impl KeywordIndex {
@@ -517,7 +571,7 @@ impl KeywordIndex {
                 return true;
             }
         }
-        self.cold.contains_key(&th)
+        self.cold.contains_key(th)
     }
 
     /// Index a file by filename. Idempotent — re-adding the same id under a token
@@ -558,7 +612,7 @@ impl KeywordIndex {
             // compact() applies the batch. Reads subtract pending, so the file stops
             // being returned immediately even though the blob still contains it.
             // Only worth marking if the key actually has a cold blob.
-            if self.cold.contains_key(&th) {
+            if self.cold.contains_key(th) {
                 let mut pend = self.pending_removals.entry(th).or_default();
                 if let Err(pos) = pend.binary_search(&id) {
                     pend.insert(pos, id);
@@ -574,57 +628,11 @@ impl KeywordIndex {
     /// `cold`). Returns an owned ascending, deduped Vec. `None` iff the keyword is
     /// absent from BOTH tiers.
     fn materialize(&self, th: TokenHash) -> Option<Vec<FileId>> {
-        let out = self.materialize_raw(th)?;
-        // Subtract not-yet-applied deletions. hot and pending are disjoint, so this
-        // only drops ids still physically present in the cold blob.
-        match self.pending_removals.get(&th) {
-            Some(pend) if !pend.is_empty() => {
-                let p = pend.value();
-                Some(
-                    out.into_iter()
-                        .filter(|id| p.binary_search(id).is_err())
-                        .collect(),
-                )
-            }
-            _ => Some(out),
-        }
-    }
-
-    /// merge(cold, hot) WITHOUT applying pending removals.
-    fn materialize_raw(&self, th: TokenHash) -> Option<Vec<FileId>> {
-        let cold = self.cold.get(&th);
-        let hot = self.hot.get(&th);
-        match (cold, hot) {
-            (None, None) => None,
-            (Some(c), None) => posting_codec::decode(c.value()),
-            (None, Some(h)) => Some(h.value().clone()),
-            (Some(c), Some(h)) => {
-                let cv = posting_codec::decode(c.value())?;
-                let hv = h.value();
-                let mut out = Vec::with_capacity(cv.len() + hv.len());
-                let (mut i, mut j) = (0usize, 0usize);
-                while i < cv.len() && j < hv.len() {
-                    match cv[i].0.cmp(&hv[j].0) {
-                        std::cmp::Ordering::Less => {
-                            out.push(cv[i]);
-                            i += 1;
-                        }
-                        std::cmp::Ordering::Greater => {
-                            out.push(hv[j]);
-                            j += 1;
-                        }
-                        std::cmp::Ordering::Equal => {
-                            out.push(cv[i]);
-                            i += 1;
-                            j += 1;
-                        }
-                    }
-                }
-                out.extend_from_slice(&cv[i..]);
-                out.extend_from_slice(&hv[j..]);
-                Some(out)
-            }
-        }
+        // Through the same walk as the capped lookup, which reads pending while
+        // it still holds the cold and hot guards. Reading pending after
+        // releasing them could pair an old cold blob with a pending set that a
+        // compaction had already trimmed, and return an id it had just removed.
+        self.merge_tiers_locked(th, usize::MAX)
     }
 
     /// Posting length across both tiers WITHOUT fully decoding cold — good enough
@@ -633,7 +641,7 @@ impl KeywordIndex {
     fn approx_len(&self, th: TokenHash) -> usize {
         let cold = self
             .cold
-            .get(&th)
+            .get(th)
             .and_then(|c| posting_codec::decoded_len(c.value()))
             .unwrap_or(0);
         let hot = self.hot.get(&th).map(|h| h.value().len()).unwrap_or(0);
@@ -707,6 +715,78 @@ impl KeywordIndex {
         result
     }
 
+    /// `find_grouped`, but a query of ONE plain word returns only its first
+    /// `cap` ids (ascending) instead of the whole posting.
+    ///
+    /// The search paths examine candidates in id order and stop after
+    /// `search_rank_scan` of them, so for a single common word ("mp3", "avi")
+    /// every id past that point was decoded and allocated for nothing — a
+    /// posting of millions per query. Here the cold blob is walked with a
+    /// cursor and merged with the hot tier only up to `cap`. Callers pass a
+    /// cap with headroom over their scan budget, so what they examine is
+    /// unchanged. Any other query shape is answered by `find_grouped` in full.
+    pub fn find_grouped_capped(&self, groups: &[Vec<String>], cap: usize) -> Vec<FileId> {
+        if let [g] = groups {
+            if let [t] = g.as_slice() {
+                return self.materialize_prefix(token_hash(t), cap);
+            }
+        }
+        self.find_grouped(groups)
+    }
+
+    /// The first `cap` ids of merge(cold − pending, hot), ascending, deduped.
+    /// The same result as a prefix of `materialize`, without decoding the rest.
+    fn materialize_prefix(&self, th: TokenHash, cap: usize) -> Vec<FileId> {
+        self.merge_tiers_locked(th, cap).unwrap_or_default()
+    }
+
+    /// merge(cold − pending, hot) up to `cap` ids, with all three guards held
+    /// for the whole walk. `None` iff the keyword is in neither cold nor hot.
+    fn merge_tiers_locked(&self, th: TokenHash, cap: usize) -> Option<Vec<FileId>> {
+        // Lock order cold → hot → pending, as everywhere.
+        let cold = self.cold.get(th);
+        let hot = self.hot.get(&th);
+        if cold.is_none() && hot.is_none() {
+            return None;
+        }
+        let pend = self.pending_removals.get(&th);
+        let hv: &[FileId] = hot.as_ref().map_or(&[], |h| h.value().as_slice());
+        let pv: &[FileId] = pend.as_ref().map_or(&[], |p| p.value().as_slice());
+        let mut cur = cold.as_ref().and_then(|c| posting_codec::PostingCursor::new(c.value()));
+        let hint = cur.as_ref().map_or(0, |c| c.len()) + hv.len();
+        let mut out = Vec::with_capacity(cap.min(hint));
+        let mut j = 0usize;
+        while out.len() < cap {
+            let c = cur.as_ref().and_then(|c| c.peek());
+            let h = hv.get(j).copied();
+            let next = match (c, h) {
+                (None, None) => break,
+                (Some(a), Some(b)) if b.0 < a.0 => {
+                    j += 1;
+                    b
+                }
+                (Some(a), b) => {
+                    if b == Some(a) {
+                        j += 1; // in both tiers: once
+                    } else if pv.binary_search(&a).is_ok() {
+                        // In the blob but deleted, and not re-added (hot and
+                        // pending are disjoint): skip.
+                        cur.as_mut().unwrap().bump();
+                        continue;
+                    }
+                    cur.as_mut().unwrap().bump();
+                    a
+                }
+                (None, Some(b)) => {
+                    j += 1;
+                    b
+                }
+            };
+            out.push(next);
+        }
+        Some(out)
+    }
+
     /// Every file holding at least one of these tokens. Unsorted, may repeat.
     fn union_of(&self, tokens: &[String]) -> Vec<FileId> {
         let mut out = Vec::new();
@@ -758,7 +838,7 @@ impl KeywordIndex {
             if i == seed_idx {
                 continue;
             }
-            let cold_ref = self.cold.get(h);
+            let cold_ref = self.cold.get(*h);
             let hot_ref = self.hot.get(h);
             if cold_ref.is_none() && hot_ref.is_none() {
                 return Vec::new(); // token absent entirely → empty intersection
@@ -809,9 +889,8 @@ impl KeywordIndex {
     /// number reads each blob's count header only (no full decode). Off hot path.
     pub fn posting_stats(&self) -> (u64, u64) {
         let mut total: u64 = 0;
-        for e in self.cold.iter() {
-            total += posting_codec::decoded_len(e.value()).unwrap_or(0) as u64;
-        }
+        self.cold
+            .for_each_blob(|b| total += posting_codec::decoded_len(b).unwrap_or(0) as u64);
         for e in self.hot.iter() {
             total += e.value().len() as u64;
         }
@@ -840,16 +919,13 @@ impl KeywordIndex {
     }
 
     pub fn size_report(&self) -> (u64, u64, u64) {
-        let blob_hdr = std::mem::size_of::<Box<[u8]>>() as u64;
         let idvec_hdr = std::mem::size_of::<Vec<FileId>>() as u64;
         let id_sz = std::mem::size_of::<FileId>() as u64;
         let key_sz = std::mem::size_of::<TokenHash>() as u64;
 
         // data = compressed cold blobs (exact-sized) + raw hot Vecs (un-merged tier)
-        let mut data = 0u64;
-        for e in self.cold.iter() {
-            data += e.value().len() as u64;
-        }
+        let (cold_data, cold_index) = self.cold.bytes();
+        let mut data = cold_data;
         for e in self.hot.iter() {
             data += e.value().capacity() as u64 * id_sz;
         }
@@ -857,12 +933,13 @@ impl KeywordIndex {
             data += e.value().capacity() as u64 * id_sz;
         }
         // headers = one Vec header per cold key + one per hot key
-        let headers = self.cold.len() as u64 * blob_hdr
+        // (the cold tier's sorted key and offset arrays count here: 8 bytes a
+        // keyword, all it spends per keyword besides the blob itself)
+        let headers = cold_index
             + (self.hot.len() + self.pending_removals.len()) as u64 * idvec_hdr;
-        // slots = both maps' table capacity
-        let slots = self.cold.capacity() as u64 * (key_sz + blob_hdr + 1)
-            + (self.hot.capacity() + self.pending_removals.capacity()) as u64
-                * (key_sz + idvec_hdr + 1);
+        // slots = the deferred maps' table capacity (the cold tier has none)
+        let slots = (self.hot.capacity() + self.pending_removals.capacity()) as u64
+            * (key_sz + idvec_hdr + 1);
 
         (data, headers, slots)
     }
@@ -874,6 +951,11 @@ impl KeywordIndex {
     /// An empty posting encodes to a single `count=0` byte, so "empty" means the
     /// blob decodes to length 0.
     pub fn compact(&self) -> usize {
+        // One compactor at a time: the cold blob is decoded, merged and encoded
+        // WITHOUT its lock held (below), which is only sound if nobody else
+        // rewrites it meanwhile. compact() is the only writer of `cold`.
+        let _one = self.compact_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         // Drain BOTH deferred tiers into the compressed cold blobs in bulk: the hot
         // additions and the pending removals. Each affected keyword costs exactly
         // one decode + one merge/filter + one encode per cycle, instead of one per
@@ -884,61 +966,22 @@ impl KeywordIndex {
         keys.sort_unstable();
         keys.dedup();
 
-        for th in keys {
-            // Take both deferred sets out first, so we hold at most one map lock at
-            // a time and never overlap with the cold entry lock below.
-            let hv = self.hot.remove(&th).map(|(_, v)| v).unwrap_or_default();
-            let pend = self
-                .pending_removals
-                .remove(&th)
-                .map(|(_, v)| v)
-                .unwrap_or_default();
-            if hv.is_empty() && pend.is_empty() {
-                continue;
-            }
-
-            let mut cold_entry = self.cold.entry(th).or_default();
-            let cold_ids = posting_codec::decode(cold_entry.value()).unwrap_or_default();
-
-            // Apply deletions to the cold side first, then merge the additions.
-            // Order matters: hot and pending are disjoint (add_file clears an id
-            // from pending), so a delete-then-re-add ends up present, correctly.
-            let mut merged = Vec::with_capacity(cold_ids.len() + hv.len());
-            let (mut i, mut j) = (0usize, 0usize);
-            while i < cold_ids.len() && j < hv.len() {
-                match cold_ids[i].0.cmp(&hv[j].0) {
-                    std::cmp::Ordering::Less => {
-                        if pend.binary_search(&cold_ids[i]).is_err() {
-                            merged.push(cold_ids[i]);
-                        }
-                        i += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        merged.push(hv[j]);
-                        j += 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        merged.push(cold_ids[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                }
-            }
-            for id in &cold_ids[i..] {
-                if pend.binary_search(id).is_err() {
-                    merged.push(*id);
-                }
-            }
-            merged.extend_from_slice(&hv[j..]);
-
-            *cold_entry.value_mut() = posting_codec::encode(&merged).into_boxed_slice();
+        // One cold shard at a time: its keys come out of the sort grouped.
+        keys.sort_unstable_by_key(|&th| (cold_store::shard_of(th), th));
+        let mut dropped = 0usize;
+        // (A manual split rather than slice::chunk_by, which needs Rust 1.77;
+        // the crate's minimum is 1.75.)
+        let mut start = 0usize;
+        while start < keys.len() {
+            let shard = cold_store::shard_of(keys[start]);
+            let end = keys[start..]
+                .iter()
+                .position(|&k| cold_store::shard_of(k) != shard)
+                .map_or(keys.len(), |n| start + n);
+            dropped += self.compact_shard(&keys[start..end]);
+            start = end;
         }
 
-        // Box<[u8]> blobs are exact-sized (rebuilt whole above). Drop keywords whose
-        // posting became empty, plus any leftover empty deferred entries.
-        let before = self.cold.len();
-        self.cold
-            .retain(|_, blob| posting_codec::decoded_len(blob).unwrap_or(0) != 0);
         self.hot.retain(|_, v| !v.is_empty());
         self.pending_removals.retain(|_, v| !v.is_empty());
 
@@ -959,9 +1002,105 @@ impl KeywordIndex {
         // the runtime, so a rebuild does not stall packet handling.
         shrink_if_slack(&self.hot);
         shrink_if_slack(&self.pending_removals);
-        shrink_if_slack(&self.cold);
 
-        before - self.cold.len()
+        dropped
+    }
+
+    /// Fold the deferred sets of `keys` (all in one cold shard, sorted) into
+    /// that shard. Returns the keywords removed.
+    fn compact_shard(&self, keys: &[TokenHash]) -> usize {
+        // SNAPSHOT the deferred sets; do not take them out yet. They are
+        // subtracted only after the new cold blobs are in place, so a search
+        // running meanwhile always sees each id in at least one tier.
+        //
+        // It used to remove them first and write cold last: between the two a
+        // search for the keyword missed every file added since the last cycle
+        // and returned every one removed since.
+        struct Snap {
+            th: TokenHash,
+            hv: Vec<FileId>,
+            pend: Vec<FileId>,
+        }
+        let mut snaps: Vec<Snap> = Vec::with_capacity(keys.len());
+        let mut updates: Vec<(TokenHash, Option<Vec<u8>>)> = Vec::with_capacity(keys.len());
+        for &th in keys {
+            let hv: Vec<FileId> = self.hot.get(&th).map(|v| v.clone()).unwrap_or_default();
+            let pend: Vec<FileId> = self
+                .pending_removals
+                .get(&th)
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            if hv.is_empty() && pend.is_empty() {
+                continue;
+            }
+            // Decode under a short read lock; merge and encode with none.
+            let cold_ids = self
+                .cold
+                .get(th)
+                .and_then(|c| posting_codec::decode(c.value()))
+                .unwrap_or_default();
+            let merged = merge_tiers(&cold_ids, &hv, &pend);
+            // A keyword whose posting became empty is removed here, rather than
+            // by a pass over the whole cold tier afterwards.
+            let blob = (!merged.is_empty()).then(|| posting_codec::encode(&merged));
+            updates.push((th, blob));
+            snaps.push(Snap { th, hv, pend });
+        }
+        if updates.is_empty() {
+            return 0;
+        }
+
+        // The new shard is built while searches keep reading the old one, and
+        // swapped in under the shard's write lock. The snapshots are subtracted
+        // while that lock is still held, so a reader (which takes cold before
+        // hot) never sees hot already trimmed and cold not yet replaced.
+        // Lock order cold → hot → pending, as every reader.
+        self.cold.rebuild(cold_store::shard_of(keys[0]), &updates, || {
+            for Snap { th, hv, pend } in &snaps {
+                if !pend.is_empty() {
+                    if let Some(mut p) = self.pending_removals.get_mut(th) {
+                        // Deletions marked meanwhile stay pending for next cycle.
+                        p.retain(|id| pend.binary_search(id).is_err());
+                    }
+                }
+                if hv.is_empty() {
+                    continue;
+                }
+                // The hot guard is held until the gone ids are in pending
+                // (hot → pending, the order add_file also respects): released
+                // earlier, an add_file of the same id in between would put it
+                // back in hot before it lands in pending, and the two tiers
+                // would no longer be disjoint.
+                let mut hot_guard = self.hot.get_mut(th);
+                let gone: Vec<FileId> = match hot_guard.as_mut() {
+                    Some(h) => {
+                        // An id from the snapshot no longer in hot was removed
+                        // while we merged; it is in the new blob now. remove_file
+                        // marks a deletion for cold only when the keyword already
+                        // had a cold blob, so for a new keyword nothing else
+                        // would ever take it out: mark it here.
+                        let gone = hv
+                            .iter()
+                            .filter(|id| h.binary_search(id).is_err())
+                            .copied()
+                            .collect();
+                        // Ids added meanwhile stay in hot for the next cycle.
+                        h.retain(|id| hv.binary_search(id).is_err());
+                        gone
+                    }
+                    None => hv.clone(),
+                };
+                if !gone.is_empty() {
+                    let mut p = self.pending_removals.entry(*th).or_default();
+                    for id in gone {
+                        if let Err(pos) = p.binary_search(&id) {
+                            p.insert(pos, id);
+                        }
+                    }
+                }
+                drop(hot_guard);
+            }
+        })
     }
 }
 
@@ -1175,6 +1314,156 @@ mod tests {
         // Removing a non-existent hash is a no-op.
         idx.remove_file(FileId(99), "beta.bin");
         assert_eq!(idx.find_intersection(&["beta".into()]).len(), 2);
+    }
+
+    #[test]
+    fn merge_tiers_matches_the_binary_search_version() {
+        fn reference(cold: &[FileId], hot: &[FileId], pend: &[FileId]) -> Vec<FileId> {
+            let mut all: Vec<FileId> = cold
+                .iter()
+                .filter(|id| pend.binary_search(id).is_err() || hot.binary_search(id).is_ok())
+                .copied()
+                .chain(hot.iter().copied())
+                .collect();
+            all.sort_unstable();
+            all.dedup();
+            all
+        }
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as u32
+        };
+        for _ in 0..500 {
+            let span = 1 + rnd(400);
+            let mut pick = |p: u32| -> Vec<FileId> {
+                (0..span).filter(|_| rnd(100) < p).map(FileId).collect()
+            };
+            let cold = pick(50);
+            let hot = pick(20);
+            // pending is disjoint from hot, as the index keeps it.
+            let pend: Vec<FileId> = pick(30)
+                .into_iter()
+                .filter(|id| hot.binary_search(id).is_err())
+                .collect();
+            assert_eq!(merge_tiers(&cold, &hot, &pend), reference(&cold, &hot, &pend));
+        }
+    }
+
+    #[test]
+    fn the_ascii_fast_path_folds_like_the_general_one() {
+        let general = |s: &str| -> String {
+            let mut out = String::new();
+            for c in s.chars() {
+                if let Some(f) = fold_char(c) {
+                    out.extend(f.to_lowercase());
+                }
+            }
+            out
+        };
+        let all_ascii: String = (0u8..128).map(char::from).collect();
+        assert_eq!(fold_for_match(&all_ascii), general(&all_ascii));
+        for s in ["Ubuntu-24.04_Desktop.ISO", "", "MiXeD CaSe 123 !@#"] {
+            assert_eq!(fold_for_match(s), general(s));
+        }
+        // Non-ASCII still takes the general path.
+        assert_eq!(fold_for_match("Château"), "chateau");
+    }
+
+    #[test]
+    fn a_search_during_compact_never_misses_a_live_file() {
+        // compact() used to take the hot and pending sets out before writing the
+        // new cold blob; a search in between missed every file added since the
+        // last cycle. Each round here publishes new files (even ids) and
+        // compacts, while a reader checks that everything published so far is
+        // found, and a writer churns odd ids in and out.
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Arc;
+        let idx = Arc::new(KeywordIndex::new());
+        // A large cold posting makes each decode + encode take a while.
+        for i in 0..100_000u32 {
+            idx.add_file(FileId(i * 2), "alpha.bin");
+        }
+        idx.compact();
+        let published = Arc::new(AtomicU32::new(100_000));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (idx, stop, published) =
+                (Arc::clone(&idx), Arc::clone(&stop), Arc::clone(&published));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let n = published.load(Ordering::Acquire);
+                    let r = idx.find_intersection(&["alpha".to_string()]);
+                    let even = r.iter().filter(|id| id.0 % 2 == 0 && id.0 / 2 < n).count();
+                    assert_eq!(even as u32, n, "a live file went missing mid-compact");
+                    assert!(r.windows(2).all(|w| w[0] < w[1]), "sorted, no duplicates");
+                }
+            })
+        };
+        let writer = {
+            let (idx, stop) = (Arc::clone(&idx), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let mut k = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let id = FileId((k % 5000) * 2 + 1);
+                    if k % 3 == 0 {
+                        idx.add_file(id, "alpha.bin");
+                    } else {
+                        idx.remove_file(id, "alpha.bin");
+                    }
+                    k += 1;
+                }
+            })
+        };
+        for _ in 0..100 {
+            let n = published.load(Ordering::Relaxed);
+            for i in n..n + 100 {
+                idx.add_file(FileId(i * 2), "alpha.bin");
+            }
+            published.store(n + 100, Ordering::Release);
+            idx.compact();
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // Settled: one more compact changes nothing visible and leaves no
+        // deferred work behind.
+        let before = idx.find_intersection(&["alpha".to_string()]);
+        idx.compact();
+        assert_eq!(idx.find_intersection(&["alpha".to_string()]), before);
+        let (_, hot, pend) = idx.tier_sizes();
+        assert_eq!((hot, pend), (0, 0));
+    }
+
+    #[test]
+    fn a_capped_single_word_lookup_is_a_prefix_of_the_full_one() {
+        // Cold ids, hot additions interleaved with them, an id in both tiers
+        // and deleted ids: the capped walk must agree with the full lookup.
+        let idx = KeywordIndex::new();
+        for i in 0..500u32 {
+            idx.add_file(FileId(i * 4), "delta.bin");
+        }
+        idx.compact();
+        for i in 0..200u32 {
+            idx.add_file(FileId(i * 6 + 1), "delta.bin"); // hot only
+        }
+        idx.add_file(FileId(40), "delta.bin"); // already cold
+        for i in 0..50u32 {
+            idx.remove_file(FileId(i * 8), "delta.bin"); // pending
+        }
+        idx.remove_file(FileId(7), "delta.bin"); // hot removal
+        let groups = vec![vec!["delta".to_string()]];
+        let full = idx.find_grouped(&groups);
+        for cap in [0usize, 1, 5, 37, 100, 300, full.len(), full.len() + 10] {
+            let got = idx.find_grouped_capped(&groups, cap);
+            assert_eq!(got, full[..cap.min(full.len())].to_vec(), "cap {cap}");
+        }
+        // Not a single word: the full answer.
+        let two = vec![vec!["delta".to_string()], vec!["bin".to_string()]];
+        assert_eq!(idx.find_grouped_capped(&two, 3), idx.find_grouped(&two));
     }
 
     #[test]

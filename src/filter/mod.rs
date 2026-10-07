@@ -104,14 +104,14 @@ pub struct ContentFilter {
     /// Wrapped in ArcSwap so the operator can hot-reload the terms file
     /// (e.g. /etc/ed2k-server/csam_terms_extra.txt) without restarting — the
     /// mtime watcher in main.rs calls `reload_extra_terms`.
-    extra_terms: arc_swap::ArcSwap<Vec<String>>,
+    extra_terms: arc_swap::ArcSwap<jargon::TermList>,
 
     /// Layer 1 jargon terms, loaded at runtime from an operator-supplied file
     /// (the list is NOT shipped in source — see jargon.rs). Empty = L1 inactive,
     /// which is fine; L2-L4 still run. Hot-reloadable like L4. The matching
     /// logic (substring for long terms, word-bounded for short) lives in
     /// `jargon::matches_terms`; this only holds the (pre-lowercased) list.
-    jargon_terms: arc_swap::ArcSwap<Vec<String>>,
+    jargon_terms: arc_swap::ArcSwap<jargon::TermList>,
 
     /// Layer 2's vocabulary, hot-swappable like the term files.
     ///
@@ -142,19 +142,55 @@ pub struct ContentFilter {
     /// list where the delay is measured in a user's inability to publish a legal
     /// file.
     hash_whitelist: arc_swap::ArcSwap<HashSet<[u8; 16]>>,
+
+    /// Bumped after every list above is replaced (see `publish`). A cached
+    /// verdict is valid only for the generation it was computed under.
+    generation: std::sync::atomic::AtomicU64,
+
+    /// Verdicts of `is_withheld`, the serving-path check: file hash ->
+    /// (generation, name hash, withheld). See `is_withheld`.
+    verdicts: dashmap::DashMap<[u8; 16], (u64, u64, bool)>,
+    verdict_count: std::sync::atomic::AtomicUsize,
+    /// Keyed per process, so a name cannot be crafted to collide with another.
+    name_hasher: std::collections::hash_map::RandomState,
 }
 
+/// Most verdicts kept. Popular files are asked about over and over; the cache
+/// only has to hold those. Cleared when full (~6 MB at this size).
+const VERDICT_CACHE_MAX: usize = 131_072;
+
 impl ContentFilter {
+    /// Replace one of the lists and invalidate every cached verdict.
+    ///
+    /// EVERY list change goes through here; it is the reason the verdict
+    /// cache is safe. The new list is stored BEFORE the generation moves, so a
+    /// reader that sees the new generation also sees the new list. A reader
+    /// that computed a verdict from the old list stores it under the old
+    /// generation, which is never served again.
+    fn publish<T>(&self, slot: &arc_swap::ArcSwap<T>, value: Arc<T>) {
+        use std::sync::atomic::Ordering;
+        slot.store(value);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        // Stale entries would be recomputed anyway; dropping them returns the
+        // memory at once.
+        self.verdicts.clear();
+        self.verdict_count.store(0, Ordering::Relaxed);
+    }
+
     /// Construct a filter. Hardcoded layers are always active; only the
     /// supplementary lists are configurable.
     pub fn new() -> Self {
         Self {
             hash_blocklist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
-            extra_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
-            jargon_terms: arc_swap::ArcSwap::from_pointee(Vec::new()),
+            extra_terms: arc_swap::ArcSwap::from_pointee(jargon::TermList::default()),
+            jargon_terms: arc_swap::ArcSwap::from_pointee(jargon::TermList::default()),
             layer2_terms: arc_swap::ArcSwap::from_pointee(layer2_terms::Layer2Terms::default()),
             hash_filter_set: arc_swap::ArcSwap::from_pointee(HashSet::new()),
             hash_whitelist: arc_swap::ArcSwap::from_pointee(HashSet::new()),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            verdicts: dashmap::DashMap::new(),
+            verdict_count: std::sync::atomic::AtomicUsize::new(0),
+            name_hasher: std::collections::hash_map::RandomState::new(),
         }
     }
 
@@ -167,10 +203,7 @@ impl ContentFilter {
         n += self.hash_filter_set.load().capacity() as u64 * hsz;
         n += self.hash_whitelist.load().capacity() as u64 * hsz;
         for list in [self.extra_terms.load(), self.jargon_terms.load()] {
-            n += list.capacity() as u64 * std::mem::size_of::<String>() as u64;
-            for t in list.iter() {
-                n += t.capacity() as u64;
-            }
+            n += list.heap_bytes() as u64;
         }
         n
     }
@@ -179,7 +212,7 @@ impl ContentFilter {
         // Builder: merge into the current (normally empty) blocklist.
         let mut set: HashSet<[u8; 16]> = (*self.hash_blocklist.load_full()).clone();
         set.extend(hashes);
-        self.hash_blocklist.store(std::sync::Arc::new(set));
+        self.publish(&self.hash_blocklist, std::sync::Arc::new(set));
         self
     }
 
@@ -188,14 +221,14 @@ impl ContentFilter {
     /// blocklist-file mtime watcher in main.rs.
     pub fn reload_hash_blocklist(&self, hashes: impl IntoIterator<Item = [u8; 16]>) {
         let set: HashSet<[u8; 16]> = hashes.into_iter().collect();
-        self.hash_blocklist.store(std::sync::Arc::new(set));
+        self.publish(&self.hash_blocklist, std::sync::Arc::new(set));
     }
 
     /// Builder: merge into the Layer 5 filter-only hash list.
     pub fn with_hash_filter(self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Self {
         let mut set: HashSet<[u8; 16]> = (*self.hash_filter_set.load_full()).clone();
         set.extend(hashes);
-        self.hash_filter_set.store(std::sync::Arc::new(set));
+        self.publish(&self.hash_filter_set, std::sync::Arc::new(set));
         self
     }
 
@@ -205,7 +238,7 @@ impl ContentFilter {
     /// file must keep the current lists, exactly as the hash lists do. Handing a
     /// half-parsed value here would silently disable whole categories.
     pub fn reload_layer2_terms(&self, terms: layer2_terms::Layer2Terms) {
-        self.layer2_terms.store(std::sync::Arc::new(terms));
+        self.publish(&self.layer2_terms, std::sync::Arc::new(terms));
     }
 
     /// Entry count, for the startup log and the web panel.
@@ -215,14 +248,14 @@ impl ContentFilter {
 
     /// Builder: replace Layer 2's vocabulary before the filter is shared.
     pub fn with_layer2_terms(self, terms: layer2_terms::Layer2Terms) -> Self {
-        self.layer2_terms.store(std::sync::Arc::new(terms));
+        self.publish(&self.layer2_terms, std::sync::Arc::new(terms));
         self
     }
 
     /// Hot-swap the Layer 5 filter-only list at runtime, like the ban list.
     pub fn reload_hash_filter(&self, hashes: impl IntoIterator<Item = [u8; 16]>) {
         let set: HashSet<[u8; 16]> = hashes.into_iter().collect();
-        self.hash_filter_set.store(std::sync::Arc::new(set));
+        self.publish(&self.hash_filter_set, std::sync::Arc::new(set));
     }
 
     /// Is this hash on either hash list (and not whitelisted)?
@@ -286,7 +319,41 @@ impl ContentFilter {
     /// sources), so this is bounded work on a bounded set — unlike the publish
     /// path, which runs the same check on every offered file anyway.
     pub fn is_withheld(&self, file_hash: &[u8; 16], filename: &str) -> bool {
-        !matches!(self.check(file_hash, filename), FilterResult::Allow)
+        use std::hash::BuildHasher;
+        use std::sync::atomic::Ordering;
+        // Cached. GETSOURCES asks this for every request, UDP source queries
+        // for every hash in them, and search for every result it serves; the
+        // same popular files come back again and again, and each answer cost a
+        // full check (NFC, folding, every term layer).
+        //
+        // The verdict depends only on (hash, name) and the lists, and `check`
+        // is pure, so a cached verdict is exact as long as all three are the
+        // same: the hash is the key, the name is compared by a keyed 64-bit
+        // hash, and any list change moves the generation (see `publish`). The
+        // generation is read BEFORE the check, so a verdict computed while a
+        // list was being replaced is filed under the old generation and never
+        // used.
+        let gen = self.generation.load(Ordering::SeqCst);
+        let name_key = self.name_hasher.hash_one(filename);
+        if let Some(e) = self.verdicts.get(file_hash) {
+            let (g, n, withheld) = *e.value();
+            if g == gen && n == name_key {
+                return withheld;
+            }
+        }
+        let withheld = !matches!(self.check(file_hash, filename), FilterResult::Allow);
+        if self.verdict_count.load(Ordering::Relaxed) >= VERDICT_CACHE_MAX {
+            self.verdicts.clear();
+            self.verdict_count.store(0, Ordering::Relaxed);
+        }
+        if self
+            .verdicts
+            .insert(*file_hash, (gen, name_key, withheld))
+            .is_none()
+        {
+            self.verdict_count.fetch_add(1, Ordering::Relaxed);
+        }
+        withheld
     }
 
     /// Number of filter-only hashes loaded (for startup logging / web panel).
@@ -297,16 +364,16 @@ impl ContentFilter {
     pub fn with_hash_whitelist(self, hashes: impl IntoIterator<Item = [u8; 16]>) -> Self {
         let mut set: HashSet<[u8; 16]> = (*self.hash_whitelist.load_full()).clone();
         set.extend(hashes);
-        self.hash_whitelist.store(std::sync::Arc::new(set));
+        self.publish(&self.hash_whitelist, std::sync::Arc::new(set));
         self
     }
 
     pub fn with_extra_terms(self, terms: impl IntoIterator<Item = String>) -> Self {
         // Builder: append to whatever is currently stored (normally empty at
         // construction). Normalization is shared with the hot-reload path.
-        let mut v: Vec<String> = (*self.extra_terms.load_full()).clone();
+        let mut v: Vec<String> = self.extra_terms.load().to_vec();
         v.extend(Self::normalize_terms(terms));
-        self.extra_terms.store(Arc::new(v));
+        self.publish(&self.extra_terms, Arc::new(jargon::TermList::new(v)));
         self
     }
 
@@ -324,23 +391,27 @@ impl ContentFilter {
     /// in `check()` see either the old or the new list, never a partial one.
     /// Called by the extra-terms-file mtime watcher in main.rs.
     pub fn reload_extra_terms(&self, terms: impl IntoIterator<Item = String>) {
-        self.extra_terms
-            .store(Arc::new(Self::normalize_terms(terms)));
+        self.publish(
+            &self.extra_terms,
+            Arc::new(jargon::TermList::new(Self::normalize_terms(terms))),
+        );
     }
 
     /// Builder: load the Layer 1 jargon list (normalized like L4). Replaces the
     /// formerly hardcoded list; an empty list leaves L1 inactive.
     pub fn with_jargon_terms(self, terms: impl IntoIterator<Item = String>) -> Self {
-        let mut v: Vec<String> = (*self.jargon_terms.load_full()).clone();
+        let mut v: Vec<String> = self.jargon_terms.load().to_vec();
         v.extend(Self::normalize_terms(terms));
-        self.jargon_terms.store(Arc::new(v));
+        self.publish(&self.jargon_terms, Arc::new(jargon::TermList::new(v)));
         self
     }
 
     /// Hot-swap the Layer 1 jargon list at runtime (no restart), like L4.
     pub fn reload_jargon_terms(&self, terms: impl IntoIterator<Item = String>) {
-        self.jargon_terms
-            .store(Arc::new(Self::normalize_terms(terms)));
+        self.publish(
+            &self.jargon_terms,
+            Arc::new(jargon::TermList::new(Self::normalize_terms(terms))),
+        );
     }
 
     /// Number of Layer 1 jargon terms loaded (for startup logging).
@@ -363,7 +434,7 @@ impl ContentFilter {
     /// watcher in main.rs, which keeps the current list on any read error.
     pub fn reload_hash_whitelist(&self, hashes: impl IntoIterator<Item = [u8; 16]>) {
         let set: HashSet<[u8; 16]> = hashes.into_iter().collect();
-        self.hash_whitelist.store(std::sync::Arc::new(set));
+        self.publish(&self.hash_whitelist, std::sync::Arc::new(set));
     }
 
     pub fn blocklist_size(&self) -> usize {
@@ -585,11 +656,10 @@ impl ContentFilter {
         // Fucking With Grey Stallion" — is real, and a future version keyed on
         // something stronger than word co-occurrence (a phrase like "fucked by a
         // horse", or animal + act with no human name in the title) could work.
-        // The measurement above is why the naive form does not.
-        #[allow(dead_code)]
-        {
-            let _ = age_pattern::matches_zoo_cooccurrence(&lowered, &l2);
-        }
+        // The measurement above is why the naive form does not. The function
+        // stays in `age_pattern` with its tests; it is not called here, because
+        // a call whose result is thrown away still costs a full scan of every
+        // name on the hot path.
 
         // Layer 4 (operator extras) — snapshot the hot-swappable list.
         //
@@ -695,6 +765,73 @@ fn without_extension(lowered: &str) -> &str {
             }
         }
         _ => lowered,
+    }
+}
+
+#[cfg(test)]
+mod verdict_cache_tests {
+    use super::*;
+
+    const NAME: &str = "holiday qxzmarker clip.avi";
+    const H: [u8; 16] = [0x42; 16];
+
+    #[test]
+    fn every_list_change_invalidates_cached_verdicts() {
+        let f = ContentFilter::new();
+        assert!(!f.is_withheld(&H, NAME));
+        assert!(!f.is_withheld(&H, NAME), "served from the cache");
+
+        f.reload_extra_terms(vec!["qxzmarker".to_string()]);
+        assert!(f.is_withheld(&H, NAME), "a new L4 term must apply at once");
+        f.reload_extra_terms(Vec::<String>::new());
+        assert!(!f.is_withheld(&H, NAME));
+
+        f.reload_jargon_terms(vec!["qxzmarker".to_string()]);
+        assert!(f.is_withheld(&H, NAME), "a new L1 term must apply at once");
+        f.reload_jargon_terms(Vec::<String>::new());
+        assert!(!f.is_withheld(&H, NAME));
+
+        f.reload_hash_blocklist(vec![H]);
+        assert!(f.is_withheld(&H, NAME), "a banned hash must apply at once");
+        f.reload_hash_whitelist(vec![H]);
+        assert!(!f.is_withheld(&H, NAME), "a whitelist entry must apply at once");
+        f.reload_hash_whitelist(Vec::<[u8; 16]>::new());
+        assert!(f.is_withheld(&H, NAME));
+        f.reload_hash_blocklist(Vec::<[u8; 16]>::new());
+        assert!(!f.is_withheld(&H, NAME));
+
+        f.reload_hash_filter(vec![H]);
+        assert!(f.is_withheld(&H, NAME), "a filter-only hash must apply at once");
+        f.reload_hash_filter(Vec::<[u8; 16]>::new());
+        assert!(!f.is_withheld(&H, NAME));
+
+        let g = f.generation.load(std::sync::atomic::Ordering::SeqCst);
+        f.reload_layer2_terms(layer2_terms::Layer2Terms::default());
+        assert!(f.generation.load(std::sync::atomic::Ordering::SeqCst) > g);
+    }
+
+    #[test]
+    fn the_name_is_part_of_the_cached_verdict() {
+        // Same hash, different stored name (a slot re-published after
+        // eviction): the cached verdict for the old name must not be reused.
+        let f = ContentFilter::new().with_extra_terms(vec!["qxzmarker".to_string()]);
+        assert!(!f.is_withheld(&H, "holiday clip.avi"));
+        assert!(f.is_withheld(&H, NAME));
+        assert!(!f.is_withheld(&H, "holiday clip.avi"));
+    }
+
+    #[test]
+    fn cached_and_uncached_verdicts_agree() {
+        let f = ContentFilter::new().with_extra_terms(vec!["qxzmarker".to_string(), "abc".to_string()]);
+        for (i, n) in ["a b c.avi", "abc.mkv", "xabcx.mp3", NAME, "plain.iso", "ABC Movie.avi"]
+            .iter()
+            .enumerate()
+        {
+            let h = [i as u8; 16];
+            let direct = !matches!(f.check(&h, n), FilterResult::Allow);
+            assert_eq!(f.is_withheld(&h, n), direct, "{n}");
+            assert_eq!(f.is_withheld(&h, n), direct, "{n} (cached)");
+        }
     }
 }
 

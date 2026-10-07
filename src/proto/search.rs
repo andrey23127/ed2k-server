@@ -712,6 +712,45 @@ fn word_matches(w: &str, name_lower: &str) -> bool {
 }
 
 pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
+    eval_node(node, name_lower, size, true)
+}
+
+/// The tree with every term and meta value folded once, for
+/// `evaluate_prepared`.
+///
+/// A search tests its tree against up to `search_rank_scan` candidates, and
+/// `evaluate` folds each term again for every one of them. Folding the tree
+/// once up front, with the same function, and then evaluating without folding
+/// gives the same answer for the same name.
+pub fn prepare(node: &SearchNode) -> SearchNode {
+    use crate::state::keyword_index::fold_for_match;
+    match node {
+        SearchNode::Term(t) => SearchNode::Term(fold_for_match(t)),
+        SearchNode::Meta { tag_name, value } => SearchNode::Meta {
+            tag_name: tag_name.clone(),
+            value: fold_for_match(value),
+        },
+        SearchNode::Numeric { .. } => node.clone(),
+        SearchNode::Bool(op, l, r) => {
+            SearchNode::Bool(op.clone(), Box::new(prepare(l)), Box::new(prepare(r)))
+        }
+    }
+}
+
+/// `evaluate` for a tree from `prepare`.
+pub fn evaluate_prepared(prepared: &SearchNode, name_lower: &str, size: u64) -> bool {
+    eval_node(prepared, name_lower, size, false)
+}
+
+fn eval_node(node: &SearchNode, name_lower: &str, size: u64, fold: bool) -> bool {
+    use std::borrow::Cow;
+    fn fold_str(s: &str, fold: bool) -> Cow<'_, str> {
+        if fold {
+            Cow::Owned(crate::state::keyword_index::fold_for_match(s))
+        } else {
+            Cow::Borrowed(s)
+        }
+    }
     match node {
         SearchNode::Term(t) => {
             // Wildcard term: "*" or "**" matches every file. eMule sends this
@@ -729,7 +768,7 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             //   split multi-word terms and this predicate was left comparing the
             //   unsplit string. Whatever the index does to a token, this has to
             //   do to the term.
-            let tl = crate::state::keyword_index::fold_for_match(t);
+            let tl = fold_str(t, fold);
             // A term is not necessarily one word. Some clients send a whole
             // query as a single node, and testing it as one substring makes the
             // WORD ORDER significant: "Ubuntu Linux Bible" contains the phrase
@@ -752,11 +791,12 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             let tag_id = tag_name.id().unwrap_or(0);
             // Folded for the same reason as the term above: the name we are
             // handed is folded, so an unfolded value would never match one.
-            let val_lower = crate::state::keyword_index::fold_for_match(value);
+            let val_lower = fold_str(value, fold);
+            let val_lower: &str = &val_lower;
 
             match tag_id {
                 // FT_FILETYPE — classify by the file's extension
-                0x03 => file_type_matches(name_lower, &val_lower),
+                0x03 => file_type_matches(name_lower, val_lower),
                 // FT_FILEFORMAT — the file's extension must equal `value`
                 0x04 => name_lower
                     .rsplit('.')
@@ -765,7 +805,7 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
                     .unwrap_or(false),
                 // Unknown meta tag — treat the value as a filename substring,
                 // but if that fails, be permissive rather than dropping the file.
-                _ => name_lower.contains(&val_lower),
+                _ => name_lower.contains(val_lower),
             }
         }
         SearchNode::Numeric {
@@ -786,9 +826,15 @@ pub fn evaluate(node: &SearchNode, name_lower: &str, size: u64) -> bool {
             }
         }
         SearchNode::Bool(op, l, r) => match op {
-            BoolOp::And => evaluate(l, name_lower, size) && evaluate(r, name_lower, size),
-            BoolOp::Or => evaluate(l, name_lower, size) || evaluate(r, name_lower, size),
-            BoolOp::Not => evaluate(l, name_lower, size) && !evaluate(r, name_lower, size),
+            BoolOp::And => {
+                eval_node(l, name_lower, size, fold) && eval_node(r, name_lower, size, fold)
+            }
+            BoolOp::Or => {
+                eval_node(l, name_lower, size, fold) || eval_node(r, name_lower, size, fold)
+            }
+            BoolOp::Not => {
+                eval_node(l, name_lower, size, fold) && !eval_node(r, name_lower, size, fold)
+            }
         },
     }
 }
@@ -802,6 +848,48 @@ mod tests {
         out.extend_from_slice(&(s.len() as u16).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
         out
+    }
+
+    #[test]
+    fn a_prepared_tree_evaluates_like_the_original() {
+        use crate::state::keyword_index::fold_for_match;
+        let t = |s: &str| SearchNode::Term(s.to_string());
+        let and = |a, b| SearchNode::Bool(BoolOp::And, Box::new(a), Box::new(b));
+        let or = |a, b| SearchNode::Bool(BoolOp::Or, Box::new(a), Box::new(b));
+        let not = |a, b| SearchNode::Bool(BoolOp::Not, Box::new(a), Box::new(b));
+        let meta = |id: u8, v: &str| SearchNode::Meta { tag_name: SearchTag::Id(id), value: v.to_string() };
+        let size = |op, v| SearchNode::Numeric { tag_name: SearchTag::Id(0x02), op, value: v };
+        let trees = vec![
+            t("Château"),
+            t("ubuntu LINUX"),
+            t("^DVD"),
+            t("dvdr*"),
+            t("*"),
+            t("ŒUVRE Ärger"),
+            and(t("Holiday"), meta(0x03, "Video")),
+            or(t("İstanbul"), t("straße")),
+            not(t("clip"), t("SAMPLE")),
+            and(meta(0x04, "AVI"), size(CmpOp::Gt, 1000)),
+            meta(0x99, "Ärger"),
+        ];
+        let names = [
+            "Château Margaux.avi", "chateau.mkv", "Ubuntu Linux Bible.pdf", "dvdrip holiday clip.avi",
+            "OEUVRE ärger.mp3", "istanbul.avi", "Strasse.iso", "holiday clip sample.avi", "x.AVI",
+            "İstanbul 2019.mkv", "", "plain.txt",
+        ];
+        for tree in &trees {
+            let prepared = prepare(tree);
+            for n in names {
+                let folded = fold_for_match(n);
+                for sz in [10u64, 5000] {
+                    assert_eq!(
+                        evaluate(tree, &folded, sz),
+                        evaluate_prepared(&prepared, &folded, sz),
+                        "{tree:?} on {n:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! resolves to `None` rather than to the wrong file — this is the safety
 //! property that makes a later lazy-cleanup migration sound.
 
+use crate::state::file_name::FileName;
 use crate::state::{FileHash, Source};
 use smallvec::{smallvec, SmallVec};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -47,17 +48,38 @@ pub struct FileId(pub u32);
 pub struct FileRecord {
     pub hash: FileHash,
     pub size: u64,
-    pub name: Arc<str>,
+    /// The name; `None` marks a tombstoned slot. When a file is evicted the
+    /// slot is marked dead rather than reused at once, so dangling FileIds in
+    /// postings resolve to None.
+    ///
+    /// One thin pointer (see `FileName`), and doubling as the tombstone flag,
+    /// is what brings the record from 80 to 64 bytes: the old separate
+    /// `alive: bool` and the `last_seen: u32` (written, never read) are gone.
+    fname: Option<FileName>,
     pub sources: SourceVec,
-    /// Seconds since the slab epoch (Stage 3d: packed from 16-byte Instant to
-    /// 4 bytes). Currently write-only; reserved for age-based eviction.
-    pub last_seen: u32,
-    /// Tombstone: when a file is evicted we mark the slot dead rather than
-    /// reusing the id, so dangling FileIds in postings resolve to None.
-    pub alive: bool,
 }
 
 impl FileRecord {
+    pub fn new(hash: FileHash, size: u64, name: &str, sources: SourceVec) -> Self {
+        Self { hash, size, fname: Some(FileName::new(name)), sources }
+    }
+
+    /// The file name ("" for a tombstoned slot, which no lookup returns).
+    #[inline]
+    pub fn name(&self) -> &str {
+        self.fname.as_deref().unwrap_or("")
+    }
+
+    #[inline]
+    pub fn alive(&self) -> bool {
+        self.fname.is_some()
+    }
+
+    /// Heap bytes of the name, before allocator rounding (memory reports).
+    pub fn name_heap_bytes(&self) -> usize {
+        self.fname.as_ref().map_or(0, |n| n.heap_bytes())
+    }
+
     /// Number of sources that hold a complete copy, for the FT_COMPLETE_SOURCES
     /// (0x30) search-result tag (issue #28).
     ///
@@ -153,8 +175,77 @@ fn bucket_of(h: u64, mask: u32) -> usize {
 /// under a single RwLock. `next[i]` is the next record index in the same bucket
 /// as record `i` (NIL-terminated); `buckets[b]` is the head record index of
 /// bucket `b` (NIL if empty). `records` and `next` are kept the same length.
+/// Records per chunk of a shard (64 KB of 64-byte records).
+const RECORD_CHUNK: usize = 1024;
+
+/// A growable array stored as fixed-size chunks.
+///
+/// The slab's records used to be one `Vec` per shard, grown by a quarter at a
+/// time. That still left on average ~10% of the largest allocation in the
+/// process reserved and unused, and every growth step copied the whole shard:
+/// for a moment the old and the new array both existed, so peak memory ran
+/// ~25% of a shard above the steady state, at 30M files tens of MB per step.
+/// Chunks never move: growth allocates one more chunk, the idle reserve is at
+/// most one chunk per shard, and an element's address is stable.
+struct ChunkedVec<T> {
+    chunks: Vec<Vec<T>>,
+    len: usize,
+}
+
+impl<T> ChunkedVec<T> {
+    fn new() -> Self {
+        Self { chunks: Vec::new(), len: 0 }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn capacity(&self) -> usize {
+        self.chunks.len() * RECORD_CHUNK
+    }
+
+    fn push(&mut self, v: T) {
+        if self.len == self.capacity() {
+            self.chunks.push(Vec::with_capacity(RECORD_CHUNK));
+        }
+        self.chunks.last_mut().expect("a chunk with room").push(v);
+        self.len += 1;
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<&T> {
+        self.chunks.get(i / RECORD_CHUNK)?.get(i % RECORD_CHUNK)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, i: usize) -> Option<&mut T> {
+        self.chunks.get_mut(i / RECORD_CHUNK)?.get_mut(i % RECORD_CHUNK)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.chunks.iter().flat_map(|c| c.iter())
+    }
+}
+
+impl<T> std::ops::Index<usize> for ChunkedVec<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, i: usize) -> &T {
+        &self.chunks[i / RECORD_CHUNK][i % RECORD_CHUNK]
+    }
+}
+
+impl<T> std::ops::IndexMut<usize> for ChunkedVec<T> {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut T {
+        &mut self.chunks[i / RECORD_CHUNK][i % RECORD_CHUNK]
+    }
+}
+
 struct SlabShard {
-    records: Vec<FileRecord>,
+    records: ChunkedVec<FileRecord>,
     /// Intrusive chain link: same length as `records`. `next[i]` = next record
     /// index in i's bucket, or NIL. Tombstoned slots are unlinked (NIL) and not
     /// referenced by any bucket head.
@@ -176,7 +267,7 @@ const SLAB_SHARD_INIT_BUCKETS: usize = 64;
 impl SlabShard {
     fn new() -> Self {
         SlabShard {
-            records: Vec::new(),
+            records: ChunkedVec::new(),
             next: Vec::new(),
             buckets: vec![NIL; SLAB_SHARD_INIT_BUCKETS],
             bucket_mask: (SLAB_SHARD_INIT_BUCKETS - 1) as u32,
@@ -184,7 +275,8 @@ impl SlabShard {
         }
     }
 
-    /// Grow `records`/`next` by a fixed fraction instead of letting `Vec` double.
+    /// Grow `next` by a fixed fraction instead of letting `Vec` double (the
+    /// records grow by chunks, see `ChunkedVec`).
     ///
     /// `Vec`'s doubling is the right default for a short-lived buffer and the
     /// wrong one for a slab that only ever grows and holds the largest single
@@ -206,14 +298,13 @@ impl SlabShard {
         const GROW_NUM: usize = 1;
         const GROW_DEN: usize = 4;
         const GROW_MIN: usize = 1024;
-        let len = self.records.len();
-        if len < self.records.capacity() {
+        let len = self.next.len();
+        if len < self.next.capacity() {
             return; // room already
         }
         let extra = std::cmp::max(len * GROW_NUM / GROW_DEN, GROW_MIN);
         // reserve_exact, NOT reserve: reserve would apply Vec's own amplification
         // on top of ours and put the doubling right back.
-        self.records.reserve_exact(extra);
         self.next.reserve_exact(extra);
     }
 
@@ -255,7 +346,7 @@ impl SlabShard {
         self.buckets = vec![NIL; new_len];
         self.bucket_mask = (new_len - 1) as u32;
         for i in 0..self.records.len() {
-            if self.records[i].alive {
+            if self.records[i].alive() {
                 let h = hash_u64(&self.records[i].hash);
                 let b = bucket_of(h, self.bucket_mask);
                 self.next[i] = self.buckets[b];
@@ -274,7 +365,7 @@ impl SlabShard {
         let mut cur = self.buckets[b];
         while cur != NIL {
             let r = &self.records[cur as usize];
-            if r.alive && &r.hash == hash {
+            if r.alive() && &r.hash == hash {
                 return Some(cur);
             }
             cur = self.next[cur as usize];
@@ -339,10 +430,8 @@ pub struct FileSlab {
     /// Live file count, maintained by get_or_insert/insert_sourceless/tombstone
     /// for O(1) reporting (was derived from the DashMap len before lever C).
     live: AtomicU32,
-    /// Monotonic time base. `last_seen` on each record is stored as u32 seconds
-    /// since this instant (Stage 3d: 16-byte Instant → 4-byte u32, ~0.4 GB at
-    /// 33M files). u32 seconds covers ~136 years of uptime — never overflows in
-    /// practice. Kept (not dropped) so a future age-based eviction can use it.
+    /// Monotonic time base for the slot quarantine: u32 seconds since this
+    /// instant (~136 years of range).
     epoch: Instant,
     /// How long (secs) a tombstoned slot is quarantined before it may be reused.
     /// Bounds dead-slot accumulation (slot_count plateaus near peak-live instead
@@ -383,8 +472,8 @@ impl FileSlab {
         self.quarantine_secs = secs;
     }
 
-    /// Current time as u32 seconds since the slab epoch — the value stored in
-    /// `FileRecord.last_seen`. Saturates at u32::MAX (≈136 years).
+    /// Current time as u32 seconds since the slab epoch. Saturates at u32::MAX
+    /// (≈136 years).
     #[inline]
     pub fn now_secs(&self) -> u32 {
         self.epoch.elapsed().as_secs().min(u32::MAX as u64) as u32
@@ -407,7 +496,7 @@ impl FileSlab {
         let recs = shard.read().unwrap();
         recs.records
             .get(id_index(id))
-            .filter(|r| r.alive)
+            .filter(|r| r.alive())
             .map(|r| r.hash)
     }
 
@@ -422,7 +511,7 @@ impl FileSlab {
         &self,
         hash: FileHash,
         size: u64,
-        name: Arc<str>,
+        name: &str,
         first_source: Source,
     ) -> (FileId, bool) {
         let now = self.now_secs();
@@ -432,14 +521,7 @@ impl FileSlab {
             return (make_id(shard_no, idx), false);
         }
         let index = sh.insert_record(
-            FileRecord {
-                hash,
-                size,
-                name,
-                sources: smallvec![first_source],
-                last_seen: now,
-                alive: true,
-            },
+            FileRecord::new(hash, size, name, smallvec![first_source]),
             now,
             self.quarantine_secs,
         );
@@ -450,7 +532,7 @@ impl FileSlab {
 
     /// Insert a file with NO sources. Returns the id (existing if the hash is
     /// already known). Same single-write-lock discipline as `get_or_insert`.
-    pub fn insert_sourceless(&self, hash: FileHash, size: u64, name: Arc<str>) -> FileId {
+    pub fn insert_sourceless(&self, hash: FileHash, size: u64, name: &str) -> FileId {
         let now = self.now_secs();
         let shard_no = shard_of_hash(&hash);
         let mut sh = self.shards[shard_no as usize].write().unwrap();
@@ -458,14 +540,7 @@ impl FileSlab {
             return make_id(shard_no, idx);
         }
         let index = sh.insert_record(
-            FileRecord {
-                hash,
-                size,
-                name,
-                sources: SourceVec::new(),
-                last_seen: now,
-                alive: true,
-            },
+            FileRecord::new(hash, size, name, SourceVec::new()),
             now,
             self.quarantine_secs,
         );
@@ -478,7 +553,7 @@ impl FileSlab {
     pub fn get(&self, id: FileId) -> Option<FileRecord> {
         let shard = self.shards.get(id_shard(id))?;
         let recs = shard.read().unwrap();
-        recs.records.get(id_index(id)).filter(|r| r.alive).cloned()
+        recs.records.get(id_index(id)).filter(|r| r.alive()).cloned()
     }
 
     /// Tombstone a file by id: marks the slot dead and drops the hash mapping.
@@ -488,34 +563,52 @@ impl FileSlab {
     /// the quarantine window, so any in-flight search holding this id has long
     /// finished — stale ids resolve to None (slot dead / unlinked) until then.
     pub fn tombstone(&self, id: FileId) -> bool {
-        let shard = match self.shards.get(id_shard(id)) {
-            Some(s) => s,
-            None => return false,
-        };
+        self.tombstone_where(id, |_| true).is_some()
+    }
+
+    /// Tombstone `id` only if it is alive AND has no sources, checked under the
+    /// same write lock that does the tombstoning. Returns the record's name
+    /// (for the keyword removal that must follow) when it was tombstoned.
+    ///
+    /// The eviction paths decide "this file is sourceless" in one lock and
+    /// tombstone in another. A publisher adding a source in between used to
+    /// lose the file: it was tombstoned with a live source, and since a
+    /// re-publish of a known hash does not re-add keywords, it vanished from
+    /// search until every source left and came back. Re-checking here closes
+    /// that window; a file that regained a source is simply left alone.
+    pub fn tombstone_if_sourceless(&self, id: FileId) -> Option<FileName> {
+        self.tombstone_where(id, |r| r.sources.is_empty())
+    }
+
+    fn tombstone_where(
+        &self,
+        id: FileId,
+        cond: impl FnOnce(&FileRecord) -> bool,
+    ) -> Option<FileName> {
+        let shard = self.shards.get(id_shard(id))?;
         let now = self.now_secs();
         let idx = id_index(id);
         let mut sh = shard.write().unwrap();
         // Read hash + liveness first (immutable borrow ends before we mutate the
         // chain), so the unlink and the field-clear don't fight the borrow check.
         let hash = match sh.records.get(idx) {
-            Some(r) if r.alive => r.hash,
-            _ => return false,
+            Some(r) if r.alive() && cond(r) => r.hash,
+            _ => return None,
         };
         // Unlink from its bucket chain (touches buckets/next only), then mark the
         // slot dead and free the heavy fields. Stale ids resolve to None via the
         // alive flag / chain absence until the slot is reused.
         sh.unlink(idx as u32, &hash);
-        {
+        let name = {
             let r = &mut sh.records[idx];
-            r.alive = false;
-            r.name = Arc::from("");
             r.sources = SourceVec::new();
-        }
+            r.fname.take()
+        };
         // Queue for reuse once quarantined (FIFO by free-time; now is monotonic).
         sh.free.push_back((idx as u32, now));
         drop(sh);
         self.live.fetch_sub(1, Ordering::Relaxed);
-        true
+        name
     }
 
     /// Tombstone by hash (convenience for callers that hold a hash, not an id).
@@ -609,7 +702,7 @@ impl FileSlab {
     /// Add or refresh a source on an existing file (by hash). Returns true if
     /// the file existed (and was updated). Mirrors the and_modify arm of the old
     /// `files.entry(hash).and_modify(...)`: dedups by user_hash, refreshes the
-    /// completeness flag, bumps last_seen. Used by add_file_with_source for the
+    /// completeness flag. Used by add_file_with_source for the
     /// "already known file" path.
     /// Like `add_or_refresh_source`, but also reports the name already stored for
     /// this file when the publisher used a DIFFERENT one.
@@ -617,10 +710,15 @@ impl FileSlab {
     /// Returns `Some(stored_name)` only on divergence; `None` when the names match
     /// or the file is unknown.
     ///
-    /// Cost is one pointer comparison inside the shard lock this call already
-    /// takes: names come from the interner, so identical strings are the same
-    /// `Arc` allocation and `Arc::ptr_eq` settles it without touching the bytes.
-    /// Nothing is allocated unless the names actually differ, which is rare.
+    /// Cost is one string comparison inside the shard lock this call already
+    /// takes. Nothing is allocated unless the names actually differ, which is
+    /// rare.
+    ///
+    /// The names are compared by content. The interner no longer deduplicates
+    /// (it is a plain `Arc::from`), so the pointer test this used to rely on
+    /// was never true for a second publish: every re-publish of a known file
+    /// under the SAME name was reported as divergence, ran the alias
+    /// bookkeeping and could fill an alias entry with copies of one name.
     ///
     /// Divergence is the signal that catches masquerading: one file circulated
     /// under many unrelated names ("MANUALE PHOTOSHOP COMPLETO.PDF" at 690 MB,
@@ -630,26 +728,25 @@ impl FileSlab {
         &self,
         hash: &FileHash,
         src: Source,
-        published_as: &Arc<str>,
+        published_as: &str,
     ) -> Option<Arc<str>> {
         let id = self.id_of(hash)?;
         let shard = self.shards.get(id_shard(id))?;
         let mut sh = shard.write().unwrap();
         let r = sh.records.get_mut(id_index(id))?;
-        if !r.alive {
+        if !r.alive() {
             return None;
         }
-        r.last_seen = self.now_secs();
         if let Some(existing) = r.sources.iter_mut().find(|s| s.user_hash == src.user_hash) {
             existing.set_complete(src.complete());
         } else {
             r.sources.push(src);
         }
-        // Same interned string → same allocation → nothing to report.
-        if Arc::ptr_eq(&r.name, published_as) {
+        // Same name → nothing to report. The pointer test is a free shortcut.
+        if r.name() == published_as {
             None
         } else {
-            Some(Arc::clone(&r.name))
+            Some(Arc::from(r.name()))
         }
     }
 
@@ -664,10 +761,9 @@ impl FileSlab {
         };
         let mut sh = shard.write().unwrap();
         if let Some(r) = sh.records.get_mut(id_index(id)) {
-            if !r.alive {
+            if !r.alive() {
                 return false;
             }
-            r.last_seen = self.now_secs();
             if let Some(existing) = r.sources.iter_mut().find(|s| s.user_hash == src.user_hash) {
                 existing.set_complete(src.complete());
             } else {
@@ -688,7 +784,7 @@ impl FileSlab {
         };
         let mut sh = shard.write().unwrap();
         if let Some(r) = sh.records.get_mut(id_index(id)) {
-            if !r.alive {
+            if !r.alive() {
                 return false;
             }
             r.sources.retain(|s| &s.user_hash != user_hash);
@@ -717,7 +813,7 @@ impl FileSlab {
         let shard = self.shards.get(id_shard(id))?;
         let recs = shard.read().unwrap();
         let r = recs.records.get(id_index(id))?;
-        if !r.alive {
+        if !r.alive() {
             return None;
         }
         Some(f(r))
@@ -737,7 +833,7 @@ impl FileSlab {
         let sh = self.shards[shard_no as usize].read().unwrap();
         let idx = sh.find(hash)?;
         let r = sh.records.get(idx as usize)?;
-        if !r.alive {
+        if !r.alive() {
             return None;
         }
         Some(f(make_id(shard_no, idx), r))
@@ -752,37 +848,47 @@ impl FileSlab {
         for (s_no, shard) in self.shards.iter().enumerate() {
             let sh = shard.read().unwrap();
             for (i, r) in sh.records.iter().enumerate() {
-                if r.alive && !f(make_id(s_no as u32, i as u32), r) {
+                if r.alive() && !f(make_id(s_no as u32, i as u32), r) {
                     return;
                 }
             }
         }
     }
 
+    /// Visit every live record. The shard read lock is taken per slice of
+    /// `SCAN_CHUNK` slots, not for the whole shard: at 30M files a shard is
+    /// ~470k slots, and holding its lock for the whole walk stalled every
+    /// publish and GETSOURCES that hashed to it for the duration. Between
+    /// slices writers get in; the walk sees each slot once (slots never move,
+    /// and slots appended meanwhile are picked up when the walk reaches them).
     pub fn for_each_live<F: FnMut(FileId, &FileRecord)>(&self, mut f: F) {
+        const SCAN_CHUNK: usize = 16 * 1024;
         for (s_no, shard) in self.shards.iter().enumerate() {
-            let sh = shard.read().unwrap();
-            for (i, r) in sh.records.iter().enumerate() {
-                if r.alive {
-                    f(make_id(s_no as u32, i as u32), r);
+            let mut start = 0usize;
+            loop {
+                let sh = shard.read().unwrap();
+                let end = sh.records.len().min(start + SCAN_CHUNK);
+                if start >= end {
+                    break;
                 }
+                for i in start..end {
+                    let r = &sh.records[i];
+                    if r.alive() {
+                        f(make_id(s_no as u32, i as u32), r);
+                    }
+                }
+                drop(sh);
+                start = end;
             }
         }
     }
 
-    /// Lightweight stats pass for memory_report: returns (sources_len,
-    /// name_len) per live record without cloning the record itself.
-    pub fn iter_records_for_report(&self) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
-        for shard in &self.shards {
-            let sh = shard.read().unwrap();
-            for r in &sh.records {
-                if r.alive {
-                    out.push((r.sources.len(), r.name.len()));
-                }
-            }
-        }
-        out
+    /// Calls `f(sources_len, name_len)` for every live record, for the memory
+    /// reports. Folds in place: it used to return a Vec of one pair per file —
+    /// 30M pairs, ~480 MB allocated for the length of one admin request.
+    /// Uses the chunked walk, so writers are not held off for a whole shard.
+    pub fn for_each_record_size(&self, mut f: impl FnMut(usize, usize)) {
+        self.for_each_live(|_, r| f(r.sources.len(), r.name_heap_bytes()));
     }
 }
 
@@ -803,7 +909,7 @@ mod tests {
         let h = [9u8; 16];
         let partial = |uh: u8| Source::new([uh; 16], IpAddr::V4(Ipv4Addr::new(10, 0, 0, uh)), 4662, false);
         let complete = |uh: u8| Source::new([uh; 16], IpAddr::V4(Ipv4Addr::new(10, 0, 0, uh)), 4662, true);
-        slab.get_or_insert(h, 100, "f".into(), partial(1));
+        slab.get_or_insert(h, 100, "f", partial(1));
         let r = slab.get_by_hash(&h).unwrap();
         assert_eq!((r.sources.len(), r.complete_source_count()), (1, 0));
         slab.add_or_refresh_source(&h, complete(2));
@@ -820,6 +926,55 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_if_sourceless_spares_a_file_that_regained_a_source() {
+        let slab = FileSlab::new();
+        let h = [5u8; 16];
+        let (id, _) = slab.get_or_insert(h, 100, "a.avi", src());
+        // The eviction path saw it go sourceless...
+        assert!(slab.remove_user_source(id, &[1u8; 16]));
+        // ...but another publisher added a source before the tombstone.
+        let other = Source::new([2u8; 16], IpAddr::V4(Ipv4Addr::new(1, 2, 3, 5)), 4662, true);
+        assert!(slab.add_or_refresh_source(&h, other));
+        assert!(slab.tombstone_if_sourceless(id).is_none());
+        assert_eq!(slab.get(id).map(|r| r.sources.len()), Some(1));
+
+        // Once really sourceless it goes, and hands back the name.
+        assert!(slab.remove_user_source(id, &[2u8; 16]));
+        assert_eq!(slab.tombstone_if_sourceless(id).as_deref(), Some("a.avi"));
+        assert!(slab.get(id).is_none());
+        assert!(slab.tombstone_if_sourceless(id).is_none(), "only once");
+    }
+
+    #[test]
+    fn chunked_scan_visits_every_live_record_once() {
+        let slab = FileSlab::new();
+        let mut want = std::collections::HashSet::new();
+        for i in 0..100_000u32 {
+            let mut h = [0u8; 16];
+            h[0..4].copy_from_slice(&i.to_le_bytes());
+            let (id, _) = slab.get_or_insert(h, 100, "f", src());
+            if i % 7 == 0 {
+                slab.tombstone(id);
+            } else {
+                want.insert(id);
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        slab.for_each_live(|id, r| {
+            assert!(r.alive());
+            assert!(seen.insert(id), "visited twice");
+        });
+        assert_eq!(seen, want);
+    }
+
+    #[test]
+    fn a_record_is_64_bytes() {
+        // 16 hash + 8 size + 8 name (thin, doubles as the tombstone flag) +
+        // 32 inline source. Was 80 with Arc<str>, alive and last_seen.
+        assert_eq!(std::mem::size_of::<FileRecord>(), 64);
+    }
+
+    #[test]
     fn shard_capacity_does_not_double() {
         // The slab is the largest allocation in the process and only grows, so
         // Vec's doubling leaves up to half of it idle. This checks the growth
@@ -828,7 +983,7 @@ mod tests {
         for i in 0..40000u32 {
             let mut h = [0u8; 16];
             h[0..4].copy_from_slice(&i.to_le_bytes());
-            slab.get_or_insert(h, 100, "f".into(), src());
+            slab.get_or_insert(h, 100, "f", src());
         }
         let (len, cap) = slab.shard_len_cap(0);
         assert!(len > 0, "shard 0 must have received records");
@@ -846,7 +1001,7 @@ mod tests {
     fn with_record_sees_the_same_data_as_get_without_cloning() {
         let slab = FileSlab::new();
         let h = [7u8; 16];
-        let (id, _) = slab.get_or_insert(h, 4242, "name.avi".into(), src());
+        let (id, _) = slab.get_or_insert(h, 4242, "name.avi", src());
 
         let via_get = slab.get(id).expect("live record");
         let via_with = slab
@@ -876,7 +1031,7 @@ mod tests {
         for i in 0..20u8 {
             let mut h = [0u8; 16];
             h[0] = i;
-            slab.get_or_insert(h, 100, "f".into(), src());
+            slab.get_or_insert(h, 100, "f", src());
         }
         let mut seen = 0;
         slab.for_each_live_while(|_id, _r| {
@@ -897,13 +1052,13 @@ mod tests {
     #[test]
     fn insert_and_resolve() {
         let slab = FileSlab::new();
-        let (id, new) = slab.get_or_insert([10u8; 16], 100, "a.bin".into(), src());
+        let (id, new) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         assert!(new);
         // id resolves back to the same record (value of id is opaque now that
         // it encodes a shard; we test the round-trip, not a literal).
         let rec = slab.get(id).unwrap();
         assert_eq!(rec.hash, [10u8; 16]);
-        assert_eq!(&*rec.name, "a.bin");
+        assert_eq!(rec.name(), "a.bin");
         assert_eq!(slab.id_of(&[10u8; 16]), Some(id));
         assert_eq!(slab.hash_of(id), Some([10u8; 16]));
     }
@@ -911,8 +1066,8 @@ mod tests {
     #[test]
     fn dedup_returns_existing_id() {
         let slab = FileSlab::new();
-        let (id1, n1) = slab.get_or_insert([10u8; 16], 100, "a.bin".into(), src());
-        let (id2, n2) = slab.get_or_insert([10u8; 16], 100, "a.bin".into(), src());
+        let (id1, n1) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
+        let (id2, n2) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         assert!(n1 && !n2);
         assert_eq!(id1, id2, "same hash must map to same id");
         assert_eq!(slab.live_count(), 1);
@@ -923,7 +1078,7 @@ mod tests {
         let slab = FileSlab::new();
         let mut ids = Vec::new();
         for i in 0..100u8 {
-            let (id, _) = slab.get_or_insert([i; 16], 1, "f".into(), src());
+            let (id, _) = slab.get_or_insert([i; 16], 1, "f", src());
             ids.push(id);
         }
         // All ids distinct.
@@ -942,14 +1097,14 @@ mod tests {
     #[test]
     fn tombstone_makes_id_resolve_none_and_frees_hash() {
         let slab = FileSlab::new();
-        let (id, _) = slab.get_or_insert([10u8; 16], 100, "a.bin".into(), src());
+        let (id, _) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         assert!(slab.tombstone(id));
         // Stale id now resolves to None (safety property for lazy cleanup).
         assert!(slab.get(id).is_none());
         assert!(slab.hash_of(id).is_none());
         // Hash mapping is gone, so the same hash re-publishes as a NEW id.
         assert_eq!(slab.id_of(&[10u8; 16]), None);
-        let (id2, new) = slab.get_or_insert([10u8; 16], 100, "a.bin".into(), src());
+        let (id2, new) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         assert!(new);
         assert_ne!(id2, id, "tombstoned id is not reused");
     }
@@ -957,7 +1112,7 @@ mod tests {
     #[test]
     fn double_tombstone_is_false() {
         let slab = FileSlab::new();
-        let (id, _) = slab.get_or_insert([10u8; 16], 100, "a.bin".into(), src());
+        let (id, _) = slab.get_or_insert([10u8; 16], 100, "a.bin", src());
         assert!(slab.tombstone(id));
         assert!(!slab.tombstone(id), "second tombstone returns false");
     }
@@ -965,12 +1120,12 @@ mod tests {
     #[test]
     fn insert_sourceless_and_tombstone_by_hash() {
         let slab = FileSlab::new();
-        let id = slab.insert_sourceless([7u8; 16], 50, "restored.bin".into());
+        let id = slab.insert_sourceless([7u8; 16], 50, "restored.bin");
         let rec = slab.get(id).unwrap();
         assert!(rec.sources.is_empty(), "restored file has no sources");
         assert_eq!(slab.live_count(), 1);
         // Re-inserting same hash returns existing id (no duplicate).
-        let id2 = slab.insert_sourceless([7u8; 16], 50, "restored.bin".into());
+        let id2 = slab.insert_sourceless([7u8; 16], 50, "restored.bin");
         assert_eq!(id, id2);
         assert_eq!(slab.live_count(), 1);
         // Tombstone by hash.
@@ -1005,7 +1160,7 @@ mod tests {
         for i in 0..5000u32 {
             let mut h = [0u8; 16];
             h[0..4].copy_from_slice(&i.to_le_bytes());
-            let (id, _) = slab.get_or_insert(h, i as u64, "f".into(), src());
+            let (id, _) = slab.get_or_insert(h, i as u64, "f", src());
             ids.push((h, id));
         }
         // Every present hash resolves to the id it was inserted as.
@@ -1039,7 +1194,7 @@ mod tests {
             let mut h = [0u8; 16];
             h[0] = 5;
             h[15] = k;
-            let (id, _) = slab.get_or_insert(h, k as u64, "f".into(), src());
+            let (id, _) = slab.get_or_insert(h, k as u64, "f", src());
             ids.push((h, id));
         }
         // Tombstone one in the middle of the chain; the rest must stay reachable.
@@ -1072,14 +1227,14 @@ mod tests {
         // fresh batch must append new slots rather than recycle the dead ones.
         let slab = FileSlab::new();
         for i in 0..50u32 {
-            slab.get_or_insert(h_of(i), i as u64, "f".into(), src());
+            slab.get_or_insert(h_of(i), i as u64, "f", src());
         }
         for i in 0..50u32 {
             assert!(slab.tombstone(slab.id_of(&h_of(i)).unwrap()));
         }
         // Insert a disjoint batch immediately — quarantine has not elapsed.
         for i in 100..150u32 {
-            slab.get_or_insert(h_of(i), i as u64, "f".into(), src());
+            slab.get_or_insert(h_of(i), i as u64, "f", src());
         }
         assert_eq!(slab.live_count(), 50);
         assert_eq!(
@@ -1096,7 +1251,7 @@ mod tests {
         let mut slab = FileSlab::new();
         slab.set_quarantine_secs(0);
         for i in 0..50u32 {
-            slab.get_or_insert(h_of(i), i as u64, "f".into(), src());
+            slab.get_or_insert(h_of(i), i as u64, "f", src());
         }
         assert_eq!(slab.slot_count(), 50);
         for i in 0..50u32 {
@@ -1106,7 +1261,7 @@ mod tests {
         // Re-publish the same hashes: each lands in the shard that holds its freed
         // slot, so every insert recycles — no new slots appended.
         for i in 0..50u32 {
-            slab.get_or_insert(h_of(i), i as u64, "f".into(), src());
+            slab.get_or_insert(h_of(i), i as u64, "f", src());
         }
         assert_eq!(slab.live_count(), 50);
         assert_eq!(

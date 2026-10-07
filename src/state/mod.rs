@@ -6,7 +6,9 @@
 /// slab tombstone-thrash; the snapshot removal in v0.9.51 fixes the root cause,
 /// so a future lever A can use plain tombstones. See STATE.md lever A plan.
 #[allow(dead_code)]
+pub mod cold_store;
 pub mod file_id;
+pub mod file_name;
 pub mod keyword_index;
 pub mod name_interner;
 pub mod posting_codec;
@@ -24,6 +26,20 @@ use std::time::Instant;
 use tokio::sync::{mpsc, RwLock};
 
 pub type UserHash = [u8; 16];
+
+/// OFFERFILES batches processed in parallel on the blocking pool. Each is
+/// CPU-bound (a content-filter check per record), so a few cover any core
+/// count this server runs on; more would only compete with searches.
+pub const OFFER_JOBS: usize = 4;
+
+/// tokio's per-task header and trailer around a task's future, roughly
+/// (state word, vtable, owner links, waker slot). For /api/memsize.
+const TASK_HEADER_EST: u64 = 128;
+
+/// One client push channel (tokio mpsc): the shared channel state plus the
+/// first block of 32 slots, allocated with the channel. For /api/memsize.
+const PUSH_CHANNEL_EST: u64 =
+    (32 * std::mem::size_of::<crate::proto::Frame>() + 384) as u64;
 pub type FileHash = [u8; 16];
 
 /// Capacity of the per-client frame send channel.
@@ -526,6 +542,9 @@ pub struct ServerState {
     pub user_files: DashMap<UserHash, std::collections::HashSet<file_id::FileId>>,
     pub keyword_index: KeywordIndex,
     pub smart_sources: SmartSourcesCache,
+    /// Bounds how many OFFERFILES batches are processed at once off the
+    /// runtime (see the OFFERFILES arm in server::connection).
+    pub offer_lane: Arc<tokio::sync::Semaphore>,
     /// IPv6 address of a publisher, keyed by user hash.
     ///
     /// ⚠ A SIDE TABLE, not a field on `Source`, and the reason is arithmetic.
@@ -637,6 +656,14 @@ pub struct ServerState {
     /// current capacity here and subtracts it on close, so the endpoint can report
     /// the real figure instead of us inferring it from a regression.
     pub framed_buffer_bytes: std::sync::atomic::AtomicI64,
+    /// Heap held by the connections' CryptStreams (pending ciphertext, prefix,
+    /// boxed RC4 keys), reported by the connections like the codec buffers.
+    pub crypt_buffer_bytes: std::sync::atomic::AtomicI64,
+    /// Connection tasks alive (accepted sockets past the admission check,
+    /// logged in or not), and the size of one such task's future, measured at
+    /// spawn. Their product is the task memory /api/memsize reports.
+    pub conn_tasks: std::sync::atomic::AtomicI64,
+    pub conn_task_bytes: std::sync::atomic::AtomicU64,
     /// When each entry was first added to server_list (for the "give it 10
     /// minutes to verify" grace period).
     pub server_list_added_at: DashMap<std::net::Ipv4Addr, std::time::Instant>,
@@ -897,6 +924,32 @@ impl ServerState {
             .filter(|&(_, n)| n > 0)
     }
 
+    /// The source with the most LOGGED-IN clients right now: (source, logged
+    /// in, open TCP connections). For IPv6 the source is the prefix the per-IP
+    /// limit counts by.
+    ///
+    /// The Status tab used to rank by open connections, which picked whichever
+    /// address had the most abandoned sockets — one client reconnecting through
+    /// a firewall that silently drops the flow held 27 of them, with 1 session.
+    /// Many logged-in clients behind one address (a CGNAT, a campus) is what
+    /// the per-IP limit has to accommodate, so that is what is ranked. Ties go
+    /// to the address with more connections, then the lower address.
+    pub fn busiest_ip_by_clients(&self) -> Option<(IpAddr, u32, u32)> {
+        let bits = self.admission.cfg.ipv6_source_prefix_bits;
+        let mut per: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
+        for c in self.clients.iter() {
+            *per.entry(crate::admission::SourceKey::of(c.ip, bits).as_ip()).or_insert(0) += 1;
+        }
+        per.into_iter()
+            .map(|(ip, n)| {
+                let conns = self.conn_per_ip.get(&ip).map_or(0, |v| *v);
+                (ip, n, conns)
+            })
+            .max_by(|a, b| {
+                (a.1, a.2, std::cmp::Reverse(a.0)).cmp(&(b.1, b.2, std::cmp::Reverse(b.0)))
+            })
+    }
+
     /// How long a flagged flood bot stays banned (its UDP traffic dropped).
     pub const BOT_BAN_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
@@ -1136,6 +1189,7 @@ impl ServerState {
             keyword_index: KeywordIndex::with_subtokens(cfg.limits.index_subtokens),
             client_ipv6: DashMap::new(),
             smart_sources: SmartSourcesCache::new(),
+            offer_lane: Arc::new(tokio::sync::Semaphore::new(OFFER_JOBS)),
             filter,
             next_low_id: AtomicU32::new(1),
             total_sessions: AtomicU32::new(0),
@@ -1155,6 +1209,9 @@ impl ServerState {
             verified_sockets: DashMap::new(),
             peer_info: DashMap::new(),
             framed_buffer_bytes: std::sync::atomic::AtomicI64::new(0),
+            crypt_buffer_bytes: std::sync::atomic::AtomicI64::new(0),
+            conn_tasks: std::sync::atomic::AtomicI64::new(0),
+            conn_task_bytes: std::sync::atomic::AtomicU64::new(0),
             server_list_added_at: DashMap::new(),
             csam_unique_ips: DashMap::new(),
             csam_blocked_hashes: DashMap::new(),
@@ -1385,25 +1442,23 @@ impl ServerState {
         let publisher_hash = source.0;
 
         let src = Source::new(source.0, source.1, source.2, source.3);
-        // Intern the name once: identical names across files share this Arc.
-        let name_arc = self.name_interner.intern(&name);
-        // The slab is now the single store. get_or_insert creates the record
-        // (with this first source) if the hash is new; otherwise we add/refresh
-        // the source on the existing record. Both take one shard lock.
-        let (file_id, newly_added) =
-            self.file_slab
-                .get_or_insert(hash, size, name_arc.clone(), src);
+        // The slab is the single store. get_or_insert creates the record (with
+        // this first source, and its own copy of the name) if the hash is new;
+        // otherwise we add/refresh the source on the existing record. Both take
+        // one shard lock. Nothing is allocated for a known file.
+        let (file_id, newly_added) = self.file_slab.get_or_insert(hash, size, &name, src);
         if !newly_added {
             // Records the source and, in the same shard lock, tells us whether
             // this publisher used a different name than the one already stored.
             if let Some(stored) = self
                 .file_slab
-                .add_or_refresh_source_named(&hash, src, &name_arc)
+                .add_or_refresh_source_named(&hash, src, &name)
             {
-                self.note_alias(hash, size, &stored, &name_arc);
+                let published: Arc<str> = Arc::from(name.as_str());
+                self.note_alias(hash, size, &stored, &published);
             }
         } else {
-            self.keyword_index.add_file(file_id, &name_arc);
+            self.keyword_index.add_file(file_id, &name);
         }
         // Maintain reverse index user → set of FileIds this user sources.
         // HashSet semantics dedup re-publishes of the same file by the same user.
@@ -1482,7 +1537,7 @@ impl ServerState {
             && !e
                 .names
                 .iter()
-                .any(|n| std::sync::Arc::ptr_eq(n, published_as))
+                .any(|n| std::sync::Arc::ptr_eq(n, published_as) || **n == **published_as)
         {
             e.names.push(std::sync::Arc::clone(published_as));
         }
@@ -1502,21 +1557,17 @@ impl ServerState {
             Some((_, set)) => set.into_iter().collect(),
             None => return,
         };
-        // (file_id, name) for files that lost their last source — to evict.
-        let mut empty: Vec<(file_id::FileId, Arc<str>)> = Vec::with_capacity(file_ids.len() / 4);
         for fid in &file_ids {
             // Drop this user's source from the record (one shard lock). Returns
             // true when the file is now sourceless and should be evicted.
             if self.file_slab.remove_user_source(*fid, user_hash) {
-                // Fetch the name (for the keyword removal) before tombstoning.
-                if let Some(rec) = self.file_slab.get(*fid) {
-                    empty.push((*fid, rec.name.clone()));
+                // Re-checked under the tombstone's own lock: another publisher
+                // may have added a source since the line above. Only a file
+                // actually tombstoned loses its keywords.
+                if let Some(name) = self.file_slab.tombstone_if_sourceless(*fid) {
+                    self.keyword_index.remove_file(*fid, &name);
                 }
             }
-        }
-        for (fid, name) in empty {
-            self.keyword_index.remove_file(fid, &name);
-            self.file_slab.tombstone(fid);
         }
     }
 
@@ -1581,14 +1632,14 @@ impl ServerState {
         let mut total_sources: u64 = 0;
         let mut max_sources: u64 = 0;
         let mut name_bytes: u64 = 0;
-        for e in self.file_slab.iter_records_for_report() {
-            let n = e.0 as u64;
+        self.file_slab.for_each_record_size(|src_len, name_len| {
+            let n = src_len as u64;
             total_sources += n;
             if n > max_sources {
                 max_sources = n;
             }
-            name_bytes += e.1 as u64;
-        }
+            name_bytes += name_len as u64;
+        });
         // Sum of all user_files set sizes (reverse-index real size).
         let mut uf_entries: u64 = 0;
         for e in self.user_files.iter() {
@@ -1712,13 +1763,13 @@ impl ServerState {
         // report a flat zero and quietly understate the largest remaining name
         // cost.
         let mut name_bytes = 0u64;
-        let mut live_names = 0u64;
-        for (_src_len, name_len) in self.file_slab.iter_records_for_report() {
+        // Text plus the 4-byte length prefix (see state::file_name). The old
+        // Arc<str> carried 16 bytes of reference counts instead; the key keeps
+        // its name, now at zero, for anyone diffing across versions.
+        self.file_slab.for_each_record_size(|_src_len, name_len| {
             name_bytes += name_len as u64;
-            live_names += 1;
-        }
-        // Arc<str> control block: two usize counters, plus allocator rounding.
-        let name_arc_ctrl = live_names * 16;
+        });
+        let name_arc_ctrl = 0u64;
         // No dedup table any more. Kept as a named zero so the /api/memsize key
         // stays put for anyone diffing across versions.
         let name_map_slots = 0u64;
@@ -1793,7 +1844,19 @@ impl ServerState {
             .framed_buffer_bytes
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(0) as u64;
-        let clients_total = clients_slots + client_strings + framed_bufs;
+        let crypt_bufs = self
+            .crypt_buffer_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .max(0) as u64;
+        // One task per accepted connection: the future (measured at spawn) plus
+        // tokio's task header, and the push channel of a logged-in client (its
+        // shared state and first block of slots, allocated at login).
+        let conn_tasks = self.conn_tasks.load(std::sync::atomic::Ordering::Relaxed).max(0) as u64;
+        let task_bytes = conn_tasks
+            * (self.conn_task_bytes.load(std::sync::atomic::Ordering::Relaxed) + TASK_HEADER_EST);
+        let push_channels = self.clients.len() as u64 * PUSH_CHANNEL_EST;
+        let clients_total =
+            clients_slots + client_strings + framed_bufs + crypt_bufs + task_bytes + push_channels;
         let filters_total = ipfilter_bytes + geoip_bytes + content_filter_bytes;
         let other_total = smart_sources_bytes + server_list_bytes + misc;
 
@@ -1821,6 +1884,9 @@ impl ServerState {
             ("clients_map_slots_cap".into(), clients_slots),
             ("clients_strings".into(), client_strings),
             ("clients_framed_buffers".into(), framed_bufs),
+            ("clients_crypt_buffers".into(), crypt_bufs),
+            ("clients_tasks_est".into(), task_bytes),
+            ("clients_push_channels_est".into(), push_channels),
             ("clients_TOTAL".into(), clients_total),
             // filters (static, loaded at startup)
             ("filter_ipfilter".into(), ipfilter_bytes),
@@ -1869,16 +1935,24 @@ impl ServerState {
         }
         let set: std::collections::HashSet<file_id::FileId> = ids.iter().copied().collect();
         let mut empty_users: Vec<UserHash> = Vec::new();
-        for mut entry in self.user_files.iter_mut() {
+        // One user at a time. `iter_mut` held each shard's WRITE lock for the
+        // whole shard — thousands of users, each with a set of thousands of ids
+        // to filter — and every OFFERFILES and disconnect that hashed to that
+        // shard waited for it. The key list is taken under read locks; each user
+        // is then locked only for its own set.
+        let users: Vec<UserHash> = self.user_files.iter().map(|e| *e.key()).collect();
+        for u in users {
+            let Some(mut entry) = self.user_files.get_mut(&u) else { continue };
             let before = entry.value().len();
-            if before == 0 {
-                empty_users.push(*entry.key());
-                continue;
+            if before != 0 {
+                entry.value_mut().retain(|id| !set.contains(id));
             }
-            entry.value_mut().retain(|id| !set.contains(id));
-            if entry.value().is_empty() {
-                empty_users.push(*entry.key());
-            } else if entry.value().len() != before {
+            let after = entry.value().len();
+            if after == 0 {
+                empty_users.push(u);
+            } else if after != before && entry.value().capacity() > after * 2 {
+                // Rebuild only when it has really over-reserved: shrinking a
+                // set of thousands for one removed id is a full rehash.
                 entry.value_mut().shrink_to_fit();
             }
         }
@@ -2058,6 +2132,33 @@ mod user_files_index_tests {
         s.note_alias(h, 50 * 1024 * 1024, &a, &b);
         let second = s.file_aliases.get(&h).map(|e| e.last_seen).unwrap();
         assert!(second > first.unwrap(), "an update must refresh last_seen");
+    }
+
+    #[test]
+    fn republishing_under_the_same_name_is_not_an_alias() {
+        // Names are separate allocations (the interner does not deduplicate),
+        // so the same-name test must compare the text, not the pointer.
+        let s = build_state();
+        let h = fhash(7);
+        let size = 50 * 1024 * 1024;
+        for i in 1..=5u8 {
+            s.add_file_with_source(
+                h,
+                size,
+                "Holiday Clip 2019.avi".to_string(),
+                (uhash(i), "10.0.0.1".parse().unwrap(), 4662, true),
+            );
+        }
+        assert!(!s.file_aliases.contains_key(&h), "one name is not masquerading");
+
+        // A divergent name is still caught, and repeating it adds no copy.
+        let a: std::sync::Arc<str> = std::sync::Arc::from("Holiday Clip 2019.avi");
+        for _ in 0..3 {
+            let b: std::sync::Arc<str> = std::sync::Arc::from("Totally Different Thing.rar");
+            s.note_alias(h, size, &a, &b);
+        }
+        let names = s.file_aliases.get(&h).map(|e| e.names.len()).unwrap();
+        assert_eq!(names, 2, "each distinct name once");
     }
 
     #[test]
@@ -2464,6 +2565,30 @@ mod ip_slot_tests {
         assert!(st
             .try_acquire_ip_slot(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)), 2)
             .is_some());
+    }
+
+    #[test]
+    fn busiest_ip_ranks_by_logged_in_clients_not_sockets() {
+        // One client reconnecting through a firewall that drops its flows
+        // holds many sockets and one session; an address with several logged-in
+        // clients behind it is the one to show.
+        let st = st();
+        let stuck = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+        let nat = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        let _sockets: Vec<_> = (0..27).map(|_| st.try_acquire_ip_slot(stuck, 0)).collect();
+        let _nat_sockets: Vec<_> = (0..3).map(|_| st.try_acquire_ip_slot(nat, 0)).collect();
+        let place = |n: u8, ip: IpAddr| {
+            st.register_test_client([n; 16], 100 + n as u32, false, 0);
+            st.clients.get_mut(&[n; 16]).unwrap().ip = ip;
+        };
+        place(1, stuck);
+        place(2, nat);
+        place(3, nat);
+        place(4, nat);
+        assert_eq!(st.busiest_ip_connections(), 27, "the socket view is unchanged");
+        assert_eq!(st.busiest_ip_by_clients(), Some((nat, 3, 3)));
+        // No one logged in: nothing to show.
+        assert_eq!(ServerState::for_test().busiest_ip_by_clients(), None);
     }
 
     #[test]

@@ -738,7 +738,7 @@ mod string_size_tests {
             (1, 0)
         );
         let rec = state.file_slab.get_by_hash(&[1; 16]).unwrap();
-        assert_eq!(&*rec.name, &name[..20]);
+        assert_eq!(rec.name(), &name[..20]);
     }
 
     #[test]
@@ -762,7 +762,7 @@ mod string_size_tests {
         let name = "x".repeat(600) + ".avi";
         handle_offerfiles(&state, &mut c, vec![offer(&name, 3)]);
         assert_eq!(
-            state.file_slab.get_by_hash(&[3; 16]).unwrap().name.len(),
+            state.file_slab.get_by_hash(&[3; 16]).unwrap().name().len(),
             604
         );
     }

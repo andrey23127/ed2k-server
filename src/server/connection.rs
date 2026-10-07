@@ -10,6 +10,9 @@ use crate::proto::{opcodes::*, CryptStream, Ed2kCodec, Frame};
 use crate::server::callback::handle_callback_request;
 use crate::server::get_sources::{handle_get_sources, GetSourcesRequest};
 use crate::server::login::{build_welcome_batch, handle_login, LoginRequest};
+/// OFFERFILES batches of up to this many records are handled on the runtime.
+const OFFER_INLINE_MAX: usize = 8;
+
 use crate::server::offerfiles::{
     declared_count, handle_offerfiles, over_hard_limit, parse_offerfiles, soft_limit_message,
 };
@@ -105,7 +108,9 @@ pub async fn handle_admitted_connection(
 
     // Report this connection's buffer footprint so /api/memsize can show it instead
     // of it landing in "unaccounted". Kept in sync on every reclaim, removed on exit.
-    let mut accounted_bufs: i64 = 0;
+    // (codec buffers, CryptStream buffers) this connection has put on the
+    // gauges; kept in step and taken off at the end.
+    let mut accounted_bufs: (i64, i64) = (0, 0);
     account_framed_buffers(&state, &framed, &mut accounted_bufs);
 
     let mut client: Option<ClientHandle> = None;
@@ -117,7 +122,15 @@ pub async fn handle_admitted_connection(
     // small. Was previously `(_, rx) = channel(1)` which discarded the Sender
     // entirely — so ClientHandle.tx was always None and callbacks were silent
     // no-ops.
-    let (_tx, mut rx): (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) = mpsc::channel(32);
+    //
+    // Until login there is nobody to push to, so this placeholder's sender is
+    // dropped at once: login replaces `rx` with the real channel, and with both
+    // ends gone the placeholder is freed there. Keeping the sender alive (it was
+    // bound to `_tx` for the whole session) kept a second, never-used channel
+    // allocated per connection (its shared state and first block of slots).
+    // A closed channel's recv() resolves to None at once; the select! arm below
+    // only matches Some, so it is simply skipped, not spun on.
+    let mut rx: mpsc::Receiver<Frame> = mpsc::channel(1).1;
 
     // Per-connection buffer of search results not yet sent to this client.
     // SEARCHREQUEST fills it; QUERY_MORE_RESULT (0x21) drains it page by page.
@@ -273,10 +286,16 @@ pub async fn handle_admitted_connection(
                 if let Some(c) = client.as_ref() { c.touch_activity(); }
                 match result {
                     Some(Ok(frame)) => {
-                        let res = dispatch(
+                        // Boxed: the dispatch future (login, search, offer
+                        // handling and every await inside them) is several KB.
+                        // Inline it was part of this connection's state for the
+                        // whole session — one copy per connected client, kept
+                        // between frames when nothing runs. Boxed it exists
+                        // only while a frame is being handled.
+                        let res = Box::pin(dispatch(
                             &cfg, &state, &state, &mut client, &mut framed, &mut rx,
                             &mut pending_search, &mut sess, peer, frame
-                        ).await;
+                        )).await;
                         // Logged in: no longer a pending login.
                         if client.is_some() {
                             pending_login.take();
@@ -350,10 +369,15 @@ pub async fn handle_admitted_connection(
 
     // This connection's buffers are about to be dropped — take them off the gauge.
     // Runs on every exit path: the loop above only leaves via `break`.
-    if accounted_bufs != 0 {
+    if accounted_bufs.0 != 0 {
         state
             .framed_buffer_bytes
-            .fetch_sub(accounted_bufs, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(accounted_bufs.0, std::sync::atomic::Ordering::Relaxed);
+    }
+    if accounted_bufs.1 != 0 {
+        state
+            .crypt_buffer_bytes
+            .fetch_sub(accounted_bufs.1, std::sync::atomic::Ordering::Relaxed);
     }
 
     if let Some(c) = client {
@@ -444,15 +468,18 @@ fn reclaim_framed_buffers(framed: &mut Framed<CryptStream, Ed2kCodec>) {
 fn account_framed_buffers(
     state: &Arc<ServerState>,
     framed: &Framed<CryptStream, Ed2kCodec>,
-    accounted: &mut i64,
+    accounted: &mut (i64, i64),
 ) {
-    let now = (framed.read_buffer().capacity() + framed.write_buffer().capacity()) as i64;
-    let delta = now - *accounted;
-    if delta != 0 {
-        state
-            .framed_buffer_bytes
-            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
-        *accounted = now;
+    use std::sync::atomic::Ordering::Relaxed;
+    let codec = (framed.read_buffer().capacity() + framed.write_buffer().capacity()) as i64;
+    if codec != accounted.0 {
+        state.framed_buffer_bytes.fetch_add(codec - accounted.0, Relaxed);
+        accounted.0 = codec;
+    }
+    let crypt = framed.get_ref().heap_bytes() as i64;
+    if crypt != accounted.1 {
+        state.crypt_buffer_bytes.fetch_add(crypt - accounted.1, Relaxed);
+        accounted.1 = crypt;
     }
 }
 
@@ -635,7 +662,42 @@ async fn dispatch(
             }
             let files = parse_offerfiles(&frame.payload)?;
             let warned_before = c.soft_limit_warned;
-            handle_offerfiles(state, c, files);
+            // A batch is a content-filter check per record, up to hundreds of
+            // records — at the default single runtime thread, all networking
+            // stopped while one ran, and a reconnect storm after a restart is
+            // tens of thousands of them back to back. A large batch goes to
+            // the blocking pool when one of OFFER_JOBS slots is free; this
+            // connection waits for its own result (a session's records stay in
+            // order) while every other one keeps being served.
+            //
+            // With no slot free it runs inline, as it always did. It must not
+            // WAIT for a slot: every waiting connection would hold its parsed
+            // batch, and in a reconnect storm that is tens of thousands of
+            // batches in memory at once. Inline, the runtime is busy and other
+            // connections are not reading theirs — the same bound as before.
+            // Small batches (the incremental offers of a running eMule) are
+            // cheaper inline anyway.
+            let permit = if files.len() > OFFER_INLINE_MAX {
+                Arc::clone(&state.offer_lane).try_acquire_owned().ok()
+            } else {
+                None
+            };
+            if let Some(permit) = permit {
+                let st = Arc::clone(state_arc);
+                let mut handle = c.clone();
+                let handle = tokio::task::spawn_blocking(move || {
+                    handle_offerfiles(&st, &mut handle, files);
+                    drop(permit);
+                    handle
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("offerfiles job failed: {e}"))?;
+                // The only fields the handler changes on the session.
+                c.csam_attempts = handle.csam_attempts;
+                c.soft_limit_warned = handle.soft_limit_warned;
+            } else {
+                handle_offerfiles(state, c, files);
+            }
             if c.soft_limit_warned && !warned_before {
                 let soft = state.live_cfg.load().limits.soft_limit_files;
                 let text = soft_limit_message(soft);
@@ -983,5 +1045,31 @@ mod session_end_tests {
         assert!(a.same_session(&a_copy));
         let b = login(&st, 5, [1, 0, 0, 10], true, 1);
         assert!(!a.same_session(&b), "same id, same IP, different session");
+    }
+}
+
+#[cfg(test)]
+mod task_size_tests {
+    /// The connection future lives on the heap for the whole session — one per
+    /// client — so its size is per-client memory. Dispatch runs boxed (see the
+    /// call site), which keeps its state out of this.
+    #[tokio::test]
+    async fn the_connection_future_stays_small() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap();
+        let _c = tokio::net::TcpStream::connect(a).await.unwrap();
+        let (s, peer) = l.accept().await.unwrap();
+        let cfg = std::sync::Arc::new(crate::config::Config::minimal_test_config());
+        let st = std::sync::Arc::new(crate::state::ServerState::for_test());
+        let fut = super::handle_connection(
+            cfg,
+            st,
+            crate::proto::crypt_stream::CryptStream::plain(s),
+            peer,
+        );
+        // 5352 bytes before dispatch was boxed and the RC4 keys moved to the
+        // heap; 1264 after.
+        let size = std::mem::size_of_val(&fut);
+        assert!(size <= 2048, "connection future grew to {size} bytes");
     }
 }

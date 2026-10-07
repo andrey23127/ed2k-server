@@ -474,8 +474,9 @@ dependencies = [
 
 [[package]]
 name = "ed2k-server"
-version = "0.9.77"
+version = "0.9.78"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "arc-swap",
  "axum",

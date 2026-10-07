@@ -37,6 +37,11 @@ const MAX_ENTRIES: usize = 4096;
 struct CacheEntry {
     /// Fully-encoded FOUNDSOURCES payload (everything after proto+opcode).
     payload: Vec<u8>,
+    /// Who each record in `payload` belongs to, in record order: the first 8
+    /// bytes of the source's user hash. The payload is shared by every
+    /// requester of the file, so it is built with ALL sources and the asker's
+    /// own record is dropped when it is served (see `get_with`).
+    owners: Vec<u64>,
     /// When this entry was inserted.
     inserted: Instant,
 }
@@ -74,6 +79,27 @@ impl SmartSourcesCache {
             self.hits.fetch_add(1, Ordering::Relaxed);
             Some(entry.payload.clone())
         } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    /// Like `get`, but hands the fresh payload and its owner list to `f` under
+    /// the lock and returns what `f` builds — so a requester-specific answer is
+    /// cut from the shared payload without cloning it first.
+    pub fn get_with<R>(&self, hash: &[u8; 16], f: impl FnOnce(&[u8], &[u64]) -> R) -> Option<R> {
+        let map = self.map.lock().unwrap();
+        let entry = match map.get(hash) {
+            Some(e) => e,
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        if entry.inserted.elapsed() < CACHE_TTL {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            Some(f(&entry.payload, &entry.owners))
+        } else {
             // Expired — counts as a miss (the caller will rebuild). We leave it
             // for the next insert() to sweep; keeping the lock simple avoids
             // upgrade churn.
@@ -91,7 +117,10 @@ impl SmartSourcesCache {
         let slots = (m.capacity()
             * (std::mem::size_of::<[u8; 16]>() + std::mem::size_of::<CacheEntry>() + 1))
             as u64;
-        let payloads: u64 = m.values().map(|e| e.payload.capacity() as u64).sum();
+        let payloads: u64 = m
+            .values()
+            .map(|e| (e.payload.capacity() + e.owners.capacity() * 8) as u64)
+            .sum();
         slots + payloads
     }
 
@@ -107,8 +136,9 @@ impl SmartSourcesCache {
         )
     }
 
-    /// Store a freshly-built FOUNDSOURCES payload for `hash`.
-    pub fn put(&self, hash: [u8; 16], payload: Vec<u8>) {
+    /// Store a freshly-built FOUNDSOURCES payload for `hash`, with the owner
+    /// of each record (see `CacheEntry::owners`).
+    pub fn put(&self, hash: [u8; 16], payload: Vec<u8>, owners: Vec<u64>) {
         let mut map = self.map.lock().unwrap();
 
         // Bound memory: if the map is getting large, sweep expired entries
@@ -126,6 +156,7 @@ impl SmartSourcesCache {
             hash,
             CacheEntry {
                 payload,
+                owners,
                 inserted: Instant::now(),
             },
         );
@@ -163,7 +194,7 @@ mod tests {
         let hash = [7u8; 16];
         let payload = vec![1, 2, 3, 4, 5];
 
-        cache.put(hash, payload.clone());
+        cache.put(hash, payload.clone(), Vec::new());
 
         // Immediate get is a hit with identical bytes.
         assert_eq!(cache.get(&hash), Some(payload));
@@ -176,7 +207,7 @@ mod tests {
     fn invalidate_removes_entry() {
         let cache = SmartSourcesCache::new();
         let hash = [3u8; 16];
-        cache.put(hash, vec![0xAA, 0xBB]);
+        cache.put(hash, vec![0xAA, 0xBB], Vec::new());
         assert!(cache.get(&hash).is_some());
 
         cache.invalidate(&hash);
@@ -195,6 +226,7 @@ mod tests {
                 hash,
                 CacheEntry {
                     payload: vec![1, 2, 3],
+                    owners: Vec::new(),
                     inserted: Instant::now() - Duration::from_secs(60),
                 },
             );
@@ -207,8 +239,8 @@ mod tests {
     fn put_overwrites_with_fresh_timestamp() {
         let cache = SmartSourcesCache::new();
         let hash = [1u8; 16];
-        cache.put(hash, vec![0x01]);
-        cache.put(hash, vec![0x02, 0x03]);
+        cache.put(hash, vec![0x01], Vec::new());
+        cache.put(hash, vec![0x02, 0x03], Vec::new());
         // Latest put wins.
         assert_eq!(cache.get(&hash), Some(vec![0x02, 0x03]));
     }
@@ -218,7 +250,7 @@ mod tests {
         let cache = SmartSourcesCache::new();
         let hash = [4u8; 16];
         assert_eq!(cache.get(&hash), None); // miss (no entry)
-        cache.put(hash, vec![1, 2, 3]);
+        cache.put(hash, vec![1, 2, 3], Vec::new());
         assert!(cache.get(&hash).is_some()); // hit
         let (hits, misses) = cache.stats();
         assert_eq!(hits, 1);

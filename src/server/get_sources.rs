@@ -103,7 +103,7 @@ pub fn handle_get_sources(
     // listed would otherwise keep being served for the life of its TTL.
     let withheld_name = state
         .file_slab
-        .with_record_by_hash(&req.file_hash, |_id, r| r.name.to_string());
+        .with_record_by_hash(&req.file_hash, |_id, r| r.name().to_string());
     if state
         .filter
         .is_withheld_opt(&req.file_hash, withheld_name.as_deref())
@@ -132,32 +132,41 @@ pub fn handle_get_sources(
     //   cache exists to absorb bursts of identical requests and v6-capable
     //   sessions are a small minority; a second keyspace would halve the hit
     //   rate for the common case to serve the rare one.
+    let me = owner_key(&requester.user_hash);
     if !v6_capable {
-        if let Some(cached) = state.smart_sources.get(&req.file_hash) {
+        if let Some(payload) = state
+            .smart_sources
+            .get_with(&req.file_hash, |p, owners| without_owner(p, owners, me))
+        {
             debug!(
                 file_hash = hex::encode(req.file_hash),
                 "getsources answered from SmartSources cache"
             );
-            return Frame::new(OP_FOUNDSOURCES, cached);
+            return Frame::new(OP_FOUNDSOURCES, payload);
         }
     }
 
     // Slow path: build the source list from the index.
+    // Only the sources are copied out, not the whole record and its name.
     let sources = state
         .file_slab
-        .get_by_hash(&req.file_hash)
-        .map(|entry| {
+        .with_record_by_hash(&req.file_hash, |_id, entry| {
             entry
                 .sources
                 .iter()
-                // Don't return the requester to itself
-                .filter(|s| s.user_hash != requester.user_hash)
+                // The requester is NOT filtered out here: the payload built
+                // from this list is cached and served to everyone who asks for
+                // the file, so it must contain every source. Each requester's
+                // own record is removed when the payload is served (below, and
+                // on a cache hit above). One extra is taken so that removing
+                // it still leaves a full reply.
+                //
                 // LowID sources are returned to LowID requesters on purpose.
                 // Stock eMule cannot use them and drops them itself, but the
                 // NAT-traversal mod reaches exactly these through the server's
                 // hole-punch rendezvous, and an IPv6-capable pair can connect
                 // over v6. Filtering here would cut those paths for no gain.
-                .take(MAX_SOURCES_PER_REPLY)
+                .take(MAX_SOURCES_PER_REPLY + 1)
                 .copied()
                 .collect::<Vec<_>>()
         })
@@ -175,7 +184,19 @@ pub fn handle_get_sources(
     // leave the client parsing past the end of the payload.
     let mut entries = BytesMut::new();
     let mut emitted: u8 = 0;
+    let mut owners: Vec<u64> = Vec::with_capacity(sources.len());
     for s in &sources {
+        // A v6-capable reply is never cached, so it is built for this
+        // requester alone: skip their own record and stop at the cap here. A
+        // classic payload keeps everyone; it is cut per requester when served.
+        if v6_capable {
+            if s.user_hash == requester.user_hash {
+                continue;
+            }
+            if emitted as usize == MAX_SOURCES_PER_REPLY {
+                break;
+            }
+        }
         // Encode the source ID the way eD2k clients expect:
         //   * HighID source  -> its real IPv4 (client connects directly)
         //   * LowID source   -> its server-assigned low ID (< 0x01000000), so the
@@ -249,26 +270,64 @@ pub fn handle_get_sources(
             entries.put_slice(&a.octets());
         }
         emitted += 1;
+        owners.push(owner_key(&s.user_hash));
     }
 
     let mut payload = BytesMut::new();
     payload.put_slice(&req.file_hash);
     payload.put_u8(emitted);
     payload.put_slice(&entries);
-
     let payload_vec = payload.to_vec();
-    // Cache the built payload. Note: the requester-self filter above means
-    // this payload technically excludes one specific peer, but in practice
-    // the same file is requested by many peers and the ~5s TTL makes the
-    // tiny over/under-inclusion harmless — clients re-query constantly.
-    //
-    // Only a classic payload is cached, for the reason at the read side: a
-    // sentinel payload stored here would later be served to a legacy client.
-    if !v6_capable {
-        state.smart_sources.put(req.file_hash, payload_vec.clone());
+
+    if v6_capable {
+        // Already this requester's own reply (see the loop). Not cached, for
+        // the reason at the read side.
+        return Frame::new(OP_FOUNDSOURCES, payload_vec);
     }
 
-    Frame::new(OP_FOUNDSOURCES, payload_vec)
+    // Cache the payload with EVERY source, and serve this requester the same
+    // cut every later requester gets. It used to be cached with the first
+    // requester already removed: for the TTL that source was hidden from
+    // everyone else, and every later requester was handed its own address.
+    let reply = without_owner(&payload_vec, &owners, me);
+    state.smart_sources.put(req.file_hash, payload_vec, owners);
+    Frame::new(OP_FOUNDSOURCES, reply)
+}
+
+/// The key a cached record's owner is stored under: the first 8 bytes of the
+/// user hash. A collision would only hide one source from one requester.
+fn owner_key(user_hash: &[u8; 16]) -> u64 {
+    u64::from_le_bytes(user_hash[..8].try_into().unwrap())
+}
+
+/// Cut a requester-specific reply from a shared classic payload: drop the
+/// records owned by `me` and keep at most `MAX_SOURCES_PER_REPLY`, fixing the
+/// count byte to match.
+///
+/// Classic records only (6 bytes: id + port) — the only kind ever cached. A
+/// payload whose length does not match its owner list is returned unchanged
+/// apart from the cap, rather than being cut at the wrong offsets.
+fn without_owner(payload: &[u8], owners: &[u64], me: u64) -> Vec<u8> {
+    const HDR: usize = 17;
+    const REC: usize = 6;
+    if payload.len() < HDR || payload.len() != HDR + owners.len() * REC {
+        return payload.to_vec();
+    }
+    let mut out = Vec::with_capacity(payload.len());
+    out.extend_from_slice(&payload[..HDR]);
+    let mut n: usize = 0;
+    for (i, &owner) in owners.iter().enumerate() {
+        if owner == me {
+            continue;
+        }
+        if n == MAX_SOURCES_PER_REPLY {
+            break;
+        }
+        out.extend_from_slice(&payload[HDR + i * REC..HDR + (i + 1) * REC]);
+        n += 1;
+    }
+    out[16] = n as u8;
+    out
 }
 
 #[cfg(test)]
@@ -466,5 +525,68 @@ mod tests {
             Some(&expect_high),
             "HighID source must encode real IP"
         );
+    }
+
+    fn ports_of(frame: &Frame) -> Vec<u16> {
+        let p = &frame.payload;
+        let count = p[16] as usize;
+        assert_eq!(p.len(), 17 + count * 6, "count byte must match the records");
+        let mut v: Vec<u16> = (0..count)
+            .map(|i| u16::from_le_bytes([p[17 + i * 6 + 4], p[17 + i * 6 + 5]]))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn a_cached_reply_hides_each_requester_from_itself_only() {
+        // The cache is shared by every requester of the file. It used to be
+        // filled with the FIRST requester already removed: that source was then
+        // hidden from everyone else for the TTL, and every later requester got
+        // its own address back.
+        use std::net::{IpAddr, Ipv4Addr};
+        let state = ServerState::for_test();
+        let file_hash = [0x55u8; 16];
+        let users = [[0xA1u8; 16], [0xA2u8; 16], [0xA3u8; 16]];
+        for (i, uh) in users.iter().enumerate() {
+            let ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10 + i as u8));
+            state.add_file_with_source(file_hash, 1000, "f".into(), (*uh, ip, 4001 + i as u16, true));
+            state.register_test_client(*uh, 0x0A00_0001 + i as u32, true, 0);
+        }
+        let ask = |uh: &[u8; 16]| {
+            let requester = state.clients.get(uh).unwrap().clone();
+            handle_get_sources(&state, &requester, GetSourcesRequest { file_hash, size: None })
+        };
+        // First requester builds the cache entry.
+        assert_eq!(ports_of(&ask(&users[0])), vec![4002, 4003]);
+        // The next two are answered from the cache.
+        assert_eq!(ports_of(&ask(&users[1])), vec![4001, 4003]);
+        assert_eq!(ports_of(&ask(&users[2])), vec![4001, 4002]);
+        let (hits, _) = state.smart_sources.stats();
+        assert_eq!(hits, 2, "the later requests must come from the cache");
+
+        // A client that is not a source gets everyone.
+        let outsider = [0xEEu8; 16];
+        state.register_test_client(outsider, 7, false, 0);
+        assert_eq!(ports_of(&ask(&outsider)), vec![4001, 4002, 4003]);
+    }
+
+    #[test]
+    fn the_reply_cap_holds_after_removing_the_requester() {
+        let mut payload = vec![0u8; 16];
+        payload.push(0);
+        let mut owners = Vec::new();
+        for i in 0..=MAX_SOURCES_PER_REPLY as u64 {
+            payload.extend_from_slice(&[1, 2, 3, 4, (i & 0xFF) as u8, (i >> 8) as u8]);
+            owners.push(i);
+        }
+        payload[16] = owners.len() as u8;
+        // The requester is in the list: the rest exactly fills the cap.
+        let out = without_owner(&payload, &owners, 5);
+        assert_eq!(out[16] as usize, MAX_SOURCES_PER_REPLY);
+        assert_eq!(out.len(), 17 + MAX_SOURCES_PER_REPLY * 6);
+        // Not in the list: still capped.
+        let out = without_owner(&payload, &owners, 99_999);
+        assert_eq!(out[16] as usize, MAX_SOURCES_PER_REPLY);
     }
 }

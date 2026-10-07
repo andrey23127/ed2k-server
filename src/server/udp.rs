@@ -18,7 +18,7 @@
 use crate::config::Config;
 use crate::proto::{
     opcodes::*,
-    search::{collect_terms, evaluate, parse as parse_search},
+    search::{collect_terms, evaluate_prepared, parse as parse_search, prepare},
     tags::{write_tag_list, Tag, TagValue},
 };
 use crate::state::ServerState;
@@ -383,6 +383,9 @@ impl UdpServer {
 
     pub async fn run(self) {
         let mut buf = vec![0u8; 65535];
+        // The socket never changes, so ask for its port once instead of a
+        // getsockname() system call per obfuscated datagram.
+        let local_port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
         loop {
             let (len, peer) = match self.socket.recv_from(&mut buf).await {
                 Ok(x) => x,
@@ -449,7 +452,6 @@ impl UdpServer {
                 // so this was not a handful of odd peers but a constant loss
                 // across all of them. Of 119 short frames checked, exactly one
                 // got a reply.
-                let local_port = self.socket.local_addr().map(|a| a.port()).unwrap_or(0);
                 let on_obfping_port = local_port == self.cfg.network.tcp_port.wrapping_add(12);
                 let min_len = if on_obfping_port { 4 } else { 10 };
                 if data.len() < min_len || data.len() > 1500 {
@@ -767,7 +769,10 @@ impl UdpServer {
                     // differs from the login hash (so the wrong client is kept
                     // warm). If you see no line at all every ~2 min, the keepalive
                     // never reaches the server (wrong UDP port / NAT / firewall).
-                    info!(
+                    // Debug level: one line per client every ~2 minutes is the
+                    // busiest line in the log at 50k clients (RUST_LOG=debug to
+                    // see it again).
+                    debug!(
                         ip = %peer.ip(),
                         udp_src_port = peer.port(),
                         user_hash = hex::encode(uh),
@@ -955,7 +960,7 @@ impl UdpServer {
         let name = self
             .state
             .file_slab
-            .with_record_by_hash(hash, |_id, r| r.name.to_string());
+            .with_record_by_hash(hash, |_id, r| r.name().to_string());
         if self.state.filter.is_withheld_opt(hash, name.as_deref()) {
             let mut out = BytesMut::new();
             out.put_u8(PROTO_EDONKEY);
@@ -1491,13 +1496,30 @@ impl UdpServer {
             _ => return Ok(()),
         };
 
-        // Guard 1: connected client → certainly not a peer server.
+        // Guard 1: only accept from peer servers we've gossiped with. Seeds
+        // populate `our_sent_random_parts` (we sent them an OBF ping) and
+        // `seed_server_keys` (we received their obf reply). Either marks
+        // them as a real peer in our books.
+        //
+        // Two O(1) lookups, so it runs first: almost every stray 0xA1 comes
+        // from an unknown sender and is dropped here without the client check
+        // below, whose fallback walks the whole client table.
+        let is_known_peer = self.state.our_sent_random_parts.contains_key(&sender_v4)
+            || self.state.seed_server_keys.contains_key(&sender_v4);
+        if !is_known_peer {
+            debug!(ip = %from.ip(),
+                   "rejecting 0xA1 from unknown sender (not a gossiped peer)");
+            return Ok(());
+        }
+
+        // Guard 2: connected client → certainly not a peer server, even when the
+        // same IP also runs a server we gossip with.
         //
         // `recent_client_ips` is keyed by IPv4 and is populated for every client
         // that connects, so an O(1) hit there answers the common case. The walk
         // over `clients` stays as a fallback for the window before an entry
         // lands (or after its TTL expires while the client is still connected),
-        // but it now runs only when the cheap check misses.
+        // but it now runs only for known peers whose cheap check missed.
         let sender_is_client = self.state.recent_client_ips.contains_key(&sender_v4)
             || self.state.clients.iter().any(|e| match e.ip {
                 std::net::IpAddr::V4(v4) => v4 == sender_v4,
@@ -1506,18 +1528,6 @@ impl UdpServer {
         if sender_is_client {
             debug!(ip = %from.ip(),
                    "rejecting 0xA1 from connected client (mldonkey-style packet)");
-            return Ok(());
-        }
-
-        // Guard 2: only accept from peer servers we've gossiped with. Seeds
-        // populate `our_sent_random_parts` (we sent them an OBF ping) and
-        // `seed_server_keys` (we received their obf reply). Either marks
-        // them as a real peer in our books.
-        let is_known_peer = self.state.our_sent_random_parts.contains_key(&sender_v4)
-            || self.state.seed_server_keys.contains_key(&sender_v4);
-        if !is_known_peer {
-            debug!(ip = %from.ip(),
-                   "rejecting 0xA1 from unknown sender (not a gossiped peer)");
             return Ok(());
         }
 
@@ -1747,7 +1757,10 @@ impl UdpServer {
             self.reply(&old_pkt, peer, obf).await?;
         }
 
-        info!(
+        // Debug level: every client asks for the description, so at info this
+        // was a log line (and a getsockname() call) per request. tracing only
+        // evaluates the fields when the level is enabled.
+        debug!(
             ip = %peer.ip(),
             challenge = format!("0x{challenge:08x}"),
             new_format_sent = is_new_format_request,
@@ -1894,7 +1907,13 @@ fn udp_search_ranked(
     //   are alternatives by construction, so its tokens are unioned as before.
     // Shared with the TCP path — see `candidate_groups`.
     let groups: Vec<Vec<String>> = crate::proto::search::candidate_groups(&tree);
-    let candidate_ids = state.keyword_index.find_grouped(&groups);
+    // Capped like the TCP path: only the first rank_scan candidates are
+    // examined, plus one to tell that the cap was hit.
+    let scan_budget = (state.live_cfg.load().limits.search_rank_scan as usize)
+        .max(UDP_MAX_SEARCH_RESULTS);
+    let candidate_ids = state
+        .keyword_index
+        .find_grouped_capped(&groups, scan_budget.saturating_mul(2).saturating_add(1));
 
     // Ranked by source count, exactly as the TCP path does.
     //
@@ -1909,42 +1928,58 @@ fn udp_search_ranked(
         let mut heap: std::collections::BinaryHeap<crate::server::search::UdpRanked> =
             std::collections::BinaryHeap::with_capacity(UDP_MAX_SEARCH_RESULTS + 1);
         let mut examined = 0usize;
+        // Terms folded once for the whole search, not once per candidate.
+        let prepared = prepare(&tree);
         for fid in candidate_ids {
             if examined >= rank_scan {
                 state.note_search_rank_capped();
                 break;
             }
             examined += 1;
-            let entry = match state.file_slab.with_record(fid, |r| r.clone()) {
-                Some(e) => e,
-                None => continue,
-            };
-            // Full filter, not just the hash lists — see
-            // ContentFilter::is_withheld. The UDP and TCP search paths must
-            // withhold the same records, or a file merely moves from one to
-            // the other.
-            if state.filter.is_withheld(&entry.hash, &entry.name) {
-                continue;
-            }
-            // Skip orphans (no live source). See src/server/search.rs for
-            // the full rationale — orphans are useless to return.
-            if entry.sources.is_empty() {
-                continue;
-            }
-            // Folded, exactly as the TCP path does. The two must agree or a
-            // query answered by one channel and not the other becomes a
-            // protocol-dependent result set.
-            let name_lower = crate::state::keyword_index::fold_for_match(&entry.name);
-            if !evaluate(&tree, &name_lower, entry.size) {
-                continue;
-            }
-            heap.push(crate::server::search::UdpRanked {
-                sources: entry.sources.len() as u32,
-                id: fid,
-                rec: entry,
+            // Tested in place under the shard read lock, as the TCP path does;
+            // only a record that enters the heap is cloned.
+            let push = state.file_slab.with_record(fid, |entry| {
+                // Skip orphans (no live source). See src/server/search.rs for
+                // the full rationale — orphans are useless to return.
+                if entry.sources.is_empty() {
+                    return None;
+                }
+                // Folded, exactly as the TCP path does. The two must agree or a
+                // query answered by one channel and not the other becomes a
+                // protocol-dependent result set.
+                let name_lower = crate::state::keyword_index::fold_for_match(entry.name());
+                if !evaluate_prepared(&prepared, &name_lower, entry.size) {
+                    return None;
+                }
+                let sources = entry.sources.len() as u32;
+                // Cheap rejection before the filter and the clone, as on TCP.
+                if heap.len() >= UDP_MAX_SEARCH_RESULTS {
+                    if let Some(worst) = heap.peek() {
+                        if (sources, std::cmp::Reverse(fid))
+                            <= (worst.sources, std::cmp::Reverse(worst.id))
+                        {
+                            return None;
+                        }
+                    }
+                }
+                // Full filter, not just the hash lists — see
+                // ContentFilter::is_withheld. The UDP and TCP search paths must
+                // withhold the same records, or a file merely moves from one to
+                // the other. Last, because it is the costliest test and pure.
+                if state.filter.is_withheld(&entry.hash, entry.name()) {
+                    return None;
+                }
+                Some(crate::server::search::UdpRanked {
+                    sources,
+                    id: fid,
+                    rec: entry.clone(),
+                })
             });
-            if heap.len() > UDP_MAX_SEARCH_RESULTS {
-                heap.pop();
+            if let Some(Some(r)) = push {
+                heap.push(r);
+                if heap.len() > UDP_MAX_SEARCH_RESULTS {
+                    heap.pop();
+                }
             }
         }
         // Ord is inverted (see `Ranked` in server/search.rs), so ascending
@@ -1971,7 +2006,7 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     let size_lo = entry.size as u32;
     let size_hi = (entry.size >> 32) as u32;
     let mut tags = vec![
-        Tag::byte(FT_FILENAME, TagValue::String(entry.name.to_string())),
+        Tag::byte(FT_FILENAME, TagValue::String(entry.name().to_string())),
         Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
     ];
     if size_hi > 0 {
@@ -1992,7 +2027,7 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     // FT_FILETYPE as an integer — see the note in server/search.rs. The
     // UDP and TCP result paths must carry the same tags, or a client
     // gets different metadata depending on which one answered it.
-    let ftype = crate::proto::search::ed2k_file_type_id(&entry.name.to_lowercase());
+    let ftype = crate::proto::search::ed2k_file_type_id(&entry.name().to_lowercase());
     if ftype != crate::proto::search::ed2k_file_type::ANY {
         tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
     }
@@ -2204,5 +2239,47 @@ mod server_desc_res_tests {
         assert_eq!(PeerInfo::clean_text("\u{7}\u{7}"), None);
         let long = "x".repeat(1000);
         assert_eq!(PeerInfo::clean_text(&long).unwrap().chars().count(), PeerInfo::MAX_TEXT_CHARS);
+    }
+}
+
+#[cfg(test)]
+mod udp_ranking_tests {
+    use super::*;
+    use crate::filter::ContentFilter;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    /// 15 files matching one word; file i has i sources. The best-sourced
+    /// one carries a term added to the filter after it was indexed.
+    fn state() -> ServerState {
+        let filter = ContentFilter::new().with_extra_terms(["qxzmarker".to_string()]);
+        let st = ServerState::new(
+            Arc::new(filter),
+            Arc::new(crate::config::Config::minimal_test_config()),
+        );
+        for i in 1..=15u8 {
+            let name = if i == 15 {
+                format!("holiday clip qxzmarker {i}.avi")
+            } else {
+                format!("holiday clip {i}.avi")
+            };
+            for s in 0..i {
+                st.add_file_with_source(
+                    [i; 16],
+                    1000 + i as u64,
+                    name.clone(),
+                    ([s.wrapping_add(100); 16], IpAddr::V4(Ipv4Addr::new(10, 0, i, s)), 4662, true),
+                );
+            }
+        }
+        st
+    }
+
+    #[test]
+    fn best_sourced_first_and_withheld_never_served() {
+        let st = state();
+        let out = udp_search_ranked(&st, crate::proto::search::SearchNode::Term("holiday".into()));
+        let got: Vec<usize> = out.iter().map(|r| r.sources.len()).collect();
+        // 15 is withheld; the ten best of the rest, best first.
+        assert_eq!(got, (5..=14).rev().collect::<Vec<_>>());
     }
 }

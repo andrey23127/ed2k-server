@@ -339,10 +339,12 @@ struct StatsResp {
     /// Admission gauges and counters (issue #25), as /api/admission.
     admission: serde_json::Value,
     hard_limit_files: u32,
-    /// Most TCP connections one IP holds now, and `limits.max_clients_per_ip`.
+    /// The source with the most logged-in clients now (see
+    /// `ServerState::busiest_ip_by_clients`): its open TCP connections, and
+    /// `limits.max_clients_per_ip` below.
     busiest_ip_connections: u32,
     /// That source: "1.2.3.4" or "2001:db8::/64", with its country and how
-    /// many of its connections are logged in. Admin page is localhost-only.
+    /// many clients from it are logged in. Admin page is localhost-only.
     busiest_ip: Option<String>,
     busiest_ip_country: Option<String>,
     busiest_ip_logged_in: u32,
@@ -396,7 +398,7 @@ struct StatsResp {
 
 async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
     let proc = read_proc_stats();
-    let busiest = s.server.busiest_ip();
+    let busiest = s.server.busiest_ip_by_clients();
     let m = &s.metrics;
     // GETSOURCES cache hit rate comes from the SmartSources cache's own
     // hit/miss counters. (The Metrics::get_sources_* atomics were never wired
@@ -435,31 +437,24 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
             .load(std::sync::atomic::Ordering::Relaxed),
         admission: s.server.admission.metrics(),
         hard_limit_files: s.server.live_cfg.load().limits.hard_limit_files,
-        busiest_ip_connections: busiest.map_or(0, |(_, n)| n),
-        busiest_ip: busiest.map(|(ip, _)| match ip {
+        busiest_ip_connections: busiest.map_or(0, |(_, _, conns)| conns),
+        busiest_ip: busiest.map(|(ip, _, _)| match ip {
             std::net::IpAddr::V6(_) => {
                 format!("{ip}/{}", s.server.admission.cfg.ipv6_source_prefix_bits)
             }
             v4 => v4.to_string(),
         }),
-        busiest_ip_country: busiest.and_then(|(ip, _)| {
+        busiest_ip_country: busiest.and_then(|(ip, _, _)| {
             s.server
                 .country_db
                 .try_read()
                 .ok()
                 .and_then(|db| db.lookup(ip).map(|(c, _)| c))
         }),
-        busiest_ip_provider: busiest.and_then(|(ip, _)| {
+        busiest_ip_provider: busiest.and_then(|(ip, _, _)| {
             s.server.country_db.try_read().ok().and_then(|db| db.provider(ip))
         }),
-        busiest_ip_logged_in: busiest.map_or(0, |(ip, _)| {
-            let bits = s.server.admission.cfg.ipv6_source_prefix_bits;
-            s.server
-                .clients
-                .iter()
-                .filter(|c| crate::admission::SourceKey::of(c.ip, bits).as_ip() == ip)
-                .count() as u32
-        }),
+        busiest_ip_logged_in: busiest.map_or(0, |(_, n, _)| n),
         max_clients_per_ip: s.server.live_cfg.load().limits.max_clients_per_ip,
         highid_observe_enabled: {
             let n = &s.server.live_cfg.load().network;
@@ -769,26 +764,49 @@ async fn api_clients_search(
     let q = ClientQuery::parse(qs.as_deref().unwrap_or(""));
     let now = Instant::now();
     let total = s.server.clients.len();
-    let mut rows: Vec<ClientRow> = s
+    // Sort and page on a light key per client, and build full rows only for
+    // the page. Building a ClientRow for every match first meant five string
+    // allocations and a reverse-index lookup per client — 50k of each for a
+    // page of 100, on every refresh of the Clients tab.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        N(u64),
+        Ip(std::net::IpAddr),
+        S(String),
+    }
+    let mut keys: Vec<(Key, crate::state::UserHash)> = s
         .server
         .clients
         .iter()
         .filter(|e| q.matches(e.value()))
-        .map(|e| client_row(&s, e.value(), now))
+        .map(|e| {
+            let c = e.value();
+            let k = match q.sort {
+                ClientSort::Connected => {
+                    Key::N(now.saturating_duration_since(c.connected_at).as_secs())
+                }
+                ClientSort::Files => Key::N(u64::from(shared_files_of(&s, c))),
+                ClientSort::Ip => Key::Ip(c.ip),
+                ClientSort::Nick => Key::S(c.nick.to_lowercase()),
+                ClientSort::Country => Key::S(c.country.clone()),
+                ClientSort::Software => Key::S(c.software.clone()),
+            };
+            (k, *e.key())
+        })
         .collect();
-    let matched = rows.len();
-    match q.sort {
-        ClientSort::Connected => rows.sort_by_key(|r| r.connected_seconds),
-        ClientSort::Files => rows.sort_by_key(|r| r.shared_files),
-        ClientSort::Ip => rows.sort_by_key(|r| r.ip.parse::<std::net::IpAddr>().ok()),
-        ClientSort::Nick => rows.sort_by_cached_key(|r| r.nick.to_lowercase()),
-        ClientSort::Country => rows.sort_by(|a, b| a.country.cmp(&b.country)),
-        ClientSort::Software => rows.sort_by(|a, b| a.software.cmp(&b.software)),
-    }
+    let matched = keys.len();
+    // Stable, then reversed — the order the full-row version produced.
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
     if q.descending {
-        rows.reverse();
+        keys.reverse();
     }
-    let mut page: Vec<ClientRow> = rows.into_iter().skip(q.offset).take(q.limit).collect();
+    // A client that left since the scan is simply not on the page.
+    let mut page: Vec<ClientRow> = keys
+        .iter()
+        .skip(q.offset)
+        .take(q.limit)
+        .filter_map(|(_, uh)| s.server.clients.get(uh).map(|c| client_row(&s, c.value(), now)))
+        .collect();
     {
         let geo = s.server.country_db.read().await;
         for r in &mut page {
@@ -2068,7 +2086,7 @@ async fn api_publishers(
                     if let Some(rec) = s.server.file_slab.get(*fid) {
                         published.push(serde_json::json!({
                             "hash": hex::encode(rec.hash),
-                            "name": &*rec.name,
+                            "name": rec.name(),
                             "size": rec.size,
                             "sources": rec.sources.len(),
                             // true = this exact file already tripped the filter
@@ -2293,7 +2311,12 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
     // sums the subtotals. `unaccounted_bytes` is what jemalloc holds beyond that:
     // size-class rounding, DashMap per-shard control state, Arc/Box control blocks,
     // tokio socket buffers and per-thread allocator caches.
-    let report = s.server.memsize_report();
+    // Walks every file record: on the blocking pool, not a runtime worker —
+    // with the default single worker thread it would stall all networking.
+    let srv = Arc::clone(&s.server);
+    let report = tokio::task::spawn_blocking(move || srv.memsize_report())
+        .await
+        .unwrap_or_default();
     let tracked: u64 = report
         .iter()
         .find(|(k, _)| k == "GRAND_TOTAL_tracked")
@@ -2338,7 +2361,11 @@ async fn api_memsize(State(s): State<WebState>) -> Json<serde_json::Value> {
 
 async fn api_memdebug(State(s): State<WebState>) -> Json<serde_json::Value> {
     // Structure element counts (what logically holds memory).
-    let report = s.server.memory_report();
+    // Off the runtime, for the same reason as /api/memsize.
+    let srv = Arc::clone(&s.server);
+    let report = tokio::task::spawn_blocking(move || srv.memory_report())
+        .await
+        .unwrap_or_default();
     // Raw /proc/self/status memory lines (what the OS actually accounts).
     let mut proc_mem: Vec<(String, String)> = Vec::new();
     if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
@@ -2690,7 +2717,11 @@ tr:hover td{background:#1e2035}
 <div style="padding:0 20px 14px;font-size:.68rem;color:#374151;text-align:right">Flag images: <a href="https://github.com/twitter/twemoji" style="color:#4b5563">Twemoji</a>, CC-BY 4.0</div>
 
 <script>
+let currentTab = 'status';
 function showTab(name, btn) {
+  const changed = name !== currentTab;
+  currentTab = name;
+  if (changed) refreshTab(name);
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
@@ -2734,7 +2765,7 @@ async function refreshStatus() {
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
-     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_connections)} connections${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_logged_in)} logged in` : ''} <span style="color:#6b7280;font-size:.75rem">most TCP connections one IP holds right now; limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'}, loopback exempt</span></td></tr>
+     <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_logged_in)} logged in${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_connections)} connections` : ''} <span style="color:#6b7280;font-size:.75rem">most logged-in clients behind one address right now (a NAT or CGNAT); connections = its open TCP sockets, which limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'} caps; loopback exempt</span></td></tr>
      <tr><td>Replaced sessions closed</td><td>${fmt(sys.replaced_sessions_closed)} <span style="color:#6b7280;font-size:.75rem">sockets a newer login of the same user took over, closed after 10 min without traffic of their own; a copy that still talks keeps its socket</span></td></tr>
      <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
      <tr><td>Admission</td><td>${(()=>{const a=sys.admission||{};const p=x=>x?`${fmt(x.in_use)}/${fmt(x.cap)}${x.rejected?` · ${fmt(x.rejected)} refused`:''}`:'–';const u=a.udp||{};return `<b style="color:${a.ready?'#16a34a':'#dc2626'}">${a.ready?'ready':'NOT READY: '+(a.saturated||[]).join(', ')}</b> · sockets ${p(a.open_tcp)} · pending logins ${p(a.pending_login)} · probes ${p(a.probes)} (${fmt(a.probe_shed_lowid||0)} → LowID) · search jobs ${p(a.search_jobs)}, queue ${p(a.search_queue)} · UDP ${u.enforce?'enforced':'observe'}: refused ${fmt((u.refused_global||0)+(u.refused_source||0)+(u.refused_table_full||0))} (global ${fmt(u.refused_global||0)}, source ${fmt(u.refused_source||0)}, table ${fmt(u.refused_table_full||0)}), sources ${fmt(u.source_entries||0)}/${fmt(u.source_entries_cap||0)}`})()} <span style="color:#6b7280;font-size:.75rem">[admission] — details at /api/admission</span></td></tr>
@@ -3141,9 +3172,21 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 
+// Only the tab on screen is polled. Every tab every 5 s meant the server
+// rebuilt the client list, the peer list, the bot and block tables and the
+// health log for each open admin page whether anyone looked at them or not.
+// A tab is refreshed at once when it is opened, so nothing shows stale data.
+const tabRefresh = {
+  clients: refreshClients, peers: refreshPeers, filter: refreshFilter,
+  bots: refreshBots, blocks: refreshBlocks, health: refreshHealth,
+};
+function refreshTab(name) {
+  const f = tabRefresh[name];
+  return f ? f().catch(() => {}) : Promise.resolve();
+}
 async function refresh() {
-  await Promise.all([refreshStatus(), refreshClients(), refreshPeers(), refreshFilter(),
-                      refreshBots(), refreshBlocks(), refreshHealth()]);
+  // Status also fills the page header, so it is always kept current.
+  await Promise.all([refreshStatus(), refreshTab(currentTab)]);
   document.getElementById('refreshed').textContent = 'last updated: ' + new Date().toLocaleTimeString();
 }
 refresh();
