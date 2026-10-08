@@ -144,6 +144,18 @@ index_subtokens = true
 # returns nothing.
 search_drop_unknown_words = true
 
+# ── Fast publishing: OFFERFILES v1 (README, "OFFERFILES v1") ────────────────
+# Tell clients that can read it (aMule with the experimental option) how many
+# files per OFFERFILES and how often, instead of the legacy 200 files a minute;
+# connections are then held to exactly that. Other clients see no change.
+# Needs soft_limit_files > 0 and hard_limit_files > offerfiles_batch_max,
+# otherwise nothing is advertised and an error is logged. Off by default.
+offerfiles_v1 = false
+offerfiles_batch_max = 200
+offerfiles_min_interval_ms = 500
+# All v1 connections together, records per second; 0 = no ceiling.
+offerfiles_global_records_per_sec = 5000
+
 [content_filter]
 # BAN LIST: blocked AND counted against the publisher. Material whose publisher
 # should answer for it — CSAM and bestiality alike, which is why the file is no

@@ -1930,6 +1930,8 @@ fn udp_search_ranked(
         let mut examined = 0usize;
         // Terms folded once for the whole search, not once per candidate.
         let prepared = prepare(&tree);
+        // Same tie-break seed as the TCP path for the same query.
+        let seed = crate::server::search::query_seed(&groups);
         for fid in candidate_ids {
             if examined >= rank_scan {
                 state.note_search_rank_capped();
@@ -1955,8 +1957,11 @@ fn udp_search_ranked(
                 // Cheap rejection before the filter and the clone, as on TCP.
                 if heap.len() >= UDP_MAX_SEARCH_RESULTS {
                     if let Some(worst) = heap.peek() {
-                        if (sources, std::cmp::Reverse(fid))
-                            <= (worst.sources, std::cmp::Reverse(worst.id))
+                        if crate::server::search::rank_key(
+                            sources,
+                            crate::server::search::tie_key(seed, &entry.hash),
+                            fid,
+                        ) <= crate::server::search::rank_key(worst.sources, worst.tie, worst.id)
                         {
                             return None;
                         }
@@ -1971,6 +1976,7 @@ fn udp_search_ranked(
                 }
                 Some(crate::server::search::UdpRanked {
                     sources,
+                    tie: crate::server::search::tie_key(seed, &entry.hash),
                     id: fid,
                     rec: entry.clone(),
                 })

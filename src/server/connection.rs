@@ -64,6 +64,9 @@ pub(crate) fn reserve_client_slot(
 pub(crate) struct SessionAdmission {
     /// Callback / hole-punch allowance.
     pub relay: crate::admission::RelayBudget,
+    /// OFFERFILES v1 bucket of this connection (issue #19); `Some` exactly
+    /// when the client was sent the v1 advertisement.
+    pub offer_bucket: Option<crate::server::offer_pacing::Gcra>,
 }
 
 pub async fn handle_connection(
@@ -138,6 +141,7 @@ pub async fn handle_admitted_connection(
     let mut pending_search: Vec<crate::state::file_id::FileRecord> = Vec::new();
     let mut sess = SessionAdmission {
         relay: crate::admission::RelayBudget::new(&state.admission.cfg),
+        offer_bucket: None,
     };
 
     if live.log.connection_trace {
@@ -483,6 +487,27 @@ fn account_framed_buffers(
     }
 }
 
+/// Await `fut` while still delivering frames other tasks push at this client
+/// (OFFERFILES v1 waits, issue #19). A closed channel is simply no longer
+/// polled; a failed send ends the session as it would anywhere else.
+async fn serve_pushes_while<F: std::future::Future>(
+    fut: F,
+    rx: &mut mpsc::Receiver<Frame>,
+    framed: &mut Framed<CryptStream, Ed2kCodec>,
+) -> Result<F::Output> {
+    tokio::pin!(fut);
+    let mut open = true;
+    loop {
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            pushed = rx.recv(), if open => match pushed {
+                Some(f) => framed.send(f).await?,
+                None => open = false,
+            },
+        }
+    }
+}
+
 async fn dispatch(
     cfg: &Config,
     state: &ServerState,
@@ -571,6 +596,17 @@ async fn dispatch(
                 return Err(SessionRefused("server full").into());
             };
             let mut new_client = handle_login(cfg, state, peer.ip(), req).await;
+            // OFFERFILES v1 snapshot (issue #19): taken once, here, and both
+            // advertised from and enforced from for the life of the connection.
+            new_client.offer_policy =
+                crate::server::offer_pacing::policy_for_login(&state.live_cfg.load().limits);
+            sess.offer_bucket = new_client.offer_policy.map(|p| p.bucket());
+            if new_client.offer_policy.is_some() {
+                state
+                    .offer_v1
+                    .sessions
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             *new_client.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(slot);
             *rx = ServerState::create_client_channel(&mut new_client);
             // Detect duplicate user_hash login — happens when a NAT-dropped
@@ -642,10 +678,18 @@ async fn dispatch(
             let Some(c) = client else {
                 return Err(anyhow::anyhow!("OFFERFILES before login"));
             };
+            // OFFERFILES v1 snapshot (issue #19), or None for a legacy session.
+            let policy = c.offer_policy;
             // limits.hard_limit_files: a per-packet bound, checked on the
             // declared count before any record is read (Lugdunum semantics).
-            let hard = state.live_cfg.load().limits.hard_limit_files;
-            if let Some(declared) = declared_count(&frame.payload) {
+            // A v1 session is held to the value it was told at login; a legacy
+            // one reads it live, as before.
+            let hard = match policy {
+                Some(p) => p.hard,
+                None => state.live_cfg.load().limits.hard_limit_files,
+            };
+            let declared = declared_count(&frame.payload);
+            if let Some(declared) = declared {
                 if over_hard_limit(declared, hard) {
                     state.note_offer_over_hard_limit();
                     if let Some(sup) = crate::health::throttle().allow(
@@ -658,6 +702,68 @@ async fn dispatch(
                               "OFFERFILES over the hard limit — packet rejected, connection closed");
                     }
                     return Err(SessionRefused("OFFERFILES over hard limit").into());
+                }
+            }
+            if let (Some(p), Some(bucket)) = (policy, sess.offer_bucket.as_mut()) {
+                use std::sync::atomic::Ordering::Relaxed;
+                let n = declared.unwrap_or(0);
+                // Above the negotiated batch size but below the hard boundary:
+                // not indexed, counted, and the session stays up — a client
+                // with a wrong idea of the contract should notice "no effect",
+                // not be pushed into a reconnect loop. Not charged to the
+                // bucket either, since nothing was processed.
+                if n > p.batch_max {
+                    state.offer_v1.oversized.fetch_add(1, Relaxed);
+                    if let Some(sup) = crate::health::throttle().allow(
+                        peer.ip(),
+                        "offer_v1_oversized",
+                        crate::health::SUPPRESS_WINDOW,
+                    ) {
+                        info!(ip = %peer.ip(), nick = %c.nick, declared = n,
+                              batch_max = p.batch_max, suppressed = sup,
+                              "OFFERFILES above offerfiles_batch_max — batch not indexed, session kept");
+                    }
+                    return Ok(());
+                }
+                if n > 0 {
+                    // Early batches wait; nothing compliant is dropped. While
+                    // this connection waits it reads nothing more, so the
+                    // client is held back by TCP, not by a queue here.
+                    //
+                    // Frames other tasks push at this client (callbacks,
+                    // hole-punch, keepalive) keep flowing while it waits: the
+                    // push channel is small and try_send drops on full, so a
+                    // long wait without draining it would lose them.
+                    let wait = bucket.reserve(n, tokio::time::Instant::now());
+                    if !wait.is_zero() {
+                        serve_pushes_while(tokio::time::sleep(wait), rx, framed).await?;
+                    }
+                    state.offer_v1.note_conn_wait(wait);
+                    let ceiling = state
+                        .live_cfg
+                        .load()
+                        .limits
+                        .offerfiles_global_records_per_sec;
+                    let waited = serve_pushes_while(
+                        state.offer_v1_pacer.acquire(n, ceiling),
+                        rx,
+                        framed,
+                    )
+                    .await?;
+                    state.offer_v1.note_global_wait(waited);
+                    // A newer login of the same user may have replaced this
+                    // session while it waited. Its batch must not be indexed
+                    // under this session's id: the replaced session's cleanup
+                    // does not remove sources, so they would outlive it.
+                    let current = state
+                        .clients
+                        .get(&c.user_hash)
+                        .is_some_and(|e| e.same_session(c));
+                    if !current {
+                        return Ok(());
+                    }
+                    state.offer_v1.batches.fetch_add(1, Relaxed);
+                    state.offer_v1.records.fetch_add(n as u64, Relaxed);
                 }
             }
             let files = parse_offerfiles(&frame.payload)?;
@@ -699,7 +805,10 @@ async fn dispatch(
                 handle_offerfiles(state, c, files);
             }
             if c.soft_limit_warned && !warned_before {
-                let soft = state.live_cfg.load().limits.soft_limit_files;
+                let soft = match policy {
+                    Some(p) => p.soft,
+                    None => state.live_cfg.load().limits.soft_limit_files,
+                };
                 let text = soft_limit_message(soft);
                 let mut payload = Vec::with_capacity(2 + text.len());
                 payload.extend_from_slice(&(text.len() as u16).to_le_bytes());
@@ -969,6 +1078,7 @@ mod session_end_tests {
             software: "test".into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),

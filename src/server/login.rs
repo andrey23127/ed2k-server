@@ -321,6 +321,10 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
         payload.put_u32_le(server_ip);
         payload.put_u16_le(cfg.network.tcp_port);
 
+        let (soft_files, hard_files) = match &client.offer_policy {
+            Some(p) => (p.soft, p.hard),
+            None => (live.limits.soft_limit_files, live.limits.hard_limit_files),
+        };
         let mut tags = vec![
             Tag::byte(ST_SERVERNAME, TagValue::String(live.server.name.clone())),
             Tag::byte(ST_DESCRIPTION, TagValue::String(live.server.desc.clone())),
@@ -335,8 +339,10 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
                 )),
             ),
             Tag::byte(ST_MAXUSERS, TagValue::U32(live.limits.max_clients)),
-            Tag::byte(ST_SOFTFILES, TagValue::U32(live.limits.soft_limit_files)),
-            Tag::byte(ST_HARDFILES, TagValue::U32(live.limits.hard_limit_files)),
+            // From the connection's OFFERFILES v1 snapshot when it has one, so
+            // the two numbers it is told are the two it is held to (#19).
+            Tag::byte(ST_SOFTFILES, TagValue::U32(soft_files)),
+            Tag::byte(ST_HARDFILES, TagValue::U32(hard_files)),
             // ST_UDPFLAGS — eMule's SupportsObfuscationTCP() requires either this OR
             // ST_TCPFLAGS to have bit 0x400 (SRV_UDPFLG_TCPOBFUSCATION) set.
             // From eMule's server.h: SupportsObfuscationTCP() =
@@ -394,6 +400,13 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
             if status != 0 {
                 tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
             }
+        }
+        // OFFERFILES v1 (issue #19): all three or none, string-named so a
+        // client that does not know them skips them. A legacy session (v1 off,
+        // or a configuration that cannot be advertised) gets a SERVERIDENT
+        // byte-identical to the one before this capability existed.
+        if let Some(p) = &client.offer_policy {
+            tags.extend(p.tags());
         }
         write_tag_list(&mut payload, &tags);
 
@@ -1173,6 +1186,7 @@ pub async fn handle_login(
         software: software.clone(),
         csam_attempts: 0,
         soft_limit_warned: false,
+        offer_policy: None,
         slot: Default::default(),
         tx: None,
         last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1248,6 +1262,7 @@ mod tests {
             software: "test".into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1357,6 +1372,7 @@ mod tests {
             software: "test".into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),

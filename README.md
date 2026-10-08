@@ -25,6 +25,9 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
 - **IPv6** (opt-in): clients can connect over IPv6, and a client that is LowID on
   IPv4 but has a public IPv6 is published as an IPv6 source to peers that can
   parse it — see *IPv6* below.
+- **OFFERFILES v1** (opt-in): tells capable clients how many files per batch
+  and how often they may publish, and holds them to it, so a large library is
+  published in minutes instead of hours — see *OFFERFILES v1* below.
 - HighID verified by a client-to-client hello, not only a TCP connect: a port
   forwarded to a *different* client behind the same NAT no longer earns HighID.
 - IP filtering in eMule **guarding.p2p** format, with per-range hit statistics.
@@ -407,6 +410,9 @@ a watched file) or needs a **restart**.
 | `search_rank_scan` | Candidates examined when ranking one search. Past it, ranking covers only what was seen; the share of searches that hit it is shown on the Status tab. Default 20000, must be ≥ `max_search_results` | live |
 | `index_subtokens` | Also index letter/digit pieces of each word, so `S01E08` is found by `s01` and `e08`, `1080p` by `1080`. Changes what searches return, so off by default. Read once at startup: the index must split names the same way for its whole life. **Not a superset of Lugdunum**: a query that starts mid-run (`1x05` against `01x05`) is still not found | restart |
 | `search_drop_unknown_words` | Ignore query words that no indexed file contains instead of returning nothing because of them (a typo no longer empties the search). A query of only unknown words still returns nothing; OR branches and negated words are never rewritten. Default on | live |
+| `offerfiles_v1` | Advertise batch size and pace for `OFFERFILES` in `OP_SERVERIDENT` (see [OFFERFILES v1](#offerfiles-v1-fast-publishing)) and hold each connection that was told them to them. Off by default; off or invalid = no tag sent, publishing unchanged | live, new logins |
+| `offerfiles_batch_max`, `offerfiles_min_interval_ms` | The advertised batch size (default 200) and least time between batches (default 500 ms). A v1 batch above the size (and below the hard limit) is not indexed, the session stays up; an early batch waits, it is never dropped | live, new logins |
+| `offerfiles_global_records_per_sec` | Ceiling on records per second from all v1 connections together, served in arrival order, so a reconnect wave of fast publishers slows down instead of saturating the content filter. Default 5000 (about a quarter of a core); `0` = none. Legacy publishers are not counted | live |
 
 ### `[content_filter]`
 | Key | Meaning | Apply |
@@ -803,6 +809,69 @@ What else covers IPv6:
 - **Not covered: the IP filter.** `guarding.p2p` carries IPv4 ranges only.
 
 ---
+
+## OFFERFILES v1 (fast publishing)
+
+Legacy eMule and aMule publish at most 200 files per `OP_OFFERFILES` and wait
+about a minute between batches, because a Lugdunum server may black out an IP
+that publishes faster. A client sharing 55,000 files then needs four and a half
+hours to be fully published. With `limits.offerfiles_v1 = true` the server
+tells a client how fast it may go and holds it to that; at the defaults (200
+files every 500 ms) the same library takes under three minutes. Agreed in
+[issue #19](https://github.com/andrey23127/ed2k-server/issues/19); the client
+side is aMule PR #1715 (experimental, opt-in). A client that does not read the
+advertisement is unaffected.
+
+### Wire contract (v1)
+
+In the post-login `OP_SERVERIDENT`, which this server always sends right after
+login (no `OP_GETSERVERLIST` needed) and only there, each exactly once, all
+`uint32`:
+
+| Tag | Name kind | Meaning |
+|---|---|---|
+| `ST_SOFTFILES` (0x88) | numeric | the connection's indexing budget, in distinct files indexed for it |
+| `ST_HARDFILES` (0x89) | numeric | per-packet boundary: every batch must declare **fewer** records |
+| `offerfiles_v` | string | capability version, `1` |
+| `offerfiles_batch_max` | string | most records in one `OP_OFFERFILES` |
+| `offerfiles_min_interval_ms` | string | least time between two batches |
+
+The string-named tags are old-format (type `0x03`, `u16` name length, name,
+`u32` value), which every client skips when it does not know them. All or
+nothing: soft > 0, batch_max > 0, interval > 0 and hard > batch_max, or no
+`offerfiles_*` tag is sent and the server behaves as a legacy one. There is no
+burst tag. A client must treat a missing, partial, duplicated or wrongly typed
+advertisement as absent (legacy 200 files / 60 s), and must never use these
+values against a server that did not send them.
+
+The five values are a snapshot taken at login and hold for the connection's
+whole life: a configuration change reaches new connections only, and a
+reconnect starts afresh (new snapshot, full bucket, budget counted from what
+the client sources then).
+
+### What the server does on a v1 connection
+
+| The batch… | Result |
+|---|---|
+| declares `>= ST_HARDFILES` records | rejected, connection closed (as for every client) |
+| declares more than `offerfiles_batch_max` | not indexed, counted, logged; the session stays up |
+| arrives before it is due | waits until it is due, then is processed; nothing is dropped |
+| would push all v1 connections over `offerfiles_global_records_per_sec` | waits its turn (arrival order), then is processed |
+| otherwise | content filter, soft budget and indexing exactly as for a legacy client |
+
+"Due" is a token bucket in file records per connection: it holds one batch,
+starts full (the first batch goes at once) and refills at `batch_max` per
+`min_interval_ms`. Smaller batches cost proportionally less. Frames that TCP
+delivers together are therefore not an offence, just processed on schedule.
+While a connection waits it reads nothing more, so the client is held back by
+TCP rather than by a queue in the server.
+
+There is no acknowledgement packet in v1: a client cannot tell which records
+were indexed (filtered, over budget) and should not try to infer it.
+
+The Status tab shows the active policy and its counters: sessions advertised,
+batches and records, how often and how long batches waited for their own pace
+and for the server-wide ceiling, and batches above the size.
 
 ## Server lists & IP filter
 

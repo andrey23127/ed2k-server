@@ -790,6 +790,52 @@ pub struct LimitsConfig {
     /// A query where EVERY word is unknown still returns nothing. Applied live.
     #[serde(default = "default_true")]
     pub search_drop_unknown_words: bool,
+
+    /// OFFERFILES v1 (issue #19): advertise the three values below, with
+    /// `soft_limit_files` and `hard_limit_files`, in OP_SERVERIDENT, and hold
+    /// each connection that was told them to them. A client that reads the
+    /// advertisement (aMule PR #1715, opt-in) may then publish faster than the
+    /// legacy 200 files a minute; a client that does not is unaffected.
+    ///
+    /// Valid only with soft_limit_files > 0, hard_limit_files above
+    /// offerfiles_batch_max, and batch and interval above 0. Otherwise nothing
+    /// is advertised, an error is logged and publishing works as before.
+    ///
+    /// Off: no tag is sent and nothing about publishing changes. Live: applies
+    /// to connections that log in after the change; a connection keeps the
+    /// values it was told for its whole life.
+    #[serde(default)]
+    pub offerfiles_v1: bool,
+    /// Most records one OP_OFFERFILES may carry on a v1 connection. A larger
+    /// batch (below the hard limit) is not indexed; the session stays up.
+    #[serde(default = "default_offerfiles_batch_max")]
+    pub offerfiles_batch_max: u32,
+    /// Least time between two batches on a v1 connection. A batch that arrives
+    /// early is held until it is due, never dropped: the connection's bucket
+    /// holds one batch and refills at batch_max per interval.
+    #[serde(default = "default_offerfiles_min_interval_ms")]
+    pub offerfiles_min_interval_ms: u32,
+    /// Ceiling on records per second from ALL v1 connections together, served
+    /// in arrival order; `0` = none. It keeps a reconnect wave of fast
+    /// publishers from saturating the content filter: each one slows down
+    /// instead. Legacy connections are not counted. Live. Default 5000: about
+    /// a quarter of one core at the measured ~54 us per published record.
+    #[serde(default = "default_offerfiles_global_records_per_sec")]
+    pub offerfiles_global_records_per_sec: u32,
+}
+
+fn default_offerfiles_batch_max() -> u32 {
+    200
+}
+fn default_offerfiles_min_interval_ms() -> u32 {
+    500
+}
+fn default_offerfiles_global_records_per_sec() -> u32 {
+    // The publish path (content filter + slab + keyword index) measured at
+    // ~54 us a record on one core (examples/loadgen, 3M files: 18.6k files/s).
+    // 5000/s is about a quarter of a core: 25 v1 clients at the full default
+    // pace of 400/s, or one 55,000-file library in ~11 s.
+    5_000
 }
 
 #[derive(Debug, Deserialize, Clone)]

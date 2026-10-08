@@ -88,6 +88,10 @@ pub struct ClientHandle {
     /// The soft-limit server message has been sent on this connection.
     /// Lugdunum sends it once per connection, however many batches go over.
     pub soft_limit_warned: bool,
+    /// OFFERFILES v1 policy this connection was told at login (issue #19);
+    /// `None` = legacy. Every OFFERFILES limit for the connection comes from
+    /// here when set, so what was advertised is what is enforced.
+    pub offer_policy: Option<crate::server::offer_pacing::OfferPolicy>,
     /// This session's `limits.max_clients` slot (issue #25). Shared by every
     /// copy of the handle, so a same-hash re-login that replaces this session
     /// releases it at once.
@@ -789,6 +793,10 @@ pub struct ServerState {
     /// OFFERFILES packets rejected (and their connections closed) because the
     /// declared record count reached `limits.hard_limit_files`.
     pub offer_over_hard_packets: std::sync::atomic::AtomicU64,
+    /// OFFERFILES v1 counters (issue #19) and the server-wide record ceiling
+    /// its connections share.
+    pub offer_v1: crate::server::offer_pacing::OfferV1Stats,
+    pub offer_v1_pacer: crate::server::offer_pacing::GlobalOfferPacer,
     /// Sockets of replaced sessions (a newer login of the same user took
     /// over) closed after replaced-session silence. See handle_connection.
     pub replaced_sessions_closed: std::sync::atomic::AtomicU64,
@@ -992,6 +1000,7 @@ impl ServerState {
             software: "test".into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: Some(tx),
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -1233,6 +1242,8 @@ impl ServerState {
             offer_over_soft_batches: std::sync::atomic::AtomicU64::new(0),
             offer_over_soft_records: std::sync::atomic::AtomicU64::new(0),
             offer_over_hard_packets: std::sync::atomic::AtomicU64::new(0),
+            offer_v1: Default::default(),
+            offer_v1_pacer: Default::default(),
             replaced_sessions_closed: std::sync::atomic::AtomicU64::new(0),
             highid_observe: std::sync::Arc::new(HighIdObserve::new()),
             admission,
@@ -1619,6 +1630,7 @@ impl ServerState {
             software,
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: Some(tx),
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1989,6 +2001,7 @@ mod callback_tests {
             software: "test".to_string(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(

@@ -9,6 +9,7 @@ pub mod keepalive;
 pub mod login;
 pub mod obf_ping;
 pub mod obfuscated_conn;
+pub mod offer_pacing;
 pub mod offerfiles;
 pub mod search;
 pub mod udp;

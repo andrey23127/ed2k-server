@@ -298,6 +298,13 @@ fn run_class(c: char) -> RunClass {
 ///   client population, not a guarantee. If a client stops sending both, this
 ///   gap becomes visible immediately.
 ///
+/// ⚠ A CONDENSED MULTI-EPISODE TAG IS LEFT WHOLE. `S01E01E02E03` has eight
+///   runs, over `SUBTOKEN_MAX_RUNS`, so it yields no `s01` and a season search
+///   for `S01` (which aMuTorrent sends) does not reach it; Lugdunum's substring
+///   filter does. Deliberate: the run cap is what keeps hashes and CRC tags
+///   from being split. The common spelling `S01E01-E03` is two words and
+///   splits normally. Pointed out in issue #14.
+///
 /// Whole words are NOT emitted here; the caller already has them. A pair equal
 /// to the whole word is skipped for the same reason.
 fn visit_subtokens<F: FnMut(&str)>(word: &str, visit: &mut F) {
@@ -1827,6 +1834,14 @@ mod tests {
         let got = subs("01x05");
         assert!(!got.contains(&"1x05".to_string()));
         assert_eq!(got, vec!["01x", "x05"]);
+    }
+
+    #[test]
+    fn a_condensed_multi_episode_tag_is_left_whole() {
+        // Eight runs, over SUBTOKEN_MAX_RUNS: no s01 (issue #14). Pinned with
+        // the comment on visit_subtokens; the dashed spelling still splits.
+        assert!(subs("s01e01e02e03").is_empty());
+        assert!(subs("s01e01").contains(&"s01".to_string()));
     }
 
     #[test]

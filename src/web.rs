@@ -335,6 +335,12 @@ struct StatsResp {
     soft_limit_files: u32,
     /// OFFERFILES packets rejected at `limits.hard_limit_files` (connection closed).
     offer_over_hard_packets: u64,
+    /// OFFERFILES v1 (issue #19): whether new logins get the advertisement,
+    /// why not if it is on but invalid, and its counters.
+    offerfiles_v1: bool,
+    offerfiles_v1_error: Option<String>,
+    offerfiles_v1_policy: Option<String>,
+    offer_v1: serde_json::Value,
     replaced_sessions_closed: u64,
     /// Admission gauges and counters (issue #25), as /api/admission.
     admission: serde_json::Value,
@@ -431,6 +437,33 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         offer_over_soft_records: s.server.offer_over_soft_stats().1,
         soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
         offer_over_hard_packets: s.server.offer_over_hard_count(),
+        offerfiles_v1: s.server.live_cfg.load().limits.offerfiles_v1,
+        offerfiles_v1_error: crate::server::offer_pacing::OfferPolicy::from_limits(
+            &s.server.live_cfg.load().limits,
+        )
+        .err(),
+        offerfiles_v1_policy: {
+            let live = s.server.live_cfg.load();
+            crate::server::offer_pacing::OfferPolicy::from_limits(&live.limits)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    let ceiling = live.limits.offerfiles_global_records_per_sec;
+                    format!(
+                        "{} files per batch, one batch per {} ms; soft {}, hard {}; server-wide {}",
+                        p.batch_max,
+                        p.min_interval_ms,
+                        p.soft,
+                        p.hard,
+                        if ceiling == 0 {
+                            "no ceiling".to_string()
+                        } else {
+                            format!("{ceiling} records/s")
+                        }
+                    )
+                })
+        },
+        offer_v1: s.server.offer_v1.to_json(&s.server.offer_v1_pacer),
         replaced_sessions_closed: s
             .server
             .replaced_sessions_closed
@@ -2770,6 +2803,7 @@ async function refreshStatus() {
      <tr><td>Soft file limit reached</td><td>${fmt(sys.offer_over_soft_batches)} batches · ${fmt(sys.offer_over_soft_records)} files not indexed <span style="color:#6b7280;font-size:.75rem">limits.soft_limit_files = ${sys.soft_limit_files ? fmt(sys.soft_limit_files) : 'off'}; new files beyond it are not indexed, the client is told once, the session stays up</span></td></tr>
      <tr><td>Admission</td><td>${(()=>{const a=sys.admission||{};const p=x=>x?`${fmt(x.in_use)}/${fmt(x.cap)}${x.rejected?` · ${fmt(x.rejected)} refused`:''}`:'–';const u=a.udp||{};return `<b style="color:${a.ready?'#16a34a':'#dc2626'}">${a.ready?'ready':'NOT READY: '+(a.saturated||[]).join(', ')}</b> · sockets ${p(a.open_tcp)} · pending logins ${p(a.pending_login)} · probes ${p(a.probes)} (${fmt(a.probe_shed_lowid||0)} → LowID) · search jobs ${p(a.search_jobs)}, queue ${p(a.search_queue)} · UDP ${u.enforce?'enforced':'observe'}: refused ${fmt((u.refused_global||0)+(u.refused_source||0)+(u.refused_table_full||0))} (global ${fmt(u.refused_global||0)}, source ${fmt(u.refused_source||0)}, table ${fmt(u.refused_table_full||0)}), sources ${fmt(u.source_entries||0)}/${fmt(u.source_entries_cap||0)}`})()} <span style="color:#6b7280;font-size:.75rem">[admission] — details at /api/admission</span></td></tr>
      <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
+     <tr><td>OFFERFILES v1</td><td>${(()=>{const o=sys.offer_v1||{};if(!sys.offerfiles_v1)return `off${o.sessions?` · ${fmt(o.sessions)} sessions advertised before it was turned off`:''}`;if(sys.offerfiles_v1_error)return `<b style="color:#dc2626">not advertised: ${escapeHtml(sys.offerfiles_v1_error)}</b>`;return `${escapeHtml(sys.offerfiles_v1_policy||'')}<br>${fmt(o.sessions)} sessions advertised · ${fmt(o.batches)} batches, ${fmt(o.records)} records · waited for own pace ${fmt(o.conn_waits)} (${fmt(o.conn_wait_ms)} ms) · for the server-wide ceiling ${fmt(o.global_waits)} (${fmt(o.global_wait_ms)} ms, longest ${fmt(o.global_wait_max_ms)} ms, ${fmt(o.global_waiting_now)} waiting now) · above batch size ${fmt(o.oversized)}`})()} <span style="color:#6b7280;font-size:.75rem">limits.offerfiles_v1 — batch size and pace advertised in SERVERIDENT to clients that can publish faster (issue #19); early batches wait, never dropped; legacy clients unaffected</span></td></tr>
      <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
@@ -3320,6 +3354,7 @@ mod client_search_tests {
             software: sw.into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(AtomicU64::new(0)),

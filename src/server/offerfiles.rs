@@ -116,7 +116,12 @@ pub fn handle_offerfiles(
     // and costs no budget). Records the content filter blocks are never indexed
     // and never counted. Each accepted record is added whole (slab, keyword
     // index, user_files), so a partly accepted batch leaves nothing half-done.
-    let soft_limit = state.live_cfg.load().limits.soft_limit_files as usize;
+    //
+    // A v1 session (issue #19) uses the soft limit it was told at login.
+    let soft_limit = match &client.offer_policy {
+        Some(p) => p.soft,
+        None => state.live_cfg.load().limits.soft_limit_files,
+    } as usize;
     let mut sourced = if soft_limit > 0 {
         layer_count(state, &client.user_hash).unwrap_or(0)
     } else {
@@ -514,6 +519,7 @@ mod soft_limit_tests {
             software: "test".into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -722,6 +728,7 @@ mod string_size_tests {
             software: "test".into(),
             csam_attempts: 0,
             soft_limit_warned: false,
+            offer_policy: None,
             slot: Default::default(),
             tx: None,
             last_activity_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),

@@ -404,6 +404,20 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    // OFFERFILES v1 (issue #19): say at startup what new logins will be told,
+    // or why nothing (the same check logs the error again only if the values
+    // change). An unusable configuration is not fatal: the server is a legacy
+    // one until it is fixed.
+    if let Some(p) = ed2k_server::server::offer_pacing::policy_for_login(&cfg.limits) {
+        info!(
+            batch_max = p.batch_max,
+            min_interval_ms = p.min_interval_ms,
+            soft = p.soft,
+            hard = p.hard,
+            global_records_per_sec = cfg.limits.offerfiles_global_records_per_sec,
+            "OFFERFILES v1 advertised to new logins"
+        );
+    }
     // Raise the descriptor limit to what the system allows before anything
     // checks it. See raise_fd_limit.
     raise_fd_limit();

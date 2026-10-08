@@ -24,13 +24,24 @@ use tracing::debug;
 ///   weakest entry kept and `pop` evicts it, which is what a bounded top-N
 ///   needs. `into_sorted_vec` then yields best-first with no reversal.
 ///
-/// Ties break on the file id, lower winning. That matters more than it looks:
-/// on a real index most files share a source count — very often exactly one —
-/// so the tie-break decides the bulk of the ordering. It has to be total and
-/// deterministic, or the same query against an unchanged index answers
-/// differently on each call.
+/// Ties break on a per-query hash of the file hash ([`tie_key`]), then on the
+/// file id. That matters more than it looks: on a real index most files share
+/// a source count — very often exactly one — so the tie-break decides the bulk
+/// of the ordering. It has to be total and deterministic, or the same query
+/// against an unchanged index answers differently on each call.
+///
+/// It used to be the file id, lower winning, described as "oldest first".
+/// That was not even true (issue #14): a FileId is `shard << 26 | slot`, the
+/// shard is chosen by the file's hash, and a slot is reused a minute after its
+/// file is evicted. So the old rule meant "files whose hash falls in shard 0,
+/// then shard 1, …" — the same hash range winning every query — with age
+/// mattering only inside a shard, and not reliably even there. A key mixed
+/// from the query and the file hash has no age bias and no hash-range bias:
+/// the same query still answers identically, and different queries break
+/// their ties over different files instead of hiding one set everywhere.
 struct Ranked {
     sources: u32,
+    tie: u64,
     id: crate::state::file_id::FileId,
     rec: crate::state::file_id::FileRecord,
 }
@@ -39,8 +50,47 @@ struct Ranked {
 /// identically. Kept as a separate type only because `Ranked` is private.
 pub struct UdpRanked {
     pub sources: u32,
+    pub tie: u64,
     pub id: crate::state::file_id::FileId,
     pub rec: crate::state::file_id::FileRecord,
+}
+
+/// The ranking key, greater = better: source count, then the tie key, then
+/// the lower id (only for totality: two files never share a hash, so the tie
+/// keys of two different files differ unless 64 bits collide).
+pub fn rank_key(
+    sources: u32,
+    tie: u64,
+    id: crate::state::file_id::FileId,
+) -> (u32, u64, std::cmp::Reverse<crate::state::file_id::FileId>) {
+    (sources, tie, std::cmp::Reverse(id))
+}
+
+/// Seed for [`tie_key`], from the query's keyword groups: the same query gets
+/// the same seed (TCP and UDP alike, since both build the groups with
+/// `candidate_groups`), a different one a different seed.
+pub fn query_seed(groups: &[Vec<String>]) -> u64 {
+    use std::hash::BuildHasher;
+    // Keys drawn once per process: stable for its whole life, which is all
+    // determinism needs (the index does not outlive it either), but not
+    // computable from the source. With fixed keys a publisher could grind the
+    // hashes it offers until its files win the ties for a chosen query —
+    // and at one source each, ties are most of the ranking.
+    static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    KEYS.get_or_init(Default::default).hash_one(groups)
+}
+
+/// Per-query tie key of one file (splitmix64 of the hash's first 8 bytes
+/// mixed with the query seed).
+pub fn tie_key(seed: u64, hash: &[u8; 16]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&hash[..8]);
+    let mut z = u64::from_le_bytes(b) ^ seed;
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 impl PartialEq for UdpRanked {
@@ -57,10 +107,7 @@ impl PartialOrd for UdpRanked {
 impl Ord for UdpRanked {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Inverted, for the reason spelled out at `Ranked`.
-        other
-            .sources
-            .cmp(&self.sources)
-            .then_with(|| self.id.cmp(&other.id))
+        rank_key(other.sources, other.tie, other.id).cmp(&rank_key(self.sources, self.tie, self.id))
     }
 }
 
@@ -77,12 +124,9 @@ impl PartialOrd for Ranked {
 }
 impl Ord for Ranked {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Inverted: greater = worse. Fewer sources is worse; on equal sources
-        // the HIGHER id is worse, so the lower id survives a tie.
-        other
-            .sources
-            .cmp(&self.sources)
-            .then_with(|| self.id.cmp(&other.id))
+        // Inverted: greater = worse, so compare the "better" keys the other way
+        // round.
+        rank_key(other.sources, other.tie, other.id).cmp(&rank_key(self.sources, self.tie, self.id))
     }
 }
 
@@ -233,6 +277,7 @@ pub fn handle_search(
     // Shared by both paths below so they cannot drift apart.
     // Terms folded once for the whole search, not once per candidate.
     let prepared = prepare(&tree);
+    let seed = query_seed(&groups);
     let mut consider = |id: crate::state::file_id::FileId,
                         entry: &crate::state::file_id::FileRecord,
                         heap: &mut std::collections::BinaryHeap<Ranked>|
@@ -258,8 +303,8 @@ pub fn handle_search(
             let keep = match heap.peek() {
                 Some(worst) if heap.len() >= max_results => {
                     let cand_sources = entry.sources.len() as u32;
-                    (cand_sources, std::cmp::Reverse(id))
-                        > (worst.sources, std::cmp::Reverse(worst.id))
+                    rank_key(cand_sources, tie_key(seed, &entry.hash), id)
+                        > rank_key(worst.sources, worst.tie, worst.id)
                 }
                 _ => true,
             };
@@ -278,6 +323,7 @@ pub fn handle_search(
             if keep && !state.filter.is_withheld(&entry.hash, entry.name()) {
                 heap.push(Ranked {
                     sources: entry.sources.len() as u32,
+                    tie: tie_key(seed, &entry.hash),
                     id,
                     rec: entry.clone(),
                 });
