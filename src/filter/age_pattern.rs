@@ -171,6 +171,10 @@ where
             "才",
             "세",
             "歲",
+            // Simplified Chinese (歲 is the traditional form). Missing until
+            // 0.9.80, so a simplified-Chinese name stating an age carried an
+            // age nobody read.
+            "岁",
             // NOTE: the school-grade suffixes "年生"/"学年"/"학년" are NOT here.
             // They were, and it was wrong: the digit in front of them is a GRADE,
             // not an age. "中学2年生" is a 14-year-old in the second year of
@@ -1921,8 +1925,12 @@ mod tests {
         assert!(contains_minor_age_token("動画 13歳 something.mp4").is_some());
         assert!(contains_minor_age_token("13才 video").is_some());
         assert!(contains_minor_age_token("13세 clip.avi").is_some());
+        // Chinese, traditional and simplified.
+        assert!(contains_minor_age_token("13歲 clip.avi").is_some());
+        assert!(contains_minor_age_token("动画 15岁 clip.avi").is_some());
         // Adult ages must NOT match.
         assert!(contains_minor_age_token("25歳 woman.mp4").is_none());
+        assert!(contains_minor_age_token("25岁 woman.mp4").is_none());
         assert!(contains_minor_age_token("30세 adult.mp4").is_none());
     }
 

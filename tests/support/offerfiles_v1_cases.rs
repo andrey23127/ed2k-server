@@ -57,14 +57,33 @@ async fn server(enabled: bool) -> (u16, Arc<ServerState>, tokio::task::JoinHandl
     server_with(|port| v1_config(port, enabled), ContentFilter::new()).await
 }
 
+/// LOGINREQUEST payload, optionally asking for OFFERFILES v1 with the
+/// string-named uint32 tag `offerfiles_v` = 1 (revised contract, 10.10.2026).
+fn login_payload(id: u8, ask_v1: bool) -> Vec<u8> {
+    let mut p = build_login([id; 16], 0, "v1-draft");
+    if ask_v1 {
+        let n = u32::from_le_bytes(p[22..26].try_into().unwrap()) + 1;
+        p[22..26].copy_from_slice(&n.to_le_bytes());
+        p.push(0x03); // uint32, old-format (string) name
+        p.extend_from_slice(&12u16.to_le_bytes());
+        p.extend_from_slice(b"offerfiles_v");
+        p.extend_from_slice(&1u32.to_le_bytes());
+    }
+    p
+}
+
 async fn login(port: u16, id: u8) -> (Peer, Vec<ed2k_server::proto::Tag>) {
+    login_as(port, id, true).await
+}
+
+async fn login_as(port: u16, id: u8, ask_v1: bool) -> (Peer, Vec<ed2k_server::proto::Tag>) {
     let mut peer = Framed::new(
         TcpStream::connect(("127.0.0.1", port)).await.unwrap(),
         Ed2kCodec::new(1_000_000),
     );
     peer.send(Frame::new(
         OP_LOGINREQUEST,
-        build_login([id; 16], 0, "v1-draft"),
+        login_payload(id, ask_v1),
     ))
     .await
     .unwrap();
@@ -493,5 +512,88 @@ async fn the_global_ceiling_slows_publishers_without_losing_records() {
     assert!(took >= Duration::from_millis(1300), "{took:?}");
     assert_eq!(state.offer_v1.records.load(Relaxed), 24);
     assert_eq!(state.offer_v1_pacer.waiting.load(Relaxed), 0);
+    task.abort();
+}
+
+// ── Revised contract (10.10.2026): only a client that asks is a v1 client ───
+
+/// v1 on, client did not ask: no advertisement and none of the v1 rules. A
+/// stock eMule sends its whole list in its first OFFERFILES — here 3 records
+/// against a batch_max of 2 — and must be indexed, back to back, at once.
+#[tokio::test]
+async fn a_client_that_did_not_ask_is_a_legacy_client() {
+    let (port, state, task) = server_with(
+        |port| {
+            let mut c = v1_config(port, true);
+            c.limits.hard_limit_files = 100;
+            c.limits.soft_limit_files = 100;
+            c.limits.offerfiles_global_records_per_sec = 1; // would stall anyone it applied to
+            c
+        },
+        ContentFilter::new(),
+    )
+    .await;
+    let (mut peer, tags) = login_as(port, 60, false).await;
+    assert_no_v1(&tags);
+    // ST_SOFTFILES / ST_HARDFILES still come from the live configuration.
+    let hard: Vec<_> = tags.iter().filter(|t| t.name == TagName::Byte(ST_HARDFILES)).collect();
+    assert_eq!(hard[0].value, TagValue::U32(100));
+    let started = std::time::Instant::now();
+    send(&mut peer, offer(1, BATCH + 1), false).await;
+    send(&mut peer, offer(10, BATCH + 1), true).await;
+    alive(&mut peer).await;
+    assert_eq!(state.file_count(), 2 * (BATCH + 1) as usize);
+    assert!(started.elapsed() < Duration::from_millis(INTERVAL as u64), "not paced");
+    use std::sync::atomic::Ordering::Relaxed;
+    assert_eq!(state.offer_v1.requested.load(Relaxed), 0);
+    assert_eq!(state.offer_v1.sessions.load(Relaxed), 0);
+    assert_eq!(state.offer_v1.oversized.load(Relaxed), 0);
+    assert_eq!(state.offer_v1.batches.load(Relaxed), 0);
+    task.abort();
+}
+
+/// A legacy client and a v1 client side by side: the first is untouched by
+/// the server-wide ceiling the second is held to.
+#[tokio::test]
+async fn the_ceiling_does_not_touch_legacy_publishers() {
+    let (port, state, task) = server_with(
+        |port| {
+            let mut c = v1_config(port, true);
+            c.limits.soft_limit_files = 100;
+            c.limits.hard_limit_files = 100;
+            c.limits.offerfiles_global_records_per_sec = 2;
+            c
+        },
+        ContentFilter::new(),
+    )
+    .await;
+    let (mut v1, tags) = login_as(port, 61, true).await;
+    assert_policy_values(&tags, BATCH, INTERVAL, 100, 100);
+    let (mut legacy, tags) = login_as(port, 62, false).await;
+    assert_no_v1(&tags);
+    // The v1 client uses up the ceiling's allowance and queues behind it...
+    send(&mut v1, offer(1, BATCH), false).await;
+    send(&mut v1, offer(3, BATCH), false).await;
+    // ...while the legacy client publishes 20 records straight through.
+    let started = std::time::Instant::now();
+    send(&mut legacy, offer(100, 20), false).await;
+    alive(&mut legacy).await;
+    assert!(started.elapsed() < Duration::from_millis(500), "{:?}", started.elapsed());
+    assert!(state.file_slab.id_of(&[119; 16]).is_some());
+    alive(&mut v1).await;
+    assert_eq!(state.file_count(), 24);
+    task.abort();
+}
+
+/// v1 off: a client that asks gets nothing either.
+#[tokio::test]
+async fn asking_when_v1_is_off_changes_nothing() {
+    let (port, state, task) = server(false).await;
+    let (_, tags) = login_as(port, 63, true).await;
+    assert_no_v1(&tags);
+    use std::sync::atomic::Ordering::Relaxed;
+    // Counted (it says how many clients would use v1), but not advertised.
+    assert_eq!(state.offer_v1.requested.load(Relaxed), 1);
+    assert_eq!(state.offer_v1.sessions.load(Relaxed), 0);
     task.abort();
 }

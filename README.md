@@ -410,9 +410,9 @@ a watched file) or needs a **restart**.
 | `search_rank_scan` | Candidates examined when ranking one search. Past it, ranking covers only what was seen; the share of searches that hit it is shown on the Status tab. Default 20000, must be ≥ `max_search_results` | live |
 | `index_subtokens` | Also index letter/digit pieces of each word, so `S01E08` is found by `s01` and `e08`, `1080p` by `1080`. Changes what searches return, so off by default. Read once at startup: the index must split names the same way for its whole life. **Not a superset of Lugdunum**: a query that starts mid-run (`1x05` against `01x05`) is still not found | restart |
 | `search_drop_unknown_words` | Ignore query words that no indexed file contains instead of returning nothing because of them (a typo no longer empties the search). A query of only unknown words still returns nothing; OR branches and negated words are never rewritten. Default on | live |
-| `offerfiles_v1` | Advertise batch size and pace for `OFFERFILES` in `OP_SERVERIDENT` (see [OFFERFILES v1](#offerfiles-v1-fast-publishing)) and hold each connection that was told them to them. Off by default; off or invalid = no tag sent, publishing unchanged | live, new logins |
+| `offerfiles_v1` | Answer clients that ask for OFFERFILES v1 at login with batch size and pace in `OP_SERVERIDENT` (see [OFFERFILES v1](#offerfiles-v1-fast-publishing)) and hold those connections to them. Clients that do not ask are never affected. Off by default; off or invalid = no tag sent, publishing unchanged | live, new logins |
 | `offerfiles_batch_max`, `offerfiles_min_interval_ms` | The advertised batch size (default 200) and least time between batches (default 500 ms). A v1 batch above the size (and below the hard limit) is not indexed, the session stays up; an early batch waits, it is never dropped | live, new logins |
-| `offerfiles_global_records_per_sec` | Ceiling on records per second from all v1 connections together, served in arrival order, so a reconnect wave of fast publishers slows down instead of saturating the content filter. Default 5000 (about a quarter of a core); `0` = none. Legacy publishers are not counted | live |
+| `offerfiles_global_records_per_sec` | Ceiling on records per second from all v1 connections (clients that asked) together, served in arrival order, so a reconnect wave of fast publishers slows down instead of saturating the content filter. Default 5000 (about a quarter of a core); `0` = none. Legacy publishers are not counted | live |
 
 ### `[content_filter]`
 | Key | Meaning | Apply |
@@ -819,14 +819,28 @@ hours to be fully published. With `limits.offerfiles_v1 = true` the server
 tells a client how fast it may go and holds it to that; at the defaults (200
 files every 500 ms) the same library takes under three minutes. Agreed in
 [issue #19](https://github.com/andrey23127/ed2k-server/issues/19); the client
-side is aMule PR #1715 (experimental, opt-in). A client that does not read the
-advertisement is unaffected.
+side is aMule PR #1715 (experimental, opt-in). Only a client that asks for v1
+at login is answered and held to it; every other client publishes exactly as
+with the option off.
 
 ### Wire contract (v1)
 
-In the post-login `OP_SERVERIDENT`, which this server always sends right after
-login (no `OP_GETSERVERLIST` needed) and only there, each exactly once, all
-`uint32`:
+**The client asks.** A client that implements v1 adds to its `OP_LOGINREQUEST`
+tag list a string-named `uint32` tag `offerfiles_v` carrying the highest
+version it implements (`1`). Any other shape (absent, another type, `0`) is a
+legacy client. Servers that do not know the tag skip it like any unknown login
+tag.
+
+> Revised 10.10.2026. The first version advertised to, and enforced on, every
+> login. On the live server that applied the batch limit and the server-wide
+> ceiling to clients that had never seen the advertisement: in one day 2.8
+> thousand OFFERFILES above `batch_max` from such clients were not indexed, and
+> nearly every publisher waited behind the ceiling. The server cannot tell who
+> reads the advertisement, so the client now has to say so.
+
+**The server answers**, only to a client that asked and only when v1 is on and
+valid, in the post-login `OP_SERVERIDENT` (always sent right after login, no
+`OP_GETSERVERLIST` needed) and only there, each exactly once, all `uint32`:
 
 | Tag | Name kind | Meaning |
 |---|---|---|
@@ -869,7 +883,8 @@ TCP rather than by a queue in the server.
 There is no acknowledgement packet in v1: a client cannot tell which records
 were indexed (filtered, over budget) and should not try to infer it.
 
-The Status tab shows the active policy and its counters: sessions advertised,
+The Status tab shows the active policy and its counters: logins that asked,
+sessions advertised,
 batches and records, how often and how long batches waited for their own pace
 and for the server-wide ceiling, and batches above the size.
 

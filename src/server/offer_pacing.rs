@@ -8,8 +8,17 @@
 //!
 //! # Wire contract (agreed in #19 and aMule #1699 / PR #1715)
 //!
-//! A server with v1 enabled sends, in the post-login OP_SERVERIDENT and nowhere
-//! else, each exactly once and all as uint32:
+//! A client asks for v1 with a string-named uint32 tag `offerfiles_v` (the
+//! highest version it implements, 1) in its OP_LOGINREQUEST; see
+//! [`client_requests_v1`]. Only a client that asked is answered, and only its
+//! connection is held to the rules below. Every other client is a legacy one,
+//! whatever the configuration says: no tag in its SERVERIDENT, no pacing, no
+//! batch limit beyond the hard one — exactly as with v1 off. (Revised
+//! 10.10.2026, after v1 applied to every login on the live server rejected the
+//! first, whole-list OFFERFILES of stock eMule clients.)
+//!
+//! To a client that asked, a server with v1 enabled sends, in the post-login
+//! OP_SERVERIDENT and nowhere else, each exactly once and all as uint32:
 //!
 //! | tag                          | name kind | meaning                              |
 //! |------------------------------|-----------|--------------------------------------|
@@ -48,8 +57,9 @@
 //!    them down instead of saturating the content filter;
 //! 5. content filter, soft budget and indexing exactly as for a legacy client.
 //!
-//! A legacy connection (v1 off, or the configuration invalid) goes through
-//! none of 2–4, and reads soft and hard live as before.
+//! A legacy connection (the client did not ask, v1 is off, or the
+//! configuration is invalid) goes through none of 2–4, and reads soft and hard
+//! live as before.
 
 use crate::config::LimitsConfig;
 use crate::proto::tags::{Tag, TagName, TagValue};
@@ -127,6 +137,27 @@ impl OfferPolicy {
     pub fn bucket(&self) -> Gcra {
         Gcra::new(self.batch_max, Duration::from_millis(self.min_interval_ms as u64))
     }
+}
+
+/// Did the client ask for OFFERFILES v1 in its OP_LOGINREQUEST?
+///
+/// The request is a string-named uint32 tag `offerfiles_v` among the login
+/// tags, carrying the highest version the client implements (1 today). Any
+/// other shape — absent, another type, 0 — is a legacy client.
+///
+/// Why a request at all: the server cannot otherwise tell a client that will
+/// read the advertisement from one that will not, and the v1 rules are not
+/// neutral for the second kind. Applied to everyone on the live server they
+/// rejected the first OFFERFILES of stock eMule clients, which send their
+/// whole list in one packet (thousands of records, under the hard limit but
+/// far over batch_max), and put every publisher behind the server-wide
+/// ceiling. So the server answers only a client that asked: it advertises,
+/// and enforces, for that connection and no other.
+pub fn client_requests_v1(tags: &[Tag]) -> bool {
+    tags.iter().any(|t| {
+        matches!(&t.name, TagName::Str(n) if n == TAG_VERSION)
+            && matches!(t.value, TagValue::U32(v) if v >= OFFERFILES_VERSION)
+    })
 }
 
 /// The policy for a client logging in now, logging a configuration that cannot
@@ -266,7 +297,10 @@ impl Drop for DecOnDrop<'_> {
 /// Counters for choosing production values (Status tab, /api/stats).
 #[derive(Default)]
 pub struct OfferV1Stats {
-    /// Logins that were sent the v1 advertisement.
+    /// Logins that asked for v1 (tag `offerfiles_v` in OP_LOGINREQUEST).
+    pub requested: AtomicU64,
+    /// Logins that were sent the v1 advertisement (asked, and v1 is on and
+    /// valid).
     pub sessions: AtomicU64,
     /// Batches and records processed on v1 connections.
     pub batches: AtomicU64,
@@ -292,7 +326,10 @@ impl OfferV1Stats {
     }
 
     pub fn note_global_wait(&self, d: Duration) {
-        if !d.is_zero() {
+        // `acquire` reports time since arrival, which is never exactly zero —
+        // a batch that went straight through still took a few microseconds to
+        // lock and book. Count only what a client could notice.
+        if d >= Duration::from_millis(1) {
             let ms = d.as_millis() as u64;
             self.global_waits.fetch_add(1, Relaxed);
             self.global_wait_ms.fetch_add(ms, Relaxed);
@@ -302,6 +339,7 @@ impl OfferV1Stats {
 
     pub fn to_json(&self, pacer: &GlobalOfferPacer) -> serde_json::Value {
         serde_json::json!({
+            "requested": self.requested.load(Relaxed),
             "sessions": self.sessions.load(Relaxed),
             "batches": self.batches.load(Relaxed),
             "records": self.records.load(Relaxed),
@@ -361,6 +399,19 @@ mod tests {
         }
         // Off never errs, whatever the values.
         assert_eq!(OfferPolicy::from_limits(&limits(false, 0, 0, 0, 0)), Ok(None));
+    }
+
+    #[test]
+    fn only_an_explicit_uint32_request_counts() {
+        let tag = |name: TagName, value: TagValue| Tag { name, value };
+        let ask = |v| tag(TagName::Str("offerfiles_v".into()), v);
+        assert!(client_requests_v1(&[ask(TagValue::U32(1))]));
+        assert!(client_requests_v1(&[ask(TagValue::U32(2))]), "a newer client still gets v1");
+        assert!(!client_requests_v1(&[]));
+        assert!(!client_requests_v1(&[ask(TagValue::U32(0))]));
+        assert!(!client_requests_v1(&[ask(TagValue::U8(1))]), "wrong type");
+        assert!(!client_requests_v1(&[ask(TagValue::String("1".into()))]));
+        assert!(!client_requests_v1(&[tag(TagName::Str("offerfiles_V".into()), TagValue::U32(1))]));
     }
 
     #[test]

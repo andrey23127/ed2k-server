@@ -791,11 +791,12 @@ pub struct LimitsConfig {
     #[serde(default = "default_true")]
     pub search_drop_unknown_words: bool,
 
-    /// OFFERFILES v1 (issue #19): advertise the three values below, with
-    /// `soft_limit_files` and `hard_limit_files`, in OP_SERVERIDENT, and hold
-    /// each connection that was told them to them. A client that reads the
-    /// advertisement (aMule PR #1715, opt-in) may then publish faster than the
-    /// legacy 200 files a minute; a client that does not is unaffected.
+    /// OFFERFILES v1 (issue #19): to a client that asks for it at login (tag
+    /// `offerfiles_v` in OP_LOGINREQUEST), advertise the three values below,
+    /// with `soft_limit_files` and `hard_limit_files`, in OP_SERVERIDENT, and
+    /// hold that connection to them. It may then publish faster than the
+    /// legacy 200 files a minute. A client that does not ask is never affected:
+    /// no tag, no pacing, no batch limit beyond the hard one.
     ///
     /// Valid only with soft_limit_files > 0, hard_limit_files above
     /// offerfiles_batch_max, and batch and interval above 0. Otherwise nothing
@@ -815,8 +816,8 @@ pub struct LimitsConfig {
     /// holds one batch and refills at batch_max per interval.
     #[serde(default = "default_offerfiles_min_interval_ms")]
     pub offerfiles_min_interval_ms: u32,
-    /// Ceiling on records per second from ALL v1 connections together, served
-    /// in arrival order; `0` = none. It keeps a reconnect wave of fast
+    /// Ceiling on records per second from ALL v1 connections (clients that
+    /// asked) together, served in arrival order; `0` = none. It keeps a reconnect wave of fast
     /// publishers from saturating the content filter: each one slows down
     /// instead. Legacy connections are not counted. Live. Default 5000: about
     /// a quarter of one core at the measured ~54 us per published record.

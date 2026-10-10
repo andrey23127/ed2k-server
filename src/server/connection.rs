@@ -595,11 +595,23 @@ async fn dispatch(
                 }
                 return Err(SessionRefused("server full").into());
             };
+            // OFFERFILES v1 only for a client that asked for it (issue #19).
+            let wants_v1 = crate::server::offer_pacing::client_requests_v1(&req.tags);
             let mut new_client = handle_login(cfg, state, peer.ip(), req).await;
             // OFFERFILES v1 snapshot (issue #19): taken once, here, and both
             // advertised from and enforced from for the life of the connection.
-            new_client.offer_policy =
-                crate::server::offer_pacing::policy_for_login(&state.live_cfg.load().limits);
+            //
+            // A client that did not ask is a legacy client whatever the
+            // configuration says: no advertisement, no pacing, no batch limit.
+            new_client.offer_policy = if wants_v1 {
+                state
+                    .offer_v1
+                    .requested
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                crate::server::offer_pacing::policy_for_login(&state.live_cfg.load().limits)
+            } else {
+                None
+            };
             sess.offer_bucket = new_client.offer_policy.map(|p| p.bucket());
             if new_client.offer_policy.is_some() {
                 state
