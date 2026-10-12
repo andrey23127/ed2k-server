@@ -834,8 +834,10 @@ fn default_offerfiles_min_interval_ms() -> u32 {
 fn default_offerfiles_global_records_per_sec() -> u32 {
     // The publish path (content filter + slab + keyword index) measured at
     // ~54 us a record on one core (examples/loadgen, 3M files: 18.6k files/s).
-    // 5000/s is about a quarter of a core: 25 v1 clients at the full default
-    // pace of 400/s, or one 55,000-file library in ~11 s.
+    // 5000/s is about a quarter of a core: 12 v1 clients at the full default
+    // pace of 400/s. It does not speed up one client: that one is held to its
+    // own pace, so a 55,000-file library still takes about 137 s (275 batches
+    // of 200, 500 ms apart).
     5_000
 }
 

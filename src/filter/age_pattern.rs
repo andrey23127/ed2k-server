@@ -160,6 +160,20 @@ where
             "leta",
             "jahr",
             "jährig",
+            // French, Italian, Dutch and Scandinavian year units ("13 ans",
+            // "14 anni", "13 jaar", "14 år"). Added 10.10.2026 from a capture of
+            // served results, where names stating an age this way passed every
+            // layer. Spelled units, so they take the pairing rule and the
+            // duration guards below, never the unpaired one. Measured on
+            // 123 563 names: 10 newly blocked, none unblocked.
+            "ans",
+            "anni",
+            "jaar",
+            "år",
+            // "yop" — "years old" with a trailing p, as some collectors write it.
+            // Compact, but NOT in the unpaired list: it takes the pairing rule
+            // like "years". One served name in the 10.10 capture.
+            "yop",
             "jahrige",
             "лет",
             "года",
@@ -209,6 +223,7 @@ where
                             | "aã±os" | "aã±o" | "aãâ±os" | "aã£â±os"
                             | "aã\u{83}â±os"
                             | "aninhos" | "añitos"
+                            | "ans" | "anni" | "jaar" | "år"
                     );
 
                     // A spelled-out year unit in a DURATION is not an age. The
@@ -238,6 +253,23 @@ where
                         // and "6Years Sweetmini", both real.
                         "reunion",
                         "reunión",
+                        // The same for the units added on 10.10.2026: "3 ans
+                        // après", "5 anni dopo", "10 jaar geleden", "2 år
+                        // senare" / "sedan". Italian "fa" (= ago) is NOT here: it
+                        // is also the verb "does", and a "fa" guard let a real
+                        // file through on the corpus.
+                        "après",
+                        "apres",
+                        "plus tard",
+                        "dopo",
+                        "geleden",
+                        // Spanish "later", from the 10.10.2026 review: an adult
+                        // studio's "3 años después ..." ("3 years later") read as
+                        // age 3.
+                        "después",
+                        "despues",
+                        "senare",
+                        "sedan",
                     ];
                     // Reference word right before the number. Kept deliberately
                     // small; "after" covers "Back After 10 Years".
@@ -1917,6 +1949,36 @@ mod tests {
         let l = s.to_lowercase();
         // "anaconda" contains "ana" but not "anal" so should NOT match the word-bounded "anal" term
         assert!(matches_layer2(s, &l).is_none());
+    }
+
+    #[test]
+    fn romance_and_germanic_year_units_are_ages() {
+        // Paired with a sexual term: an age claim.
+        for s in [
+            "clip 13 ans sex.mp4",
+            "clip 14 anni porno.avi",
+            "clip 13 jaar sex.avi",
+            "clip 14 år porn.avi",
+            "clip 15 yop sex.mp4",
+            // Italian "fa" is "does" as often as "ago"; it is no guard.
+            "clip 13 anni fa sesso.avi",
+        ] {
+            assert!(matches_layer2(s, &s.to_lowercase()).is_some(), "{s}");
+        }
+        // Spelled units never block alone, and adult ages never count.
+        for s in [
+            "clip 13 ans.mp4",
+            "clip 35 ans sexe.avi",
+            "clip anni 40 sesso.avi",
+            // Durations, not ages.
+            "sexe 10 ans apres.avi",
+            "porno 3 anni dopo.avi",
+            "sex 10 jaar geleden.avi",
+            "porn 2 år senare.avi",
+            "porno 3 años despues.mp4",
+        ] {
+            assert!(matches_layer2(s, &s.to_lowercase()).is_none(), "{s}");
+        }
     }
 
     #[test]

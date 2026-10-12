@@ -863,6 +863,20 @@ whole life: a configuration change reaches new connections only, and a
 reconnect starts afresh (new snapshot, full bucket, budget counted from what
 the client sources then).
 
+**One advertisement per connection.** The server sends `OP_SERVERIDENT` once,
+right after login, and never again on that connection. It holds a connection to
+v1 if and only if that SERVERIDENT carried a complete, valid advertisement, so
+a client that finds none there (missing, partial, malformed) is legacy on both
+sides. A client that did get a valid one keeps it for the connection: a later
+SERVERIDENT, valid or not, changes nothing, and slowing down to the legacy pace
+does not lift the negotiated batch size (a 200-record batch against
+`batch_max = 50` is not indexed).
+
+**Batch size a v1 client sends:** the smallest of its remaining soft budget,
+`offerfiles_batch_max`, `ST_HARDFILES - 1` and its own local cap.
+`batch_max < ST_HARDFILES` is required, and the gap is deliberate: `ST_HARDFILES`
+is the final boundary for every client, `batch_max` the contract for v1 ones.
+
 ### What the server does on a v1 connection
 
 | The batch… | Result |
@@ -879,6 +893,13 @@ starts full (the first batch goes at once) and refills at `batch_max` per
 delivers together are therefore not an offence, just processed on schedule.
 While a connection waits it reads nothing more, so the client is held back by
 TCP rather than by a queue in the server.
+
+A legacy connection is held to none of this. The 200-record batch of eMule and
+aMule is their own publishing policy (`min(ST_SOFTFILES, 200)`), not a server
+limit: a legacy client may declare any count below `ST_HARDFILES`, including its
+whole share list in one packet, and it is processed. The soft budget is never
+fatal for anyone: once it is spent, further new files are not indexed, the
+usual server message is sent once, and the connection stays up.
 
 There is no acknowledgement packet in v1: a client cannot tell which records
 were indexed (filtered, over budget) and should not try to infer it.

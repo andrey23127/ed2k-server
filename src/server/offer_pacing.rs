@@ -219,8 +219,14 @@ impl Gcra {
     pub fn reserve(&mut self, n: u32, now: Instant) -> Duration {
         let cost_ns = (self.per.as_nanos() * n as u128) / self.rate as u128;
         // Capped so a pathological configuration cannot overflow Instant
-        // arithmetic: a day is far beyond any interval anyone would set.
-        let cost = Duration::from_nanos(cost_ns.min(86_400_000_000_000) as u64);
+        // arithmetic. The cap must stay ABOVE the largest `per` there can be
+        // (u32::MAX ms, about 49.7 days): a cost capped below `per` makes a
+        // full batch cheaper than the bucket's depth, and every such batch
+        // then goes through at once. A one-day cap did exactly that for an
+        // interval set above a day (reported in #19). Ten years is far above
+        // any `per` and far below where Instant arithmetic can overflow.
+        const COST_CAP_NS: u128 = 10 * 365 * 86_400 * 1_000_000_000;
+        let cost = Duration::from_nanos(cost_ns.min(COST_CAP_NS) as u64);
         let start = match self.tat {
             Some(t) if t > now => t,
             _ => now,
@@ -497,9 +503,27 @@ mod tests {
         let mut b = Gcra::new(1, Duration::from_millis(u32::MAX as u64));
         b.reserve(u32::MAX, t0);
         let w = b.reserve(u32::MAX, t0);
-        assert!(w <= Duration::from_secs(86_400));
+        // Two capped bookings: the second waits at most two caps.
+        assert!(w <= Duration::from_secs(2 * 10 * 365 * 86_400));
         let mut b = Gcra::new(0, MS(1)); // rate clamped to 1
         assert_eq!(b.reserve(1, t0), Duration::ZERO);
+    }
+
+    #[test]
+    fn an_interval_above_a_day_still_paces_every_batch() {
+        // Reported in #19: with the cost capped at one day, a two-day interval
+        // let the second and third full batch through at once.
+        let t0 = Instant::now();
+        let two_days = Duration::from_secs(2 * 86_400);
+        let mut b = Gcra::new(200, two_days);
+        assert_eq!(b.reserve(200, t0), Duration::ZERO, "first batch goes at once");
+        assert_eq!(b.reserve(200, t0), two_days, "second waits a full interval");
+        assert_eq!(b.reserve(200, t0), 2 * two_days, "third waits two");
+        // The largest interval the configuration can express.
+        let max = Duration::from_millis(u32::MAX as u64);
+        let mut b = Gcra::new(200, max);
+        assert_eq!(b.reserve(200, t0), Duration::ZERO);
+        assert_eq!(b.reserve(200, t0), max);
     }
 
     #[tokio::test(start_paused = true)]
