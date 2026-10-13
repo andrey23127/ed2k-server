@@ -284,6 +284,36 @@ fn skip_one_tag(buf: &[u8]) -> Option<&[u8]> {
     rest.get(value_len..)
 }
 
+/// The TCP port of the server a 0x97 came from; see
+/// `UdpServer::reply_server_port`. `pinged(p)`: we sent an OBF ping to the
+/// server on TCP port `p` at this address; `listed(p)`: it is in our server
+/// list.
+fn pick_reply_server_port(
+    src_port: u16,
+    obfuscated: bool,
+    udpobf: Option<u16>,
+    pinged: impl Fn(u16) -> bool,
+    listed: impl Fn(u16) -> bool,
+) -> u16 {
+    let plain = src_port.saturating_sub(4);
+    if !obfuscated {
+        return plain;
+    }
+    let advertised = udpobf.and_then(|u| u.checked_sub(14));
+    let mut candidates: Vec<u16> = [12u16, 14, 4, 8]
+        .iter()
+        .filter_map(|d| src_port.checked_sub(*d))
+        .collect();
+    candidates.extend(advertised);
+    candidates
+        .iter()
+        .copied()
+        .find(|p| pinged(*p))
+        .or_else(|| candidates.iter().copied().find(|p| listed(*p)))
+        .or(advertised)
+        .unwrap_or(plain)
+}
+
 impl UdpServer {
     pub async fn bind(cfg: Arc<Config>, state: Arc<ServerState>, seckey: [u8; 16]) -> Result<Self> {
         let bind_addr = format!("{}:{}", cfg.network.listen_ip, cfg.network.udp_port());
@@ -481,8 +511,10 @@ impl UdpServer {
                 // Formula B (decode_with_obfbyte 0x6b): MD5(key || 0x6b || salt) — portUDPobf
                 //
                 // Keys to try (in order):
-                //  1. our_sent_random_parts[sender] — what seed uses after OBF ping
-                //  2. seed_server_keys[sender]      — seed's ServerKey we learned
+                //  1. our_sent_random_parts for every server at the sender's
+                //     address — what a seed uses after our OBF ping
+                //  2. seed_server_keys for every server at that address
+                //     (several servers can share one IP, each with its own key)
                 //  3. ip_obfuscate(our_seckey, sender_ip) — fallback for unknown senders
                 //
                 // OPTIMIZATION (v0.9.31): cache the (key, formula) tuple that
@@ -511,7 +543,12 @@ impl UdpServer {
                     }
                 }
 
-                let last = self.state.obf_decode_cache.get(&sender_v4).map(|e| *e);
+                // Keyed by the sender's address AND port: several servers can
+                // share one IP, each with its own key, and keyed by IP alone
+                // their packets kept evicting each other's entry, sending
+                // every one of them down the cold path.
+                let sender_sock = std::net::SocketAddrV4::new(sender_v4, peer.port());
+                let last = self.state.obf_decode_cache.get(&sender_sock).map(|e| *e);
 
                 // First: try the cached (key, formula) if any — covers 99% of legit packets.
                 let mut decoded_opt = last.and_then(|(k, f)| {
@@ -534,17 +571,18 @@ impl UdpServer {
                         continue;
                     }
                     let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
-                    let keys_to_try: [Option<u32>; 3] = [
-                        self.state
-                            .our_sent_random_parts
-                            .get(&sender_v4)
-                            .map(|r| r.0),
-                        self.state.seed_server_keys.get(&sender_v4).map(|r| *r),
-                        Some(ip_obf_key),
-                    ];
+                    let mut keys_to_try: Vec<u32> = self
+                        .state
+                        .sent_random_parts_for_ip(sender_v4)
+                        .into_iter()
+                        .map(|(_, k)| k)
+                        .collect();
+                    keys_to_try.extend(
+                        self.state.seed_keys_for_ip(sender_v4).into_iter().map(|(_, k)| k),
+                    );
+                    keys_to_try.push(ip_obf_key);
                     let formulas = [Formula::Plain, Formula::ObfA5, Formula::Obf6B];
-                    'outer: for &kopt in &keys_to_try {
-                        let Some(k) = kopt else { continue };
+                    'outer: for &k in &keys_to_try {
                         for &f in &formulas {
                             // Skip the combination we already tried as the cached one.
                             if let Some((lk, lf)) = last {
@@ -565,7 +603,7 @@ impl UdpServer {
                                     Formula::ObfA5 => 1u8,
                                     Formula::Obf6B => 2u8,
                                 };
-                                self.state.obf_decode_cache.insert(sender_v4, (k, fnum));
+                                self.state.obf_decode_cache.insert(sender_sock, (k, fnum));
                                 break 'outer;
                             }
                         }
@@ -580,7 +618,7 @@ impl UdpServer {
                         // obfuscated channel cannot read a plaintext answer, and the
                         // decode cache we just populated holds exactly the (key,
                         // formula) pair needed to encode it back.
-                        obf_ctx = self.state.obf_decode_cache.get(&sender_v4).map(|e| *e);
+                        obf_ctx = self.state.obf_decode_cache.get(&sender_sock).map(|e| *e);
                         decoded_buf = inner;
                         opcode = decoded_buf[1];
                         payload = &decoded_buf[2..];
@@ -626,9 +664,7 @@ impl UdpServer {
 
                         // Other undecodable: log if from a known seed,
                         // otherwise silently drop.
-                        if self.state.our_sent_random_parts.contains_key(&sender_v4)
-                            || self.state.seed_server_keys.contains_key(&sender_v4)
-                        {
+                        if self.state.is_gossiped_ip(sender_v4) {
                             debug!(
                                 ip = %peer.ip(),
                                 pkt_len = data.len(),
@@ -789,7 +825,7 @@ impl UdpServer {
             }
             OP_GLOB_SERVSTATREQ => self.handle_servstat(payload, peer, obf).await,
             // 0x97 = GLOBSERVSTATRES — seed server responding to our keepalive ping
-            0x97 => self.handle_pingreply(payload, peer).await,
+            0x97 => self.handle_pingreply(payload, peer, obf.is_some()).await,
             OP_SERVER_DESC_REQ => self.handle_server_desc(payload, peer, obf).await,
             // A peer server's answer to our own 0xA2 (Peers tab).
             OP_SERVER_DESC_RES => self.handle_server_desc_res(payload, peer),
@@ -1216,8 +1252,12 @@ impl UdpServer {
             // 0x97 whose challenge doesn't match `entry+0x28` (the chal
             // Lugdunum stored when it sent the 0x96). Without this map,
             // gossip can only use a placeholder (which gets rejected).
-            if let std::net::IpAddr::V4(v4) = peer.ip() {
-                self.state.incoming_seed_challenges.insert(v4, challenge);
+            // Keyed by the probing SERVER: its probe comes from its main UDP
+            // port, TCP+4, so its TCP port is the source port minus four.
+            if let (std::net::IpAddr::V4(v4), Some(tcp)) = (peer.ip(), peer.port().checked_sub(4)) {
+                self.state
+                    .incoming_seed_challenges
+                    .insert(std::net::SocketAddrV4::new(v4, tcp), challenge);
             }
         }
         // Short form: 12 bytes payload (just challenge+users+files)
@@ -1247,7 +1287,11 @@ impl UdpServer {
                 std::net::IpAddr::V4(v4) => v4,
                 _ => return Ok(()),
             };
-            if let Some(seed_key_ref) = self.state.seed_server_keys.get(&peer_ip_v4) {
+            let Some(peer_tcp) = peer.port().checked_sub(4) else {
+                return Ok(());
+            };
+            let peer_server = std::net::SocketAddrV4::new(peer_ip_v4, peer_tcp);
+            if let Some(seed_key_ref) = self.state.seed_server_keys.get(&peer_server) {
                 let seed_key = *seed_key_ref;
                 drop(seed_key_ref);
 
@@ -1408,7 +1452,12 @@ impl UdpServer {
     /// Incoming GLOBSERVSTATRES from a known seed server (pingreply in Lugdunum).
     /// The seed is responding to our GLOBSERVSTATREQ keepalive/probe.
     /// We update our knowledge of the seed's stats (users/files) for the server list.
-    async fn handle_pingreply(&self, payload: &[u8], from: SocketAddr) -> Result<()> {
+    async fn handle_pingreply(
+        &self,
+        payload: &[u8],
+        from: SocketAddr,
+        obfuscated: bool,
+    ) -> Result<()> {
         if payload.len() < 12 {
             return Ok(());
         }
@@ -1428,7 +1477,9 @@ impl UdpServer {
             // so a phantom port on an otherwise-real server's IP can never be
             // advertised to clients.
             if from.port() > 4 {
-                let tcp = from.port() - 4;
+                let udpobf = (payload.len() >= 34)
+                    .then(|| u16::from_le_bytes([payload[32], payload[33]]));
+                let tcp = self.reply_server_port(v4, from.port(), obfuscated, udpobf).await;
                 self.state.verified_sockets.insert(
                     std::net::SocketAddrV4::new(v4, tcp),
                     std::time::Instant::now(),
@@ -1455,11 +1506,14 @@ impl UdpServer {
         if payload.len() >= 40 {
             let server_key =
                 u32::from_le_bytes([payload[36], payload[37], payload[38], payload[39]]);
-            if let std::net::IpAddr::V4(v4) = from.ip() {
-                let previous = self.state.seed_server_keys.insert(v4, server_key);
+            if let (std::net::IpAddr::V4(v4), true) = (from.ip(), from.port() > 4) {
+                let udpobf = Some(u16::from_le_bytes([payload[32], payload[33]]));
+                let tcp = self.reply_server_port(v4, from.port(), obfuscated, udpobf).await;
+                let server = std::net::SocketAddrV4::new(v4, tcp);
+                let previous = self.state.seed_server_keys.insert(server, server_key);
                 if previous != Some(server_key) {
                     info!(
-                        seed = %v4,
+                        seed = %server,
                         server_key = format!("0x{server_key:08x}"),
                         "learned seed ServerKey — gossip will use obfuscated UDP"
                     );
@@ -1469,6 +1523,36 @@ impl UdpServer {
 
         debug!(from = %from, users, files, "pingreply (GLOBSERVSTATRES from peer server)");
         Ok(())
+    }
+
+    /// Which server at `ip` a 0x97 came from, as its TCP port.
+    ///
+    /// A server answers from one of several UDP ports: its main port (TCP+4)
+    /// for a plain probe, its obf-ping port (TCP+12) or its portUDPobf
+    /// (TCP+14) for the obfuscated handshake. With one server per address the
+    /// distinction hardly mattered, because everything was keyed by IP. With
+    /// several servers behind one address it decides whose ServerKey this is.
+    ///
+    /// A plain reply comes from the main port. For an obfuscated one, the
+    /// server we sent an OBF ping to wins (we know its TCP port exactly), then
+    /// one already in our server list, then the portUDPobf the reply
+    /// advertises; failing all of those, TCP+4 as before.
+    async fn reply_server_port(
+        &self,
+        ip: std::net::Ipv4Addr,
+        src_port: u16,
+        obfuscated: bool,
+        udpobf: Option<u16>,
+    ) -> u16 {
+        let at = |p: u16| std::net::SocketAddrV4::new(ip, p);
+        let list = self.state.server_list.read().await;
+        pick_reply_server_port(
+            src_port,
+            obfuscated,
+            udpobf,
+            |p| self.state.our_sent_random_parts.contains_key(&at(p)),
+            |p| list.contains(&at(p)),
+        )
     }
 
     // ─── SERVER_LIST_RES (0xA1) ─────────────────────────────────────────────
@@ -1504,8 +1588,7 @@ impl UdpServer {
         // Two O(1) lookups, so it runs first: almost every stray 0xA1 comes
         // from an unknown sender and is dropped here without the client check
         // below, whose fallback walks the whole client table.
-        let is_known_peer = self.state.our_sent_random_parts.contains_key(&sender_v4)
-            || self.state.seed_server_keys.contains_key(&sender_v4);
+        let is_known_peer = self.state.is_gossiped_ip(sender_v4);
         if !is_known_peer {
             debug!(ip = %from.ip(),
                    "rejecting 0xA1 from unknown sender (not a gossiped peer)");
@@ -2287,5 +2370,36 @@ mod udp_ranking_tests {
         let got: Vec<usize> = out.iter().map(|r| r.sources.len()).collect();
         // 15 is withheld; the ten best of the rest, best first.
         assert_eq!(got, (5..=14).rev().collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod several_servers_per_ip_tests {
+    use super::pick_reply_server_port;
+
+    #[test]
+    fn a_plain_reply_comes_from_the_main_port() {
+        assert_eq!(pick_reply_server_port(4665, false, None, |_| true, |_| true), 4661);
+    }
+
+    #[test]
+    fn an_obfuscated_reply_belongs_to_the_server_we_pinged() {
+        // Two servers on one IP, TCP 4232 and 4661. The OBF ping reply comes
+        // from 4661's obf-ping port, 4673.
+        let pinged = |p: u16| p == 4232 || p == 4661;
+        let listed = |p: u16| p == 4232 || p == 4661;
+        assert_eq!(pick_reply_server_port(4673, true, Some(4675), pinged, listed), 4661);
+        // The follow-up from its portUDPobf (TCP+14).
+        assert_eq!(pick_reply_server_port(4675, true, Some(4675), pinged, listed), 4661);
+        // And the first server's from 4244.
+        assert_eq!(pick_reply_server_port(4244, true, Some(4246), pinged, listed), 4232);
+    }
+
+    #[test]
+    fn without_a_ping_the_list_then_the_advertised_port_decide() {
+        let none = |_: u16| false;
+        assert_eq!(pick_reply_server_port(5567, true, None, none, |p| p == 5555), 5555);
+        assert_eq!(pick_reply_server_port(5567, true, Some(5569), none, none), 5555);
+        assert_eq!(pick_reply_server_port(5567, true, None, none, none), 5563);
     }
 }

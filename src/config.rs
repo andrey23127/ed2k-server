@@ -464,16 +464,45 @@ impl UpdatesConfig {
     }
 }
 
-/// Localhost-only admin web UI. Disabled by default for safety.
+/// Admin web UI. Disabled by default; loopback-only unless a password is set.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AdminConfig {
-    /// Enable the admin web server. Always binds to 127.0.0.1 only;
-    /// access via SSH tunnel: `ssh -L 8080:127.0.0.1:8080 vps`.
+    /// Enable the admin web server.
     #[serde(default)]
     pub enabled: bool,
-    /// Port for the admin UI on 127.0.0.1.
+    /// Port for the admin UI.
     #[serde(default = "default_admin_port")]
     pub port: u16,
+    /// Address to listen on. Default 127.0.0.1: reached through an SSH tunnel
+    /// (`ssh -L 8080:127.0.0.1:8080 vps`), no password needed. Any other
+    /// address (a VPN interface, a LAN address, 0.0.0.0) requires
+    /// `password_hash`, and the panel then speaks plain HTTP on it.
+    #[serde(default = "default_admin_bind")]
+    pub bind: String,
+    /// `pbkdf2-sha256$...` from `ed2k-server --hash-password`. Empty: no login
+    /// (loopback only). Set: every request needs a session, from any address.
+    #[serde(default)]
+    pub password_hash: String,
+    /// HTTPS for the panel: "off" (default), "self-signed" (the server makes
+    /// and renews its own certificate) or "files" (`tls_cert` / `tls_key`).
+    #[serde(default = "default_admin_tls")]
+    pub tls: String,
+    /// Certificate (chain) and key. Default: `admin-cert.pem` / `admin-key.pem`
+    /// next to the config file. Written by "self-signed", read by "files".
+    #[serde(default)]
+    pub tls_cert: String,
+    #[serde(default)]
+    pub tls_key: String,
+    /// "self-signed" only: sign with this CA (`ed2k-server --make-admin-ca`)
+    /// instead of self-signing. Both or neither.
+    #[serde(default)]
+    pub tls_ca_cert: String,
+    #[serde(default)]
+    pub tls_ca_key: String,
+    /// Extra names (IP addresses or DNS names) the certificate must cover,
+    /// besides the bind address (or `server.this_ip` on 0.0.0.0) and loopback.
+    #[serde(default)]
+    pub tls_names: Vec<String>,
 }
 
 impl Default for AdminConfig {
@@ -481,12 +510,90 @@ impl Default for AdminConfig {
         Self {
             enabled: false,
             port: default_admin_port(),
+            bind: default_admin_bind(),
+            password_hash: String::new(),
+            tls: default_admin_tls(),
+            tls_cert: String::new(),
+            tls_key: String::new(),
+            tls_ca_cert: String::new(),
+            tls_ca_key: String::new(),
+            tls_names: Vec::new(),
         }
+    }
+}
+
+impl AdminConfig {
+    /// The listen address. Validated in [`Config::validate`].
+    pub fn bind_addr(&self) -> std::net::IpAddr {
+        self.bind
+            .trim()
+            .parse()
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let ip: std::net::IpAddr = self.bind.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "admin.bind = \"{}\" is not an IP address (use 127.0.0.1, a VPN or \
+                 LAN address, or 0.0.0.0)",
+                self.bind
+            )
+        })?;
+        if !self.password_hash.trim().is_empty() {
+            crate::admin_auth::PasswordHash::parse(&self.password_hash)
+                .map_err(|e| anyhow::anyhow!("admin.password_hash: {e}"))?;
+        } else if !ip.is_loopback() {
+            bail!(
+                "admin.bind = {ip} is reachable from other machines, but admin.password_hash \
+                 is empty: anyone who can reach the port would control the server. Set a \
+                 password (`ed2k-server --hash-password`) or keep admin.bind = 127.0.0.1 and \
+                 use an SSH tunnel. Refusing to start."
+            );
+        }
+        use crate::admin_tls::Mode;
+        let mode = Mode::parse(&self.tls).map_err(anyhow::Error::msg)?;
+        if mode == Mode::Files && (self.tls_cert.trim().is_empty() || self.tls_key.trim().is_empty())
+        {
+            bail!("admin.tls = \"files\" needs admin.tls_cert and admin.tls_key");
+        }
+        let ca_cert = !self.tls_ca_cert.trim().is_empty();
+        let ca_key = !self.tls_ca_key.trim().is_empty();
+        if ca_cert != ca_key {
+            bail!("admin.tls_ca_cert and admin.tls_ca_key go together: set both or neither");
+        }
+        if ca_cert && mode != Mode::SelfSigned {
+            bail!("admin.tls_ca_cert / tls_ca_key are used only with admin.tls = \"self-signed\"");
+        }
+        for n in &self.tls_names {
+            let n = n.trim();
+            let dns_ok = !n.is_empty()
+                && n.len() <= 253
+                && n.split('.').all(|l| {
+                    !l.is_empty()
+                        && l.len() <= 63
+                        && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                });
+            if n.parse::<std::net::IpAddr>().is_err() && !dns_ok {
+                bail!("admin.tls_names: \"{n}\" is neither an IP address nor a DNS name");
+            }
+        }
+        Ok(())
     }
 }
 
 fn default_admin_port() -> u16 {
     8080
+}
+
+fn default_admin_bind() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_admin_tls() -> String {
+    "off".into()
 }
 
 /// Persistent storage of the file index across restarts.
@@ -1170,6 +1277,7 @@ whitelist_hashes = ""
             );
         }
         self.admission.validate()?;
+        self.admin.validate()?;
         if self.network.max_decompressed_frame_size == 0 {
             bail!(
                 "network.max_decompressed_frame_size must be at least 1: it is the only \

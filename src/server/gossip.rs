@@ -280,7 +280,7 @@ async fn handshake_with_seed(
         // Stash BEFORE sending so the main handler can decode the reply.
         state
             .our_sent_random_parts
-            .insert(*seed.ip(), (random_part, std::time::Instant::now()));
+            .insert(*seed, (random_part, std::time::Instant::now()));
         let ping_dst = SocketAddrV4::new(*seed.ip(), seed_obfping_port);
         obf_sock.send_to(&ping, ping_dst).await?;
         info!(
@@ -297,7 +297,7 @@ async fn handshake_with_seed(
         let seed_serverkey = {
             let dl = tokio::time::Instant::now() + REPLY_TIMEOUT;
             loop {
-                if let Some(k) = state.seed_server_keys.get(seed.ip()).map(|r| *r) {
+                if let Some(k) = state.seed_server_keys.get(seed).map(|r| *r) {
                     break k;
                 }
                 if tokio::time::Instant::now() >= dl {
@@ -367,7 +367,7 @@ async fn handshake_with_seed(
         obf_sock.send_to(&obf_a4, gossip_dst).await?;
 
         // obf 0x97 only if the seed has probed us (we must echo its challenge).
-        if let Some(chal_ref) = state.incoming_seed_challenges.get(seed.ip()) {
+        if let Some(chal_ref) = state.incoming_seed_challenges.get(seed) {
             let challenge_97 = *chal_ref;
             drop(chal_ref);
             let users = state.client_count() as u32;
@@ -449,7 +449,7 @@ async fn handshake_with_seed(
     // obfuscated frames from this seed (it encrypts replies with this value).
     state
         .our_sent_random_parts
-        .insert(*seed.ip(), (random_part, std::time::Instant::now()));
+        .insert(*seed, (random_part, std::time::Instant::now()));
 
     // Wait for OBF reply. Reply arrives on our ephemeral socket from seed:4673.
     let mut buf = vec![0u8; 4096];
@@ -466,7 +466,7 @@ async fn handshake_with_seed(
 
     let seed_serverkey = match decode_obf_s2s(&buf[..n], random_part) {
         Some(k) => {
-            state.seed_server_keys.insert(*seed.ip(), k);
+            state.seed_server_keys.insert(*seed, k);
             info!(seed = %seed.ip(), server_key = format!("0x{:08x}", k),
                   "stored peer ServerKey from obf handshake");
             k
@@ -562,7 +562,7 @@ async fn handshake_with_seed(
     // (populated by handle_servstat). If seed hasn't probed us yet, skip
     // sending obf 0x97 from gossip — handle_servstat's synchronous obf 0x97
     // follow-up handles the case where seed *has* probed us.
-    if let Some(chal_ref) = state.incoming_seed_challenges.get(seed.ip()) {
+    if let Some(chal_ref) = state.incoming_seed_challenges.get(seed) {
         let challenge_97 = *chal_ref;
         drop(chal_ref);
         let users = state.client_count() as u32;
@@ -851,7 +851,7 @@ pub async fn build_tcp_server_list(state: &ServerState) -> Vec<u8> {
             // pass — that is how phantom entries (e.g. a real server on a made-up
             // port, learned from a peer's list) got advertised to our clients.
             state.verified_sockets.contains_key(*addr)
-                || state.seed_server_keys.contains_key(addr.ip())
+                || state.seed_server_keys.contains_key(*addr)
         })
         .take(255)
         .collect();
@@ -887,7 +887,7 @@ pub async fn build_server_list_res(state: &ServerState) -> Vec<u8> {
             // pass — that is how phantom entries (e.g. a real server on a made-up
             // port, learned from a peer's list) got advertised to our clients.
             state.verified_sockets.contains_key(*addr)
-                || state.seed_server_keys.contains_key(addr.ip())
+                || state.seed_server_keys.contains_key(*addr)
         })
         .take(255)
         .collect();

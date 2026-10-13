@@ -164,7 +164,7 @@ Fill in at least:
 | `server.name`, `server.desc` | how the server appears in eMule server lists |
 | `server.this_ip` | the server's public IPv4 |
 | `welcome.messages` | the greeting clients see |
-| `network.tcp_port` | 4661 in the template; UDP is this + 4, the admin panel is on `admin.port` (8080, localhost only) |
+| `network.tcp_port` | 4661 in the template; UDP is this + 4, the admin panel is on `admin.port` (8080, localhost only unless `admin.bind` and a password are set) |
 | `limits.max_clients` | 5000 in the template; raise it for a large server (see `LimitNOFILE` below) |
 
 The server **refuses to start** while `server.name` or `server.this_ip` still
@@ -524,7 +524,13 @@ server past every ceiling and checks that it stays bounded and recovers.
 | Key | Meaning | Apply |
 |---|---|---|
 | `enabled` | Enable the admin web panel | **restart** |
-| `port` | Admin panel port (localhost-only) | **restart** |
+| `port` | Admin panel port | **restart** |
+| `bind` | Listen address. Default `127.0.0.1` (SSH tunnel, no login). Any other address — a VPN or LAN address, `0.0.0.0` — needs `password_hash`, or the server refuses to start | **restart** |
+| `password_hash` | `pbkdf2-sha256$…` from `ed2k-server --hash-password`. Empty = no login. Set = every page and API call needs a login, from any address (an SSH tunnel too) | **restart** |
+| `tls` | `"off"` (default, plain HTTP), `"self-signed"` (the server makes and renews its own certificate) or `"files"` (`tls_cert`/`tls_key`, e.g. Let's Encrypt; re-read when they change) | **restart** |
+| `tls_cert`, `tls_key` | Certificate (chain) and key. Default `admin-cert.pem` / `admin-key.pem` next to the config file; written by `"self-signed"`, read by `"files"` | **restart** |
+| `tls_ca_cert`, `tls_ca_key` | `"self-signed"` only: sign with this CA (`ed2k-server --make-admin-ca DIR`) instead of self-signing. Both or neither | **restart** |
+| `tls_names` | Extra IP addresses or DNS names the certificate covers, besides the bind address (`server.this_ip` on `0.0.0.0`), `127.0.0.1`, `::1` and `localhost` | **restart** |
 
 ### `[log]`, `[welcome]`, runtime
 | Key | Meaning | Apply |
@@ -921,9 +927,10 @@ and for the server-wide ceiling, and batches above the size.
 
 ## Admin web panel & SSH tunnel
 
-The admin panel binds to **localhost only** (`127.0.0.1:<admin.port>`, default
-8080) and is **not** exposed to the internet. To reach it from your PC, forward
-the port over SSH.
+By default the admin panel binds to **localhost only** (`127.0.0.1:<admin.port>`,
+default 8080) and is **not** exposed to the internet. To reach it from your PC,
+forward the port over SSH, or set a password and another address (see *With a
+password* below).
 
 ### With PuTTY (Windows)
 
@@ -944,6 +951,196 @@ Command-line SSH (Linux/macOS/WSL) equivalent:
 ```bash
 ssh -N -L 8080:127.0.0.1:8080 user@your-vps
 ```
+
+Several servers on one machine, each with its own `admin.port`: one SSH
+connection can carry all of them. In `~/.ssh/config`:
+
+```
+Host ed2k
+    HostName your-vps
+    LocalForward 8081 127.0.0.1:8081
+    LocalForward 8082 127.0.0.1:8082
+```
+
+### With a password (VPN, LAN or the network)
+
+Instead of a tunnel, the panel can listen on another address with a login:
+
+```bash
+ed2k-server --hash-password        # asks twice, prints the line below
+```
+
+```toml
+[admin]
+enabled = true
+port = 8080
+bind = "0.0.0.0"                   # or the VPN / LAN address
+password_hash = "pbkdf2-sha256$600000$…"
+```
+
+**Making `password_hash`.** Run the server binary with `--hash-password` on any
+machine (usually the VPS itself). It does not read `config.toml`, does not
+touch a running server and needs no root:
+
+```bash
+./ed2k-server --hash-password
+New admin password:                # typed twice, not shown
+Repeat:
+password_hash = "pbkdf2-sha256$600000$…$…"
+Put that line under [admin] in config.toml and restart the server.
+```
+
+Copy the whole `password_hash = "…"` line under `[admin]` and restart the
+server. The password must be at least 10 characters. Every run gives a
+different hash for the same password (the salt is random); that is expected,
+and any of them works. Several servers on one machine can share one hash or
+have their own. The password itself is stored nowhere: to change it, make a new
+hash and replace the line. From a script, the password can be fed on stdin
+(one line, asked once):
+
+```bash
+read -rs PW && printf '%s\n' "$PW" | ./ed2k-server --hash-password; unset PW
+```
+
+`read -rs` keeps the password out of the shell history and off the screen.
+
+**`bind = "0.0.0.0"` or the external IP?** Either works for a login from
+outside; `0.0.0.0` is the usual choice.
+
+- **`0.0.0.0`** listens on every address of the machine: the external IP, a
+  VPN address and `127.0.0.1`. The SSH tunnel keeps working, and loopback stays
+  exempt from the global login lock, so you always keep a way in. With HTTPS
+  the certificate covers `server.this_ip` (or the detected public address),
+  loopback and `tls_names`.
+- **The external IP** (`bind = "203.0.113.5"`) listens on that address only.
+  The SSH tunnel to `127.0.0.1:<port>` then finds nothing; forward to the
+  external address instead (`-L 8080:203.0.113.5:8080`). Use this when the
+  panel must not answer on other addresses of the machine.
+- **A VPN address** (`bind = "10.8.0.1"`) makes the panel reachable only
+  through the VPN — the safest choice when you have one.
+- On a cloud VPS whose interface has a private address behind 1:1 NAT, the
+  external IP is not on the machine and cannot be bound: the eD2k server runs,
+  but the panel stays off and the log says `admin web bind failed — UI
+  disabled`. Use `0.0.0.0` there. `ip -4 addr` shows which addresses the
+  machine has.
+- Several servers on one machine each need their own `admin.port`; `bind` can
+  be the same for all of them.
+- Whatever the bind, open the port in the firewall only to the addresses you
+  manage from, if you can.
+
+- **Hash.** PBKDF2-HMAC-SHA256, random salt, 600 000 iterations — not the
+  unsalted MD5 that some P2P web interfaces keep in their config. A leaked
+  config does not give the password away cheaply.
+- **Session.** A login sets an `HttpOnly`, `SameSite=Strict` cookie for 12
+  hours. Sessions are kept in memory, so a restart logs everybody out.
+- **Guessing.** Five wrong passwords from one address (one /64 for IPv6) lock
+  it out for ten minutes. Fifty wrong passwords from everywhere together stop
+  remote logins for the rest of the ten minutes; the SSH tunnel (loopback) is
+  never held by that, so you always have a way in. Password checks run one at
+  a time, at most four wait, and they never slow down the eD2k side.
+- **Behind a reverse proxy** on the same host every request comes from
+  127.0.0.1: the per-address lockout then counts everybody together, and the
+  server key is shown to everybody. Prefer the built-in HTTPS below.
+- **Cross-site requests.** A request that changes something (reload, config,
+  update) and comes from another site is refused, with or without a login.
+- **Server key.** The server key, and the update access key derived from it,
+  are shown only to requests from loopback.
+- **Host check.** The panel answers only when the browser addressed it by IP,
+  `localhost` or a name in `admin.tls_names` (otherwise 421). This stops DNS
+  rebinding, where a web page re-points its own domain at 127.0.0.1 and talks
+  to the panel through your SSH tunnel. To open the panel by a domain name, put
+  the name in `tls_names`.
+- **Connection limits.** At most 64 connections, 16 per address (per /64 for
+  IPv6), a 10 s TLS handshake, 30 s for each request's headers, a login form of
+  at most 4 KB within 10 s.
+- **The SSH tunnel still works.** With a password set it asks for the password
+  too, so a reverse proxy on the same host cannot become a way around the
+  login.
+
+**Without `admin.tls` the panel speaks plain HTTP.** On anything but loopback
+the password (at login) and the session cookie then travel unencrypted, and the
+server logs a warning at startup saying so. Turn on HTTPS (below), or use a VPN
+(WireGuard, Tailscale) and bind to its address.
+
+### HTTPS without a domain
+
+```toml
+[admin]
+tls = "self-signed"
+```
+
+On first start the server makes an ECDSA P-256 key and a certificate for its
+address and writes them to `admin-cert.pem` / `admin-key.pem` next to the
+config file (key mode 0600). It logs the certificate's SHA-256 fingerprint and
+shows it on the Status tab:
+
+```
+admin web UI listening over HTTPS ... fingerprint=A3:8C:CB:...:62:D0
+```
+
+Open `https://<server IP>:<admin.port>/`. The browser warns once, because no
+public authority vouches for the certificate. Open the certificate details,
+check that the SHA-256 fingerprint matches the one in the log (read the log over
+SSH, not over this connection), and accept. From then on the connection is
+encrypted, and a different certificate in the middle would trigger the warning
+again.
+
+After that Chrome keeps showing **"Not secure"** with `https` struck through.
+This only says that the certificate was accepted by hand, not issued by an
+authority the browser knows; the traffic is encrypted all the same. What
+matters is the fingerprint check the first time: someone in the middle at that
+moment would have shown a different one. To get a normal padlock without a
+domain, use your own CA (below).
+
+- **Addresses covered.** The bind address, or `server.this_ip` on
+  `bind = "0.0.0.0"`, plus `127.0.0.1`, `::1` and `localhost` for the SSH tunnel
+  (`https://127.0.0.1:8080/`). Add a VPN address or a domain with
+  `tls_names = ["10.8.0.1"]`.
+- **Lifetime.** 397 days. The server replaces the certificate 30 days before it
+  ends, or when the addresses change, without a restart. A replaced self-signed
+  certificate has a new fingerprint and the browser asks once more.
+- **The cookie** is marked `Secure` over HTTPS, so the browser never sends it
+  in clear.
+- **Plain HTTP on the HTTPS port** is redirected: `http://<IP>:8080/` answers
+  with a 302 to `https://<IP>:8080/` on the same port (the first byte tells a
+  TLS handshake from an HTTP request). Only `GET` and `HEAD` with a `Host` the
+  panel answers to are redirected; anything else gets a 400. Nothing but the
+  redirect is ever sent in clear.
+
+**Several servers, no warnings: your own CA.** Make a CA once:
+
+```bash
+ed2k-server --make-admin-ca /etc/ed2k-server/ca --admin-ca-names 203.0.113.7,10.8.0.0/24
+# admin-ca-cert.pem, admin-ca-key.pem (0600) and the CA fingerprint
+```
+
+`--admin-ca-names` lists what the CA may sign for: your servers' addresses,
+networks in CIDR form, DNS names. Loopback is always included. The limit is
+written into the CA certificate (X.509 name constraints), so browsers refuse
+anything else it signs. An unconstrained CA imported as a trusted root would be
+trusted for every site, and its key sits on your servers: whoever took one over
+could impersonate any HTTPS site to your PC. Constrained, it can only vouch for
+your own servers. A server whose certificate would need a name outside the list
+refuses to start and says which.
+
+Import `admin-ca-cert.pem` into the trusted roots of the PC you manage from
+(Windows: `certmgr.msc` → *Trusted Root Certification Authorities* → Import;
+Firefox keeps its own list: *Settings → Privacy & Security → Certificates →
+View Certificates → Authorities → Import*). On each server:
+
+```toml
+[admin]
+tls = "self-signed"
+tls_ca_cert = "/etc/ed2k-server/ca/admin-ca-cert.pem"
+tls_ca_key  = "/etc/ed2k-server/ca/admin-ca-key.pem"
+```
+
+Every server's certificate is then signed by that CA and opens without a
+warning, renewals included. The CA lasts ten years. Keep `admin-ca-key.pem` as
+private as an SSH key, and copy it only to servers you run yourself.
+
+**With a domain:** `tls = "files"` and the paths certbot writes
+(`fullchain.pem`, `privkey.pem`). The server re-reads them when they change.
 
 The panel shows live status, connected clients, peers/servers, filter info and
 per-range IP-filter hits, blocks, and memory metrics (RSS plus the non-evictable

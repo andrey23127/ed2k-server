@@ -211,6 +211,26 @@ geoip_mmdb_path = "/etc/ed2k-server/ipinfo_lite.mmdb"
 [admin]
 enabled = true
 port = 8080
+# Default: the panel listens on 127.0.0.1 only and has no login; reach it with
+# an SSH tunnel (README, "Admin web panel"). To reach it over a VPN or the
+# network instead, set a password and an address:
+#   ed2k-server --hash-password      (prints the password_hash line)
+# bind = "0.0.0.0"
+# password_hash = "pbkdf2-sha256$600000$..."
+# With a password set, the SSH tunnel asks for it too.
+#
+# HTTPS (recommended whenever bind is not loopback):
+# tls = "self-signed"   # the server makes and renews its own certificate;
+#                       # check the SHA-256 fingerprint in its log once
+# tls_names = []        # extra IPs / DNS names to cover (VPN address, domain)
+# Optional, one CA for all your servers:
+#   ed2k-server --make-admin-ca DIR --admin-ca-names <your server IPs/networks>
+# tls_ca_cert = "/etc/ed2k-server/admin-ca-cert.pem"
+# tls_ca_key  = "/etc/ed2k-server/admin-ca-key.pem"
+# Or your own certificate (Let's Encrypt):
+# tls = "files"
+# tls_cert = "/etc/letsencrypt/live/example.org/fullchain.pem"
+# tls_key  = "/etc/letsencrypt/live/example.org/privkey.pem"
 
 [updates]
 # Update service for the filter data files. See UPDATE-SERVICE.md.

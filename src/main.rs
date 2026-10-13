@@ -34,10 +34,90 @@ struct Args {
     /// Path to config file
     #[arg(short, long, default_value = "config/config.toml")]
     config: PathBuf,
+    /// Ask for a password, print the admin.password_hash line for it, and exit.
+    /// Reads one line from stdin when it is not a terminal.
+    #[arg(long)]
+    hash_password: bool,
+    /// Make a CA for the admin panel's HTTPS certificates in DIR
+    /// (admin-ca-cert.pem, admin-ca-key.pem), print its fingerprint, and exit.
+    #[arg(long, value_name = "DIR")]
+    make_admin_ca: Option<PathBuf>,
+    /// With --make-admin-ca: the server addresses, networks (CIDR) and DNS
+    /// names the CA may sign for, comma-separated. Loopback is always included.
+    #[arg(long, value_name = "LIST", value_delimiter = ',')]
+    admin_ca_names: Vec<String>,
+}
+
+/// Read a line from the terminal without echoing it.
+fn read_secret(prompt: &str) -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    let stdin = std::io::stdin();
+    let tty = stdin.is_terminal();
+    let mut saved: Option<libc::termios> = None;
+    if tty {
+        eprint!("{prompt}");
+        std::io::stderr().flush().ok();
+        // SAFETY: plain termios calls on fd 0, restored below.
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut t) == 0 {
+                saved = Some(t);
+                t.c_lflag &= !libc::ECHO;
+                libc::tcsetattr(0, libc::TCSANOW, &t);
+            }
+        }
+    }
+    let mut line = String::new();
+    let r = stdin.lock().read_line(&mut line);
+    if let Some(t) = saved {
+        // SAFETY: restoring the attributes read above.
+        unsafe {
+            libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+        eprintln!();
+    }
+    r.context("reading the password")?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn hash_password_command() -> Result<()> {
+    use std::io::IsTerminal;
+    let pw = read_secret("New admin password: ")?;
+    if std::io::stdin().is_terminal() {
+        let again = read_secret("Repeat: ")?;
+        if again != pw {
+            anyhow::bail!("the two passwords differ; nothing printed");
+        }
+    }
+    if pw.chars().count() < 10 {
+        anyhow::bail!("use at least 10 characters: the panel may face the network");
+    }
+    let h = ed2k_server::admin_auth::PasswordHash::new(
+        &pw,
+        ed2k_server::admin_auth::DEFAULT_ITERATIONS,
+    );
+    println!("password_hash = \"{h}\"");
+    eprintln!("Put that line under [admin] in config.toml and restart the server.");
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.hash_password {
+        return hash_password_command();
+    }
+    if let Some(dir) = &args.make_admin_ca {
+        let (cert, key, fp) = ed2k_server::admin_tls::make_ca(dir, &args.admin_ca_names)?;
+        println!("CA certificate: {}", cert.display());
+        println!("CA key:         {}  (keep it private)", key.display());
+        println!("Limited to:     {} and loopback", args.admin_ca_names.join(", "));
+        println!("SHA-256:        {fp}");
+        eprintln!(
+            "Import the certificate into your PC's trusted roots once. On each server set\n\
+             [admin] tls = \"self-signed\", tls_ca_cert and tls_ca_key to these files."
+        );
+        return Ok(());
+    }
     // Read config synchronously BEFORE starting the runtime so we can choose
     // single-threaded vs multi-threaded based on cfg.log.worker_threads.
     let cfg_preview = Config::load_from_file(&args.config)
@@ -582,6 +662,35 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     .unwrap_or_else(|| "(auto)".to_string())
             }
         };
+        // HTTPS for the panel, if asked for. A failure here is fatal: falling
+        // back to plain HTTP would send the password in clear on an address
+        // the operator meant to protect.
+        let admin_tls = ed2k_server::admin_tls::AdminTls::setup(
+            &cfg.admin,
+            &args.config,
+            // server.this_ip, or the detected address when it is empty.
+            &cached_public_ip,
+        )
+        .context("admin.tls")?;
+        if let Some(tls) = admin_tls.clone() {
+            // Renew a server-made certificate in time and pick up replaced
+            // files (certbot), without a restart.
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+                tick.tick().await;
+                loop {
+                    tick.tick().await;
+                    let t = Arc::clone(&tls);
+                    match tokio::task::spawn_blocking(move || t.refresh()).await {
+                        Ok(Ok(Some(fp))) => info!(fingerprint = %fp,
+                            "admin HTTPS certificate replaced; new SHA-256 fingerprint"),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => warn!(error = %e, "admin HTTPS certificate check failed; keeping the current one"),
+                        Err(_) => {}
+                    }
+                }
+            });
+        }
         let web_state = ed2k_server::web::WebState {
             server: Arc::clone(&state),
             config: Arc::clone(&cfg),
@@ -590,8 +699,14 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             config_path: args.config.to_string_lossy().to_string(),
             reload_flag: Arc::clone(&admin_reload_flag),
             cached_public_ip,
+            auth: (!cfg.admin.password_hash.trim().is_empty()).then(|| {
+                let h = ed2k_server::admin_auth::PasswordHash::parse(&cfg.admin.password_hash)
+                    .expect("checked by Config::validate");
+                Arc::new(ed2k_server::admin_auth::Auth::new(h))
+            }),
+            tls: admin_tls,
         };
-        ed2k_server::web::spawn_admin(web_state, cfg.admin.port);
+        ed2k_server::web::spawn_admin(web_state, cfg.admin.clone());
     }
 
     // Main UDP listener (TCP+4 = 4665) — primary GLOBSERVSTATREQ/GETSOURCES channel
@@ -837,8 +952,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 let before = list.len();
                 list.retain(|s| {
                     let ip = *s.ip();
-                    let verified = state_clean.verified_servers.contains_key(&ip)
-                        || state_clean.seed_server_keys.contains_key(&ip);
+                    // By server (ip:port) where we can tell: an IP with one
+                    // verified server must not vouch for a dead port next to it.
+                    // The IP-level plain verification stays as the fallback for
+                    // the client-IP filter below, as before.
+                    let verified = state_clean.verified_sockets.contains_key(s)
+                        || state_clean.seed_server_keys.contains_key(s)
+                        || state_clean.verified_servers.contains_key(&ip);
                     // Filter 1+2: known client IPs (current or recent) — but a
                     // VERIFIED server is kept even if it also shows up as a
                     // client. A server can legitimately send us UDP (gossip,
@@ -1271,12 +1391,15 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     if probed >= PROBE_BATCH {
                         break;
                     }
-                    let ip = *addr.ip();
-                    if state_probe.verified_servers.contains_key(&ip)
-                        || state_probe.seed_server_keys.contains_key(&ip)
+                    // Skip a server already verified, by ip:port: a second
+                    // server on an already-verified IP still needs its own probe,
+                    // or it is never verified (and never handed out) at all.
+                    if state_probe.verified_sockets.contains_key(&addr)
+                        || state_probe.seed_server_keys.contains_key(&addr)
                     {
                         continue;
                     }
+                    let ip = *addr.ip();
                     // Build a plain 0x96 GLOBSERVSTATREQ: e3 96 + 4-byte random challenge
                     // (using 0x55AA prefix as eMule does — but we don't actually need
                     // server-probe semantics here, just any valid 0x96).
@@ -1624,10 +1747,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let pairs: Vec<ed2k_server::updates::PeerPair> = state_exp
                         .seed_server_keys
                         .iter()
+                        // One pair per server. Several servers behind one IP
+                        // give several pairs with that IP, each with its own
+                        // key; the update service keeps them all.
                         .map(|e| ed2k_server::updates::PeerPair {
-                            ip: e.key().to_string(),
+                            ip: e.key().ip().to_string(),
                             key: format!("{:08x}", *e.value()),
-                            verified_plain: state_exp.verified_servers.contains_key(e.key()),
+                            verified_plain: state_exp.verified_sockets.contains_key(e.key()),
                         })
                         .collect();
 

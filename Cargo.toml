@@ -1,6 +1,6 @@
 [package]
 name = "ed2k-server"
-version = "0.9.81"
+version = "0.9.82"
 edition = "2021"
 description = "Modern eDonkey2000 / eMule index server (test/MVP build)"
 license = "MIT"
@@ -69,6 +69,18 @@ ureq = { version = "=2.9.7", default-features = false, features = ["tls", "json"
 # Signature verification for downloaded data files. The public key is compiled
 # in; see src/updates.rs for why the signature matters more than the transport.
 ed25519-dalek = "=2.1.1"
+# OS random source for admin session tokens and password salts. Already in the
+# tree (ring, ed25519-dalek); listed so the admin login can use it directly.
+getrandom = "=0.2.17"
+# Admin panel over HTTPS (admin.tls): a certificate the server makes itself,
+# served with rustls (already in the tree through ureq) on hyper (through axum).
+rcgen = { version = "=0.12.1", default-features = false, features = ["pem", "ring"] }
+time = "=0.3.36"
+tokio-rustls = { version = "=0.25.0", default-features = false, features = ["ring"] }
+pem = "=3.0.5"
+rustls-pki-types = { version = "=1.15.1", features = ["alloc"] }
+hyper = { version = "=1.9.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.7", features = ["tokio"] }
 
 # NOTE: no zip crate. The one archive we consume is unpacked by a ~60-line
 # reader in src/updates.rs on top of `flate2`, which is already in the tree.
@@ -85,6 +97,10 @@ tempfile = "3"
 # resolver to a version compatible with Rust 1.75 (Debian/Ubuntu stable).
 [dependencies.indexmap]
 version = "=2.6.0"
+
+# time 0.3.36 (for rcgen) takes powerfmt ^0.2; 0.2.1 needs Rust 1.79.
+[dependencies.powerfmt]
+version = "=0.2.0"
 
 # Stage 4 (memory): inline single-source storage in FileRecord. The `union`
 # feature lets SmallVec overlap its inline-array and heap-pointer storage, so

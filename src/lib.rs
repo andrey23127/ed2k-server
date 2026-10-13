@@ -1,5 +1,7 @@
 //! ed2k-server library root.
 
+pub mod admin_auth;
+pub mod admin_tls;
 pub mod admission;
 pub mod config;
 pub mod filter;

@@ -1,13 +1,15 @@
-//! Minimal admin web interface (SPEC: localhost-only, read-mostly).
+//! Minimal admin web interface (read-mostly).
 //!
-//! Binds to 127.0.0.1 ONLY. Never exposed publicly — accessed via SSH tunnel:
+//! By default it binds to 127.0.0.1 and has no login: access control is SSH.
 //!     ssh -L 8080:127.0.0.1:8080 your-vps
 //! Then open http://localhost:8080 in your browser.
 //!
-//! There is no auth in the web server itself — access control is delegated
-//! to SSH. This keeps the admin surface tiny and removes the most common
-//! class of bugs (auth bypass). Adding HTTP-level auth here would be a
-//! redundant second wall against the same attacker.
+//! With `admin.password_hash` set it requires a login for every request, from
+//! any address, and may then bind elsewhere (`admin.bind`): a VPN interface,
+//! a LAN address, or 0.0.0.0. See [`crate::admin_auth`] for what that does and
+//! does not protect. Regardless of login, a state-changing request whose
+//! `Origin` is another site is refused, and the server key is shown only to
+//! requests from loopback.
 //!
 //! Endpoints:
 //!   GET  /                    HTML dashboard (Status / Stats / Clients tabs)
@@ -22,12 +24,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::State,
-    http::StatusCode,
-    response::{Html, IntoResponse, Json},
+    extract::{ConnectInfo, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
+use std::net::SocketAddr;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -183,11 +187,438 @@ pub struct WebState {
     /// Cached public IPv4 string. Computed once at startup so /api/status
     /// doesn't re-parse /proc/net/fib_trie on every 5s poll.
     pub cached_public_ip: String,
+    /// Password login; `None` when `admin.password_hash` is empty.
+    pub auth: Option<Arc<crate::admin_auth::Auth>>,
+    /// HTTPS; `None` when `admin.tls = "off"`.
+    pub tls: Option<Arc<crate::admin_tls::AdminTls>>,
 }
 
-/// Spawn the admin HTTP server on 127.0.0.1:port. Never binds to a public
-/// address even if config asked for one — that would be a footgun.
-pub fn spawn_admin(state: WebState, port: u16) {
+// ── Access control ───────────────────────────────────────────────────────────
+
+/// Is this state-changing request from another site?
+///
+/// `Sec-Fetch-Site`, when the browser sends it (HTTPS and loopback only),
+/// decides: `same-origin` and `none` (typed or bookmarked) pass, anything
+/// else is refused. Otherwise `Origin` must name this host; `null` is refused.
+/// The panel sends `Referrer-Policy: same-origin`, under which a browser puts
+/// the real origin on its own same-origin POSTs and `null` on cross-origin
+/// ones. (Under `no-referrer` it would send `null` for both, and no form
+/// could be submitted.) Requests with neither header (curl, scripts) are let
+/// through: they do not carry a victim's cookie.
+fn cross_site(headers: &HeaderMap) -> bool {
+    if let Some(v) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
+        return !matches!(v.trim(), "same-origin" | "none");
+    }
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let origin_host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
+    !origin_host.trim().eq_ignore_ascii_case(host.trim())
+}
+
+/// Is the `Host` header one this panel answers to?
+///
+/// This stops DNS rebinding: a page on `evil.example` re-points its own name
+/// at 127.0.0.1 and then talks to the panel through the SSH tunnel as a
+/// same-origin page, so `Origin` and `Host` agree and no login stands in the
+/// way when none is configured. Its requests still say `Host: evil.example`.
+/// An IP literal, `localhost` and the configured `admin.tls_names` are
+/// accepted; any other name is refused.
+fn host_allowed(headers: &HeaderMap, admin: &crate::config::AdminConfig) -> bool {
+    let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
+        return false;
+    };
+    let host = host.trim();
+    // "[v6]:port", "[v6]", "v4:port", "name:port", "name"
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inside, _)) => inside,
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.parse::<std::net::IpAddr>().is_ok()
+        || name == "localhost"
+        || admin
+            .tls_names
+            .iter()
+            .any(|n| n.trim().trim_end_matches('.').eq_ignore_ascii_case(&name))
+}
+
+/// Every request passes here: Host check, CSRF check, login check, security
+/// headers.
+async fn guard(
+    State(s): State<WebState>,
+    ConnectInfo(_peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !host_allowed(req.headers(), &s.config.admin) {
+        return (
+            StatusCode::MISDIRECTED_REQUEST,
+            "unknown Host: open the panel by IP address, localhost, or a name in \
+             admin.tls_names\n",
+        )
+            .into_response();
+    }
+    let state_changing = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if state_changing && cross_site(req.headers()) {
+        return (StatusCode::FORBIDDEN, "cross-site request refused\n").into_response();
+    }
+    if let Some(auth) = &s.auth {
+        let path = req.uri().path();
+        let open = path == "/login";
+        let token = req
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| crate::admin_auth::cookie_token(c, crate::admin_auth::cookie_name(s.tls.is_some())));
+        let ok = token.is_some_and(|t| auth.session_valid(t, std::time::Instant::now()));
+        if !open && !ok {
+            return if path.starts_with("/api/") {
+                (StatusCode::UNAUTHORIZED, "login required\n").into_response()
+            } else {
+                (StatusCode::SEE_OTHER, [(header::LOCATION, "/login")]).into_response()
+            };
+        }
+    }
+    let mut resp = next.run(req).await;
+    let h = resp.headers_mut();
+    // The panel never needs to be framed, sniffed or to leak its URLs to
+    // other sites. `same-origin`, not `no-referrer`: see `cross_site`.
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    resp
+}
+
+fn session_cookie(value: &str, max_age: u64, secure: bool) -> HeaderValue {
+    // `Secure` over HTTPS: the browser then never sends the cookie in clear.
+    let secure = if secure { "; Secure" } else { "" };
+    HeaderValue::from_str(&format!(
+        "{}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}{secure}",
+        crate::admin_auth::cookie_name(!secure.is_empty())
+    ))
+    .expect("cookie is ASCII")
+}
+
+fn login_html(message: &str) -> Html<String> {
+    Html(LOGIN_HTML.replace("{{MESSAGE}}", message))
+}
+
+async fn login_page(State(s): State<WebState>) -> Response {
+    if s.auth.is_none() {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    }
+    login_html("").into_response()
+}
+
+async fn login_submit(
+    State(s): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    body: axum::body::Body,
+) -> Response {
+    use crate::admin_auth::Login;
+    let Some(auth) = &s.auth else {
+        return (StatusCode::SEE_OTHER, [(header::LOCATION, "/")]).into_response();
+    };
+    // Anyone can reach this handler. A form with one password field fits in a
+    // few hundred bytes; a body that is larger, or arrives slowly, is someone
+    // trying to hold a connection open.
+    let bytes = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        axum::body::to_bytes(body, 4096),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        _ => return (StatusCode::PAYLOAD_TOO_LARGE, "login form too large or too slow\n").into_response(),
+    };
+    let body = String::from_utf8_lossy(&bytes);
+    let password = crate::admin_auth::form_password(&body).unwrap_or_default();
+    match auth.login(peer.ip(), password).await {
+        Login::Ok(token) => {
+            info!(ip = %peer.ip(), "admin login");
+            let ttl = crate::admin_auth::SESSION_TTL.as_secs();
+            (
+                StatusCode::SEE_OTHER,
+                [
+                    (header::LOCATION, HeaderValue::from_static("/")),
+                    (header::SET_COOKIE, session_cookie(&token, ttl, s.tls.is_some())),
+                ],
+            )
+                .into_response()
+        }
+        Login::Wrong => {
+            warn!(ip = %peer.ip(), "admin login: wrong password");
+            (StatusCode::UNAUTHORIZED, login_html("Wrong password.")).into_response()
+        }
+        Login::Busy => (
+            StatusCode::TOO_MANY_REQUESTS,
+            login_html("Too many logins at once. Try again in a few seconds."),
+        )
+            .into_response(),
+        Login::Locked(wait) => {
+            let mins = wait.as_secs().div_ceil(60);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                login_html(&format!(
+                    "Too many wrong passwords from this address. Try again in {mins} min."
+                )),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn logout(State(s): State<WebState>, headers: HeaderMap) -> Response {
+    if let (Some(auth), Some(tok)) = (
+        &s.auth,
+        headers
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|c| crate::admin_auth::cookie_token(c, crate::admin_auth::cookie_name(s.tls.is_some()))),
+    ) {
+        auth.logout(tok);
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, HeaderValue::from_static("/login")),
+            (header::SET_COOKIE, session_cookie("", 0, s.tls.is_some())),
+        ],
+    )
+        .into_response()
+}
+
+const LOGIN_HTML: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ed2k-server admin — log in</title>
+<style>
+body{background:#111827;color:#e5e7eb;font-family:system-ui,sans-serif;display:flex;
+     align-items:center;justify-content:center;min-height:100vh;margin:0}
+form{background:#1f2937;padding:28px 32px;border-radius:8px;min-width:280px}
+h1{font-size:1.1rem;margin:0 0 16px}
+input{width:100%;box-sizing:border-box;padding:8px;margin:6px 0 14px;border-radius:4px;
+      border:1px solid #374151;background:#111827;color:#e5e7eb}
+button{width:100%;padding:8px;border:0;border-radius:4px;background:#2563eb;color:#fff;cursor:pointer}
+.msg{color:#f87171;font-size:.85rem;min-height:1.2em}
+</style></head><body>
+<form method="post" action="/login">
+  <h1>ed2k-server admin</h1>
+  <label for="pw">Password</label>
+  <input id="pw" name="password" type="password" autocomplete="current-password" autofocus required>
+  <div class="msg">{{MESSAGE}}</div>
+  <button type="submit">Log in</button>
+</form>
+</body></html>
+"#;
+
+/// Most connections the panel holds at once, and per client address (IPv6:
+/// per /64). A browser opens about six to one host.
+const ADMIN_MAX_CONNS: usize = 64;
+const ADMIN_MAX_CONNS_PER_IP: u32 = 16;
+
+/// Serve the panel, over HTTPS when `tls` is set.
+///
+/// This is the accept loop `axum::serve` would run, written out so that every
+/// connection, with or without TLS, gets the same limits: a cap overall and
+/// per address, a TLS handshake deadline, a deadline for each request's
+/// headers, and a lifetime after which the browser simply reconnects. Without
+/// them a few dozen slow connections would lock the operator out of a panel
+/// that anyone can reach.
+async fn serve_admin(
+    listener: TcpListener,
+    app: Router,
+    tls: Option<Arc<crate::admin_tls::AdminTls>>,
+    admin: Arc<crate::config::AdminConfig>,
+) {
+    use std::collections::HashMap;
+    use std::time::Duration;
+    let slots = Arc::new(tokio::sync::Semaphore::new(ADMIN_MAX_CONNS));
+    let per_ip: Arc<std::sync::Mutex<HashMap<std::net::IpAddr, u32>>> = Arc::default();
+    struct Held(Arc<std::sync::Mutex<HashMap<std::net::IpAddr, u32>>>, std::net::IpAddr);
+    impl Drop for Held {
+        fn drop(&mut self) {
+            let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = m.get_mut(&self.1) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&self.1);
+                }
+            }
+        }
+    }
+    let key = |ip: std::net::IpAddr| match ip {
+        std::net::IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        other => other,
+    };
+    loop {
+        let (tcp, peer) = match listener.accept().await {
+            Ok(x) => x,
+            Err(e) => {
+                warn!(error = %e, "admin accept failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue; // dropped: closes the socket
+        };
+        let k = key(peer.ip());
+        {
+            let mut m = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let n = m.entry(k).or_insert(0);
+            if *n >= ADMIN_MAX_CONNS_PER_IP {
+                continue;
+            }
+            *n += 1;
+        }
+        let held = Held(per_ip.clone(), k);
+        let app = app.clone();
+        let tls = tls.clone();
+        let admin = admin.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _held = held;
+            let life = Duration::from_secs(300);
+            match tls {
+                Some(tls) => {
+                    // A TLS connection opens with a handshake record (0x16).
+                    // Anything else on this port is a browser that was given
+                    // http://: send it to https:// on the same port.
+                    let mut first = [0u8; 1];
+                    let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_secs(10), tcp.peek(&mut first)).await
+                    else {
+                        return;
+                    };
+                    if n == 1 && first[0] != 0x16 {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(10),
+                            redirect_plain_http(tcp, &admin),
+                        )
+                        .await;
+                        return;
+                    }
+                    let accept = tls.acceptor.accept(tcp);
+                    let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(10), accept).await
+                    else {
+                        // Plain HTTP on the HTTPS port, a scanner, a browser that
+                        // refused the certificate: nothing worth a log line each.
+                        return;
+                    };
+                    let _ = tokio::time::timeout(life, serve_conn(stream, app, peer)).await;
+                }
+                None => {
+                    let _ = tokio::time::timeout(life, serve_conn(tcp, app, peer)).await;
+                }
+            }
+        });
+    }
+}
+
+/// Answer a plain-HTTP request on the HTTPS port with a redirect to
+/// `https://<Host><path>`. Only a `Host` the panel answers to is used (the
+/// same check as for every request), so the redirect cannot be pointed
+/// elsewhere. 302, not 301: a browser would cache a 301 for good and keep
+/// trying https:// after `admin.tls` is turned off again.
+async fn redirect_plain_http(mut tcp: tokio::net::TcpStream, admin: &crate::config::AdminConfig) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(4).any(|w| w == b"\r\n\r\n") && buf.len() < 4096 {
+        match tcp.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    const BODY: &str = "This panel is served over HTTPS.\n";
+    let resp = match redirect_target(&buf, admin) {
+        Some(loc) => format!(
+            "HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+            BODY.len()
+        ),
+        None => format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+            BODY.len()
+        ),
+    };
+    let _ = tcp.write_all(resp.as_bytes()).await;
+    let _ = tcp.shutdown().await;
+}
+
+/// The `https://` URL for a plain-HTTP request head, or `None` when the
+/// request is not one we redirect (no or unknown `Host`, not origin-form).
+fn redirect_target(head: &[u8], admin: &crate::config::AdminConfig) -> Option<String> {
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    let mut parts = lines.next()?.split(' ');
+    let method = parts.next()?;
+    let target = parts.next()?;
+    if !matches!(method, "GET" | "HEAD") {
+        return None;
+    }
+    // Origin-form only: "/path?query". Not "//host" or an absolute URL.
+    let path = if target.starts_with('/') && !target.starts_with("//") {
+        target
+    } else {
+        "/"
+    };
+    if !path.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let host = lines
+        .take_while(|l| !l.is_empty())
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case("host").then(|| v.trim())
+        })?;
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_graphic()) {
+        return None;
+    }
+    let mut h = HeaderMap::new();
+    h.insert(header::HOST, HeaderValue::from_str(host).ok()?);
+    if !host_allowed(&h, admin) {
+        return None;
+    }
+    Some(format!("https://{host}{path}"))
+}
+
+/// One HTTP/1.1 connection, with the peer address where `ConnectInfo` finds it.
+async fn serve_conn<I>(io: I, app: Router, peer: SocketAddr)
+where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use tower::Service;
+    let svc = hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let mut app = app.clone();
+        async move { app.call(req.map(axum::body::Body::new)).await }
+    });
+    let _ = hyper::server::conn::http1::Builder::new()
+        .timer(TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30))
+        .serve_connection(TokioIo::new(io), svc)
+        .await;
+}
+
+/// Spawn the admin HTTP server on `admin.bind:admin.port`. `Config::validate`
+/// has already refused a non-loopback address without a password.
+pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
+    let port = admin.port;
+    let ip = admin.bind_addr();
+    let admin_cfg = Arc::new(admin);
     tokio::spawn(async move {
         let app = Router::new()
             .route("/", get(dashboard))
@@ -216,15 +647,39 @@ pub fn spawn_admin(state: WebState, port: u16) {
             .route("/api/review", get(api_review))
             .route("/api/updates", get(api_updates_status))
             .route("/api/update", post(api_update_run))
-            .with_state(state);
+            .route("/login", get(login_page).post(login_submit))
+            .route("/logout", post(logout))
+            .layer(middleware::from_fn_with_state(state.clone(), guard))
+            .with_state(state.clone());
 
-        let bind = format!("127.0.0.1:{port}");
-        match TcpListener::bind(&bind).await {
-            Ok(listener) => {
-                info!(addr = %bind, "admin web UI listening (localhost only)");
-                if let Err(e) = axum::serve(listener, app).await {
-                    warn!(error = %e, "admin web server stopped");
+        let bind = SocketAddr::new(ip, port);
+        if let Some(tls) = state.tls.clone() {
+            match TcpListener::bind(bind).await {
+                Ok(listener) => {
+                    info!(addr = %bind, login = state.auth.is_some(),
+                          fingerprint = %tls.fingerprint(),
+                          "admin web UI listening over HTTPS. Before accepting the certificate \
+                           in a browser, check that it shows this SHA-256 fingerprint");
+                    serve_admin(listener, app, Some(tls), admin_cfg.clone()).await;
                 }
+                Err(e) => warn!(addr = %bind, error = %e, "admin web bind failed — UI disabled"),
+            }
+            return;
+        }
+        match TcpListener::bind(bind).await {
+            Ok(listener) => {
+                if ip.is_loopback() {
+                    info!(addr = %bind, login = state.auth.is_some(),
+                          "admin web UI listening (loopback only)");
+                } else {
+                    warn!(
+                        addr = %bind,
+                        "admin web UI listening on an address other machines can reach, \
+                         over plain HTTP: the password (at login) and the session cookie \
+                         travel unencrypted. Set admin.tls = \"self-signed\", or use a VPN."
+                    );
+                }
+                serve_admin(listener, app, None, admin_cfg.clone()).await;
             }
             Err(e) => {
                 warn!(addr = %bind, error = %e, "admin web bind failed — UI disabled");
@@ -247,6 +702,10 @@ struct StatusResp {
     file_count: u64,
     keyword_count: u64,
     seckey_hex: String,
+    /// The panel asks for a password; the page then shows a log-out button.
+    login_required: bool,
+    /// SHA-256 of the HTTPS certificate in use, when the panel serves HTTPS.
+    tls_fingerprint: Option<String>,
     /// Diagnostics: sizes of the previously-unbounded IP-keyed caches, plus the
     /// current flood-bot ban count. Surfaced so RAM growth can be watched live.
     obf_decode_cache_entries: u64,
@@ -262,7 +721,10 @@ struct StatusResp {
     natt_coordinated: u64,
 }
 
-async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
+async fn api_status(
+    State(s): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Json<StatusResp> {
     Json(StatusResp {
         server_name: s.config.server.name.clone(),
         description: s.config.server.desc.clone(),
@@ -283,7 +745,16 @@ async fn api_status(State(s): State<WebState>) -> Json<StatusResp> {
             .load(std::sync::atomic::Ordering::Relaxed) as u64,
         file_count: s.server.file_slab.live_count() as u64,
         keyword_count: s.server.keyword_index.keyword_count() as u64,
-        seckey_hex: s.seckey_hex.clone(),
+        // The server key identifies this server in obfuscated gossip and is
+        // what the update service's access key is derived from. Shown only on
+        // the machine itself (an SSH tunnel arrives from loopback).
+        seckey_hex: if peer.ip().is_loopback() {
+            s.seckey_hex.clone()
+        } else {
+            "(shown only on loopback)".into()
+        },
+        login_required: s.auth.is_some(),
+        tls_fingerprint: s.tls.as_ref().map(|t| t.fingerprint()),
         obf_decode_cache_entries: s.server.obf_decode_cache.len() as u64,
         incoming_seed_challenges_entries: s.server.incoming_seed_challenges.len() as u64,
         banned_bots: s.server.banned_bots.len() as u64,
@@ -890,9 +1361,11 @@ async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
             PeerRow {
                 ip: addr.ip().to_string(),
                 port: addr.port(),
-                has_server_key: s.server.seed_server_keys.contains_key(addr.ip()),
-                verified: s.server.verified_servers.contains_key(addr.ip())
-                    || s.server.seed_server_keys.contains_key(addr.ip()),
+                // Per server (ip:port), not per IP: with several servers behind
+                // one address, one answering must not mark the others.
+                has_server_key: s.server.seed_server_keys.contains_key(addr),
+                verified: s.server.verified_sockets.contains_key(addr)
+                    || s.server.seed_server_keys.contains_key(addr),
                 country: geo.lookup(*addr.ip()).map(|(c, _)| c),
                 name: info.name,
                 desc: info.desc,
@@ -923,7 +1396,10 @@ async fn asset_flags_font() -> impl IntoResponse {
 
 /// What the Updates panel needs to draw itself: per-file URL, whether it can be
 /// merged, and what is on disk right now.
-async fn api_updates_status(State(s): State<WebState>) -> Json<serde_json::Value> {
+async fn api_updates_status(
+    State(s): State<WebState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Json<serde_json::Value> {
     use crate::updates::Target;
     let u = &s.config.updates;
 
@@ -949,7 +1425,14 @@ async fn api_updates_status(State(s): State<WebState>) -> Json<serde_json::Value
     // The access key is derived, not stored, so it can be shown: it is the same
     // number this server already hands the reference peer during the obfuscated
     // handshake. Seeing it is what makes a 403 diagnosable from this page.
-    let key = access_key_hex(&s);
+    //
+    // Only on loopback, like the server key it is derived from: it is the
+    // credential the update service accepts from this address.
+    let key = if peer.ip().is_loopback() {
+        access_key_hex(&s)
+    } else {
+        Some("(shown only on loopback)".into())
+    };
 
     Json(serde_json::json!({
         "enabled": u.enabled,
@@ -1281,8 +1764,18 @@ async fn api_config_set(
     if old.network.tcp_port != new_cfg.network.tcp_port {
         restart_needed.push("network.tcp_port".into());
     }
-    if old.admin.port != new_cfg.admin.port || old.admin.enabled != new_cfg.admin.enabled {
-        restart_needed.push("admin.port / admin.enabled".into());
+    if old.admin.port != new_cfg.admin.port
+        || old.admin.enabled != new_cfg.admin.enabled
+        || old.admin.bind != new_cfg.admin.bind
+        || old.admin.password_hash != new_cfg.admin.password_hash
+        || old.admin.tls != new_cfg.admin.tls
+        || old.admin.tls_cert != new_cfg.admin.tls_cert
+        || old.admin.tls_key != new_cfg.admin.tls_key
+        || old.admin.tls_ca_cert != new_cfg.admin.tls_ca_cert
+        || old.admin.tls_ca_key != new_cfg.admin.tls_ca_key
+        || old.admin.tls_names != new_cfg.admin.tls_names
+    {
+        restart_needed.push("admin.port / enabled / bind / password_hash / tls*".into());
     }
     // [admission] is restart-only (issue #25). The open-socket ceiling also
     // derives from limits.max_clients when it is not set, so raising
@@ -1297,7 +1790,26 @@ async fn api_config_set(
 
     // 3. Write to tempfile + atomic rename.
     let tmp_path = format!("{}.tmp", s.config_path);
-    if let Err(e) = std::fs::write(&tmp_path, &req.content) {
+    // Keep the original file's permissions: config.toml may hold the admin
+    // password hash and the update export token, and a fresh file would get
+    // the process umask (typically world-readable).
+    let mode = std::fs::metadata(&s.config_path).ok().map(|m| m.permissions());
+    let _ = std::fs::remove_file(&tmp_path);
+    let write = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(req.content.as_bytes())?;
+        if let Some(m) = &mode {
+            f.set_permissions(m.clone())?;
+        }
+        f.sync_all()
+    })();
+    if let Err(e) = write {
         return Json(ConfigSetResp {
             ok: false,
             error: Some(format!("write tempfile failed: {}", e)),
@@ -2564,6 +3076,9 @@ tr:hover td{background:#1e2035}
   <span>🖥</span>
   <h1>ed2k-server</h1>
   <div class="ver" id="hdr-ver">loading...</div>
+  <form id="logout" method="post" action="/logout" style="display:none;margin-left:auto">
+    <button type="submit" style="background:none;border:1px solid #4b5563;color:#9ca3af;border-radius:4px;padding:2px 10px;cursor:pointer">Log out</button>
+  </form>
 </header>
 <nav>
   <button class="active" onclick="showTab('status',this)">Status</button>
@@ -2750,6 +3265,13 @@ tr:hover td{background:#1e2035}
 <div style="padding:0 20px 14px;font-size:.68rem;color:#374151;text-align:right">Flag images: <a href="https://github.com/twitter/twemoji" style="color:#4b5563">Twemoji</a>, CC-BY 4.0</div>
 
 <script>
+// A session that expired (or a server restart) answers 401: go to the login.
+const _fetch = window.fetch.bind(window);
+window.fetch = async (...a) => {
+  const r = await _fetch(...a);
+  if (r.status === 401) location.href = '/login';
+  return r;
+};
 let currentTab = 'status';
 function showTab(name, btn) {
   const changed = name !== currentTab;
@@ -2784,6 +3306,7 @@ async function refreshStatus() {
     fetch('/api/stats').then(r=>r.json()),
   ]);
   document.getElementById('hdr-ver').textContent = st.server_name + ' v' + st.version;
+  document.getElementById('logout').style.display = st.login_required ? '' : 'none';
   document.getElementById('cards').innerHTML =
     card('Clients', fmt(st.client_count), st.low_id_count + ' Low ID') +
     card('Files', fmt(st.file_count), 'in index') +
@@ -2795,6 +3318,7 @@ async function refreshStatus() {
      <tr><td>Server IP</td><td>${st.public_ip || '(auto)'}</td></tr>
      <tr><td>TCP Port</td><td>${st.tcp_port}</td></tr>
      <tr><td>Seckey</td><td><code style="font-size:.75rem">${st.seckey_hex}</code></td></tr>
+     ${st.tls_fingerprint ? `<tr><td>HTTPS certificate</td><td><code style="font-size:.7rem">${st.tls_fingerprint}</code> <span style="color:#6b7280;font-size:.75rem">SHA-256; the browser shows the same when the connection is genuine</span></td></tr>` : ''}
      <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
@@ -3246,6 +3770,8 @@ mod highid_mismatch_endpoint_tests {
             config_path: String::new(),
             reload_flag: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cached_public_ip: String::new(),
+            auth: None,
+            tls: None,
         }
     }
 
@@ -3410,5 +3936,93 @@ mod client_search_tests {
         assert!(!ClientQuery::parse("software=aMule").matches(&c));
         assert!(!ClientQuery::parse("id=low").matches(&c));
         assert!(!ClientQuery::parse("ipv6=1").matches(&c));
+    }
+}
+
+#[cfg(test)]
+mod cross_site_tests {
+    use super::*;
+
+    fn h(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(*k, HeaderValue::from_str(v).unwrap());
+        }
+        m
+    }
+
+    #[test]
+    fn own_form_over_plain_http_passes() {
+        // Plain HTTP to a public IP: no Sec-Fetch-*, real Origin under
+        // Referrer-Policy: same-origin.
+        assert!(!cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "http://85.17.116.222:8080")])));
+    }
+
+    #[test]
+    fn sec_fetch_site_decides_when_present() {
+        // A browser under an old no-referrer page may send Origin: null with
+        // same-origin; Sec-Fetch-Site wins.
+        assert!(!cross_site(&h(&[("host", "127.0.0.1:8080"), ("origin", "null"), ("sec-fetch-site", "same-origin")])));
+        assert!(!cross_site(&h(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", "none")])));
+        assert!(cross_site(&h(&[("host", "127.0.0.1:8080"), ("origin", "http://127.0.0.1:8080"), ("sec-fetch-site", "cross-site")])));
+        assert!(cross_site(&h(&[("host", "127.0.0.1:8080"), ("sec-fetch-site", "same-site")])));
+    }
+
+    #[test]
+    fn foreign_or_null_origin_refused_without_sec_fetch() {
+        assert!(cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "http://evil.example")])));
+        assert!(cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "http://85.17.116.222:8081")])));
+        assert!(cross_site(&h(&[("host", "85.17.116.222:8080"), ("origin", "null")])));
+    }
+
+    #[test]
+    fn scripts_without_browser_headers_pass() {
+        assert!(!cross_site(&h(&[("host", "127.0.0.1:8080")])));
+    }
+}
+
+#[cfg(test)]
+mod https_redirect_tests {
+    use super::*;
+
+    fn admin(names: &[&str]) -> crate::config::AdminConfig {
+        let mut a = crate::config::AdminConfig::default();
+        a.tls_names = names.iter().map(|s| s.to_string()).collect();
+        a
+    }
+
+    #[test]
+    fn keeps_host_and_path() {
+        let a = admin(&[]);
+        assert_eq!(
+            redirect_target(b"GET /login HTTP/1.1\r\nHost: 85.17.116.222:8080\r\n\r\n", &a).as_deref(),
+            Some("https://85.17.116.222:8080/login")
+        );
+        assert_eq!(
+            redirect_target(b"GET / HTTP/1.1\r\nhost: [2001:db8::1]:8080\r\n\r\n", &a).as_deref(),
+            Some("https://[2001:db8::1]:8080/")
+        );
+        assert_eq!(
+            redirect_target(b"GET /x HTTP/1.1\r\nHost: panel.example\r\n\r\n", &admin(&["panel.example"]))
+                .as_deref(),
+            Some("https://panel.example/x")
+        );
+    }
+
+    #[test]
+    fn refuses_unknown_host_and_odd_requests() {
+        let a = admin(&[]);
+        assert!(redirect_target(b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n", &a).is_none());
+        assert!(redirect_target(b"GET / HTTP/1.0\r\n\r\n", &a).is_none());
+        assert!(redirect_target(b"POST /login HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n", &a).is_none());
+        // Absolute or protocol-relative targets never become the Location path.
+        assert_eq!(
+            redirect_target(b"GET //evil.example/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n", &a).as_deref(),
+            Some("https://1.2.3.4/")
+        );
+        assert_eq!(
+            redirect_target(b"GET http://evil.example/ HTTP/1.1\r\nHost: 1.2.3.4\r\n\r\n", &a).as_deref(),
+            Some("https://1.2.3.4/")
+        );
     }
 }

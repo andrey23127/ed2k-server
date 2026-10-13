@@ -573,25 +573,35 @@ pub struct ServerState {
     /// Our latest outgoing random_part sent to each seed via OBF ping.
     /// The seed encrypts its responses (0xA1, 0x97) using this value as the
     /// ServerKey. We need it to decrypt those responses in the UDP handler.
-    /// Keyed by seed IPv4 address, updated each time we send an OBF ping.
+    /// Keyed by the seed SERVER (IPv4 address and TCP port), updated each time
+    /// we send it an OBF ping. Not by address alone: several servers can run
+    /// behind one IP, and the ping to one of them used to overwrite the
+    /// random part the reply of another one needed.
     ///
     /// Value carries the time it was stored so the map can be aged out: it is
     /// keyed by arbitrary remote addresses and had no eviction, so it grew for
     /// the life of the process. Expiring an entry costs one extra handshake with
     /// that peer and nothing else.
-    pub our_sent_random_parts: DashMap<std::net::Ipv4Addr, (u32, Instant)>,
+    pub our_sent_random_parts: DashMap<SocketAddrV4, (u32, Instant)>,
     /// Per-seed ServerKey for outbound obfuscated UDP. A seed tells us the
     /// key to use when talking to it via the ServerKey field of an obfuscated
-    /// GLOBSERVSTATRES. Keyed by the seed's IPv4 address. Empty until the
-    /// first obfuscated 0x97 arrives — gossip falls back to plain UDP until then.
-    pub seed_server_keys: DashMap<std::net::Ipv4Addr, u32>,
+    /// GLOBSERVSTATRES. Empty until the first obfuscated 0x97 arrives — gossip
+    /// falls back to plain UDP until then.
+    ///
+    /// Keyed by the seed SERVER, IPv4 address and TCP port. Every server
+    /// derives its key from its own seckey, so two instances behind one IP
+    /// have two different keys; keyed by IP alone, the last one learned
+    /// replaced the other, and obfuscated gossip to every other instance on
+    /// that address went out under the wrong key.
+    pub seed_server_keys: DashMap<SocketAddrV4, u32>,
     /// Latest challenge a Lugdunum peer sent us in its 0x96 probe. Lugdunum's
     /// 0x97 handler validates that the echoed challenge matches `entry+0x28`
     /// (the chal it stored when it sent its 0x96). For our obfuscated 0x97
     /// reply to be accepted (and our ServerKey extracted), we must echo the
     /// SAME chal seed sent in its most recent 0x96. handle_servstat fills
-    /// this map; gossip Phase 3 reads from it.
-    pub incoming_seed_challenges: DashMap<std::net::Ipv4Addr, u32>,
+    /// this map; gossip Phase 3 reads from it. Keyed by the seed server
+    /// (address and TCP port), for the same reason as `seed_server_keys`.
+    pub incoming_seed_challenges: DashMap<SocketAddrV4, u32>,
     /// Last external UDP port we observed a given client IP send from (i.e. the
     /// post-NAT source port of a real UDP packet to us, e.g. OP_GLOB_GETSOURCES).
     /// Used to improve LowID↔LowID hole punching: a client behind a NAT announces
@@ -691,7 +701,7 @@ pub struct ServerState {
     /// UDP datagram from a given sender. formula_id: 0=Plain, 1=ObfA5, 2=Obf6B.
     /// Massively reduces CPU on the hot path: a busy peer that sends many obf
     /// packets only triggers ONE decode attempt per packet instead of 9.
-    pub obf_decode_cache: DashMap<std::net::Ipv4Addr, (u32, u8)>,
+    pub obf_decode_cache: DashMap<SocketAddrV4, (u32, u8)>,
     /// Hot-reloadable config snapshot. Updated by `POST /api/config`. Handlers
     /// that need live values (limits, server name/desc, version, this_ip, log)
     /// read `state.live_cfg.load()` instead of using a fixed Arc<Config>.
@@ -1045,6 +1055,35 @@ impl ServerState {
     /// 24h window. Cheap — one DashMap insert. Called from the bot detector.
     /// The `bot_ban` block_stats counter is bumped only on the not-banned →
     /// banned transition, so it reflects distinct ban events, not refreshes.
+    /// Every ServerKey we hold for servers at `ip`, with their TCP ports. More
+    /// than one when several servers share the address. Scans the map: it
+    /// holds one entry per peer server (hundreds at most) and this runs only
+    /// on the cold paths (an obfuscated datagram missing the decode cache, an
+    /// 0xA1 from a sender to check).
+    pub fn seed_keys_for_ip(&self, ip: std::net::Ipv4Addr) -> Vec<(u16, u32)> {
+        self.seed_server_keys
+            .iter()
+            .filter(|e| *e.key().ip() == ip)
+            .map(|e| (e.key().port(), *e.value()))
+            .collect()
+    }
+
+    /// Every random part of an OBF ping we sent to servers at `ip`.
+    pub fn sent_random_parts_for_ip(&self, ip: std::net::Ipv4Addr) -> Vec<(u16, u32)> {
+        self.our_sent_random_parts
+            .iter()
+            .filter(|e| *e.key().ip() == ip)
+            .map(|e| (e.key().port(), e.value().0))
+            .collect()
+    }
+
+    /// Have we completed (or started) an obfuscated handshake with any
+    /// server at `ip`?
+    pub fn is_gossiped_ip(&self, ip: std::net::Ipv4Addr) -> bool {
+        self.seed_server_keys.iter().any(|e| *e.key().ip() == ip)
+            || self.our_sent_random_parts.iter().any(|e| *e.key().ip() == ip)
+    }
+
     pub fn ban_bot(&self, ip: std::net::IpAddr) {
         let was_new = self
             .banned_bots
@@ -1745,6 +1784,7 @@ impl ServerState {
             (cap * (key + val + 1)) as u64
         }
         const IPV4: usize = 4;
+        const SOCKV4: usize = size_of::<SocketAddrV4>();
         const IPADDR: usize = size_of::<std::net::IpAddr>();
         const UHASH: usize = 16;
         const INSTANT: usize = 16;
@@ -1822,16 +1862,16 @@ impl ServerState {
         };
 
         let mut misc = 0u64;
-        misc += dm_slots(self.our_sent_random_parts.capacity(), IPV4, 4 + INSTANT);
-        misc += dm_slots(self.seed_server_keys.capacity(), IPV4, 4);
-        misc += dm_slots(self.incoming_seed_challenges.capacity(), IPV4, 4);
+        misc += dm_slots(self.our_sent_random_parts.capacity(), SOCKV4, 4 + INSTANT);
+        misc += dm_slots(self.seed_server_keys.capacity(), SOCKV4, 4);
+        misc += dm_slots(self.incoming_seed_challenges.capacity(), SOCKV4, 4);
         misc += dm_slots(self.observed_udp_ports.capacity(), IPV4, 2 + INSTANT);
         misc += dm_slots(self.recent_client_ips.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.verified_servers.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.csam_unique_ips.capacity(), IPADDR, 8);
         misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 16);
-        misc += dm_slots(self.obf_decode_cache.capacity(), IPV4, 5);
+        misc += dm_slots(self.obf_decode_cache.capacity(), SOCKV4, 5);
         misc += dm_slots(self.banned_bots.capacity(), IPADDR, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
         misc += dm_slots(self.bot_query_log.capacity(), IPADDR, size_of::<BotTracker>());
@@ -2652,5 +2692,30 @@ mod ip_slot_tests {
             let slots: Vec<_> = (0..5).map(|_| st.try_acquire_ip_slot(ip, 1)).collect();
             assert!(slots.iter().all(|s| s.is_some()));
         }
+    }
+}
+
+#[cfg(test)]
+mod several_servers_per_ip {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn keys_are_kept_per_server_not_per_address() {
+        let st = ServerState::for_test();
+        let ip = Ipv4Addr::new(203, 0, 113, 7);
+        let a = SocketAddrV4::new(ip, 4232);
+        let b = SocketAddrV4::new(ip, 4661);
+        st.seed_server_keys.insert(a, 0xAAAA_AAAA);
+        st.seed_server_keys.insert(b, 0xBBBB_BBBB);
+        assert_eq!(st.seed_server_keys.get(&a).map(|k| *k), Some(0xAAAA_AAAA));
+        assert_eq!(st.seed_server_keys.get(&b).map(|k| *k), Some(0xBBBB_BBBB));
+        let mut all = st.seed_keys_for_ip(ip);
+        all.sort();
+        assert_eq!(all, vec![(4232, 0xAAAA_AAAA), (4661, 0xBBBB_BBBB)]);
+        assert!(st.is_gossiped_ip(ip));
+        assert!(!st.is_gossiped_ip(Ipv4Addr::new(203, 0, 113, 8)));
+        st.our_sent_random_parts.insert(SocketAddrV4::new(ip, 5555), (7, Instant::now()));
+        assert_eq!(st.sent_random_parts_for_ip(ip), vec![(5555, 7)]);
     }
 }
