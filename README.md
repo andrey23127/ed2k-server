@@ -910,6 +910,21 @@ usual server message is sent once, and the connection stays up.
 There is no acknowledgement packet in v1: a client cannot tell which records
 were indexed (filtered, over budget) and should not try to infer it.
 
+**Re-offers.** A record for a hash the connection already sources (after a
+rename, or to mark a download complete) refreshes that source, including its
+complete/partial state, and takes no slot of the soft budget. It is still a
+record: it counts toward `batch_max` and is charged to both pacers like any
+other. Which name the file is indexed and searched under is this server's own
+behaviour, not part of the contract: today it keeps the name the file was first
+indexed under.
+
+**Versioning.** The numbers are configuration, not contract: a client uses
+what the server advertised on that connection. The rules above are fixed for
+version 1. The client's login tag names the highest version it implements; the
+server answers with the version it applies, never above the client's (this
+server: `1` to any request of 1 or more). Any incompatible change would be a
+new version, so a client implementing 1 keeps getting exactly these rules.
+
 The Status tab shows the active policy and its counters: logins that asked,
 sessions advertised,
 batches and records, how often and how long batches waited for their own pace
