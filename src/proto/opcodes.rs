@@ -42,6 +42,10 @@ pub const OP_LOWID_HOLEPUNCH_INFO: u8 = 0x61;
 //   reason: 1 = target not connected, 2 = target is HighID (no punch needed),
 //           3 = requester not logged in / invalid
 pub const OP_LOWID_HOLEPUNCH_FAIL: u8 = 0x62;
+// Client→server (issue #34): the client's IPv6 changed during the session.
+//   payload: 16 raw bytes, the new address, or all zeros to withdraw it.
+// Sent only to a server that set `SRVFLG_IPV6_UPDATE` in OP_IDCHANGE.
+pub const OP_IPV6_UPDATE: u8 = 0x63;
 
 // Server → Client (TCP)
 pub const OP_REJECT: u8 = 0x05;
@@ -167,13 +171,13 @@ pub const SRVFLG_SUPPORTCRYPT: u32 = 0x0800;
 /// | 0x0008 | NEWTAGS | all 987 tags in a 245-result capture use the 0x80 form |
 /// | 0x0010 | UNICODE | non-ASCII filenames decode as valid UTF-8 in replies |
 /// | 0x0020 | EXT_GETSOURCES2 | 0x94 records walked correctly (fixed in 0.9.71) |
-/// | 0x0040 | RELATEDSEARCH | NOT implemented — kept pending a decision |
-/// | 0x0080 | TYPETAGINTEGER | FT_FILETYPE emitted as an integer in both result paths |
 /// | 0x0100 | LARGEFILES | FT_FILESIZE_HI emitted; 17 GiB file observed correct |
 /// | 0x0200 | UDPOBFUSCATION | the large majority of our UDP output is obfuscated |
 /// | 0x0400 | TCPOBFUSCATION | handshake verified by capture against eMule/aMule |
 ///
-/// 0x0040 RELATEDSEARCH is advertised and not implemented, deliberately. It is a
+/// 0x0040 RELATEDSEARCH and 0x0080 TYPETAGINTEGER are TCP flags (OP_IDCHANGE,
+/// 0x05DD), not part of this UDP mask; eMule defines no UDP bit at either value.
+/// RELATEDSEARCH is advertised there and not implemented, deliberately. It is a
 /// real Lugdunum feature: `Is_related_search` (eserver decompile) recognises a
 /// search term literally beginning "related:", parses up to 32 `count:hash`
 /// pairs out of it, and rewrites the node to type 0x4F — so it is an ordinary
@@ -198,6 +202,13 @@ pub const SRVFLG_REQUESTCRYPT: u32 = 0x1000;
 ///   backwards.
 pub const SRVFLG_IPV6: u32 = 0x0000_4000;
 
+/// Server accepts `OP_IPV6_UPDATE` (issue #34), in the `OP_IDCHANGE` flags.
+///
+/// Its own bit, not `SRVFLG_IPV6`: 0.9.82 already sets 0x4000 without knowing
+/// the opcode, so a client that saw only 0x4000 must not send it. Set under the
+/// same condition as 0x4000 (`ipv6_publish_sources`).
+pub const SRVFLG_IPV6_UPDATE: u32 = 0x0000_8000;
+
 // OFFERFILES self-source markers - SPEC.md §3.3
 pub const SELF_COMPLETE_ID: u32 = 0xFBFB_FBFB;
 pub const SELF_COMPLETE_PORT: u16 = 0xFBFB;
@@ -217,6 +228,8 @@ pub fn opcode_name_c2s(op: u8) -> &'static str {
         OP_CALLBACKREQUEST => "CALLBACKREQUEST",
         OP_QUERY_MORE_RESULT => "QUERY_MORE_RESULT",
         OP_GETSOURCES_OBFU => "GETSOURCES_OBFU",
+        OP_LOWID_HOLEPUNCH_REQUEST => "LOWID_HOLEPUNCH_REQUEST",
+        OP_IPV6_UPDATE => "IPV6_UPDATE",
         _ => "UNKNOWN",
     }
 }
@@ -266,6 +279,9 @@ mod capability_tests {
         // ...and the server bit must not collide with what IDCHANGE already
         // carries.
         assert_eq!(0x0000_05DD & SRVFLG_IPV6, 0);
+        // The update bit is its own, clear of both (issue #34).
+        assert_eq!(SRVFLG_IPV6_UPDATE.count_ones(), 1);
+        assert_eq!((0x0000_05DD | SRVFLG_IPV6) & SRVFLG_IPV6_UPDATE, 0);
     }
 
     #[test]

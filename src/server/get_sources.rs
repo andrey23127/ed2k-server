@@ -115,9 +115,21 @@ pub fn handle_get_sources(
         return Frame::new(OP_FOUNDSOURCES, encode_empty_sources(&req.file_hash));
     }
 
-    // Whether this requester can parse an inline IPv6 record. Decided once, and
-    // it also decides whether the cache may be used at all.
-    let v6_capable = state.live_cfg.load().network.ipv6_publish_sources && requester.ipv6_capable;
+    // Whether this requester gets inline IPv6 records. Decided once, and it
+    // also decides whether the cache may be used at all.
+    //
+    // ⚠ ONLY A LowID REQUESTER (issue #33). A HighID requester reaches a LowID
+    //   source by OP_CALLBACKREQUEST, which works whenever the requester is
+    //   HighID. Handing it the sentinel instead took that away and left only a
+    //   dial to the source's IPv6, an address taken from the login tag and
+    //   never checked: many home routers drop inbound IPv6, so the dial often
+    //   failed with nothing to fall back on. A LowID requester cannot use a
+    //   callback, so for it the IPv6 path is the only one and it keeps it. A
+    //   session that arrived over IPv6 is always LowID (an eD2k id is an IPv4
+    //   address), so it keeps the sentinel too.
+    let v6_capable = state.live_cfg.load().network.ipv6_publish_sources
+        && requester.ipv6_capable
+        && !requester.is_high_id;
 
     // Fast path: a freshly-cached payload for this hash.
     //
@@ -525,6 +537,43 @@ mod tests {
             Some(&expect_high),
             "HighID source must encode real IP"
         );
+    }
+
+    /// Issue #33: the sentinel goes to a LowID requester only.
+    #[test]
+    fn a_highid_requester_keeps_the_lowid_and_its_callback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let state = ServerState::for_test();
+        let mut cfg = (**state.live_cfg.load()).clone();
+        cfg.network.ipv6_publish_sources = true;
+        state.live_cfg.store(std::sync::Arc::new(cfg));
+
+        let file_hash = [0x66u8; 16];
+        let src = [0xA0u8; 16];
+        state.add_file_with_source(
+            file_hash,
+            1000,
+            "f".into(),
+            (src, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 4001, true),
+        );
+        state.register_test_client(src, 42, false, 0);
+        state.client_ipv6.insert(src, "2001:db8:5::1".parse::<Ipv6Addr>().unwrap());
+
+        let ask = |uh: [u8; 16], high: bool| {
+            state.register_test_client(uh, if high { 0x0102_0304 } else { 77 }, high, 0);
+            let mut requester = state.clients.get(&uh).unwrap().clone();
+            requester.ipv6_capable = true;
+            handle_get_sources(&state, &requester, GetSourcesRequest { file_hash, size: None })
+        };
+        // HighID, sentinel-capable: the classic record with the low id.
+        let p = ask([0xC1; 16], true).payload;
+        assert_eq!(p[16], 1);
+        assert_eq!(p.len(), 17 + 6, "classic record");
+        assert_eq!(u32::from_le_bytes([p[17], p[18], p[19], p[20]]), 42);
+        // LowID, sentinel-capable: no callback possible, so the IPv6 route.
+        let p = ask([0xC2; 16], false).payload;
+        assert_eq!(p[16], 1);
+        assert_eq!(u32::from_le_bytes([p[17], p[18], p[19], p[20]]), IPV6_SOURCE_SENTINEL);
     }
 
     fn ports_of(frame: &Frame) -> Vec<u16> {

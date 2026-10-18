@@ -18,7 +18,9 @@
 use crate::config::Config;
 use crate::proto::{
     opcodes::*,
-    search::{collect_terms, evaluate_prepared, parse as parse_search, prepare},
+    search::{
+        collect_terms, evaluate_prepared, parse as parse_search, uses_complete_sources,
+    },
     tags::{write_tag_list, Tag, TagValue},
 };
 use crate::state::ServerState;
@@ -435,6 +437,7 @@ impl UdpServer {
             // flood becomes essentially free. Ban is set by the bot detector
             // (24h TTL, swept by the 60s cleanup task).
             if self.state.is_bot_banned(peer.ip()) {
+                crate::server::bot_detector::note_banned(&self.state, peer.ip(), data);
                 continue;
             }
 
@@ -639,12 +642,21 @@ impl UdpServer {
                         // the verification step Lugdunum requires before a
                         // peer "trusts" a new server for propagation).
                         //
-                        // Heuristic: short packet (4..=18 bytes), not a
+                        // eMule clients send the same thing: their "crypt ping"
+                        // (ServerList.cpp, CServerList::ServerStats) is a
+                        // nonzero 4-byte challenge plus `rand() % 16` bytes of
+                        // padding, so 4..=19 bytes, to TCP+12, and the reply
+                        // is how eMule learns our UDP key. The range used to
+                        // end at 18, which left every ping with 15 bytes of
+                        // padding — one in sixteen — unanswered; eMule then
+                        // waits 20 s and falls back to a plain ping.
+                        //
+                        // Heuristic: short packet (4..=19 bytes), not a
                         // plain eD2k frame (we're already in the obfuscated
                         // branch), arriving on our obfpingport (TCP+12).
                         // `on_obfping_port` was computed by the pre-flight above,
                         // which is also what lets a 4..=9 byte frame reach here.
-                        if on_obfping_port && (4..=18).contains(&data.len()) {
+                        if on_obfping_port && is_crypt_ping(data) {
                             // Extract peer's random_part (first 4 bytes, LE).
                             let random_part =
                                 u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
@@ -751,7 +763,22 @@ impl UdpServer {
                 // Bot detector: track query rate and interval patterns, for
                 // both families. Keyed by source, so an IPv6 querier counts
                 // by its /64 (see ServerState::source_key).
-                crate::server::bot_detector::record_query(&self.state, peer.ip());
+                let search = matches!(
+                    opcode,
+                    OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 | OP_GLOB_SEARCHREQ3
+                );
+                let hashes = crate::server::bot_detector::query_hashes(opcode, payload);
+                crate::server::bot_detector::record_query(
+                    &self.state,
+                    peer,
+                    crate::server::bot_detector::QueryInfo {
+                        search,
+                        hashes: hashes.len() as u32,
+                        obfuscated: obf.is_some(),
+                        our_port: self.socket.local_addr().map_or(0, |a| a.port()),
+                    },
+                    &hashes,
+                );
                 // The other two records stay IPv4-only, and need nothing more:
                 // the gossip server list holds IPv4 servers only, so an IPv6
                 // client can never leak into it; and hole punching is for
@@ -1378,7 +1405,14 @@ impl UdpServer {
         let max_conn = live.limits.max_clients;
         let soft = live.limits.soft_limit_files;
         let hard = live.limits.hard_limit_files;
-        let pingflg: u32 = 0x0000_17FB;
+        // The same flags as the plain 0x97 and ST_UDPFLAGS. This used to be
+        // Lugdunum's 0x17FB, left behind when SERVER_UDP_FLAGS dropped bit
+        // 0x1000; eMule takes its flags from whichever 0x97 arrives, and for a
+        // client with obfuscation on that is usually this one.
+        let mut pingflg: u32 = crate::proto::opcodes::SERVER_UDP_FLAGS;
+        if live.network.ipv6_publish_sources {
+            pingflg |= crate::server::login::SRV_TCPFLG_IPV6;
+        }
 
         // Use the peer's random_part as the implicit challenge — Lugdunum
         // doesn't carry a separate challenge in the OBF ping wire format.
@@ -2012,7 +2046,9 @@ fn udp_search_ranked(
             std::collections::BinaryHeap::with_capacity(UDP_MAX_SEARCH_RESULTS + 1);
         let mut examined = 0usize;
         // Terms folded once for the whole search, not once per candidate.
-        let prepared = prepare(&tree);
+        let prepared = crate::server::search::prepared_tree(state, &tree);
+        let want_complete = uses_complete_sources(&prepared);
+        let want_media = crate::proto::search::uses_media(&prepared);
         // Same tie-break seed as the TCP path for the same query.
         let seed = crate::server::search::query_seed(&groups);
         for fid in candidate_ids {
@@ -2023,7 +2059,7 @@ fn udp_search_ranked(
             examined += 1;
             // Tested in place under the shard read lock, as the TCP path does;
             // only a record that enters the heap is cloned.
-            let push = state.file_slab.with_record(fid, |entry| {
+            let push = state.file_slab.with_record_media(fid, want_media, |entry, media| {
                 // Skip orphans (no live source). See src/server/search.rs for
                 // the full rationale — orphans are useless to return.
                 if entry.sources.is_empty() {
@@ -2033,7 +2069,12 @@ fn udp_search_ranked(
                 // query answered by one channel and not the other becomes a
                 // protocol-dependent result set.
                 let name_lower = crate::state::keyword_index::fold_for_match(entry.name());
-                if !evaluate_prepared(&prepared, &name_lower, entry.size) {
+                let facts = crate::server::search::file_facts(
+                    entry,
+                    want_complete,
+                    want_media.then(|| media.unwrap_or_default()),
+                );
+                if !evaluate_prepared(&prepared, &name_lower, &facts) {
                     return None;
                 }
                 let sources = entry.sources.len() as u32;
@@ -2120,6 +2161,7 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     if ftype != crate::proto::search::ed2k_file_type::ANY {
         tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
     }
+    crate::server::search::push_media_tags(state, &hash, &mut tags);
     write_tag_list(&mut out, &tags);
     out
 }
@@ -2222,6 +2264,13 @@ pub fn parse_server_desc_res(payload: &[u8], challenge: u32) -> Option<ServerDes
     })
 }
 const OP_GLOB_SEARCHRES: u8 = 0x99;
+
+/// Is this datagram on TCP+12 a crypt ping? eMule's is a nonzero 4-byte
+/// challenge plus 0..=15 bytes of padding (`4 + rand() % 16`), a Lugdunum
+/// peer's OBF ping the same shape. eMule never sends a zero challenge.
+fn is_crypt_ping(data: &[u8]) -> bool {
+    (4..=19).contains(&data.len()) && data[..4] != [0, 0, 0, 0]
+}
 
 /// Send a UDP reply, obfuscated the way the request was. A free function so
 /// tasks spawned off the receive loop can answer too.
@@ -2401,5 +2450,27 @@ mod several_servers_per_ip_tests {
         assert_eq!(pick_reply_server_port(5567, true, None, none, |p| p == 5555), 5555);
         assert_eq!(pick_reply_server_port(5567, true, Some(5569), none, none), 5555);
         assert_eq!(pick_reply_server_port(5567, true, None, none, none), 5563);
+    }
+}
+
+#[cfg(test)]
+mod crypt_ping_tests {
+    use super::is_crypt_ping;
+
+    #[test]
+    fn every_length_emule_sends_is_a_crypt_ping() {
+        // eMule: nPacketLen = 4 + (uint8)(rand() % 16)
+        for pad in 0..16usize {
+            let mut d = vec![0x11, 0x22, 0x33, 0x44];
+            d.extend(std::iter::repeat(0xAB).take(pad));
+            assert!(is_crypt_ping(&d), "{} bytes", d.len());
+        }
+    }
+
+    #[test]
+    fn other_shapes_are_not() {
+        assert!(!is_crypt_ping(&[1, 2, 3]));
+        assert!(!is_crypt_ping(&[7u8; 20]));
+        assert!(!is_crypt_ping(&[0, 0, 0, 0, 9, 9]), "zero challenge");
     }
 }

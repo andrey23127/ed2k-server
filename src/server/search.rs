@@ -6,7 +6,10 @@
 
 use crate::proto::{
     opcodes::*,
-    search::{collect_terms, evaluate_prepared, parse, prepare, SearchNode},
+    search::{
+        collect_terms, evaluate_prepared, parse, prepare, resolve_codecs, uses_complete_sources,
+        uses_media, FileFacts, SearchNode,
+    },
     tags::{Tag, TagValue},
     write_tag_list, Frame,
 };
@@ -276,10 +279,13 @@ pub fn handle_search(
     // Test one candidate. Returns false once the examination budget is spent.
     // Shared by both paths below so they cannot drift apart.
     // Terms folded once for the whole search, not once per candidate.
-    let prepared = prepare(&tree);
+    let prepared = prepared_tree(state, &tree);
+    let want_complete = uses_complete_sources(&prepared);
+    let want_media = uses_media(&prepared);
     let seed = query_seed(&groups);
     let mut consider = |id: crate::state::file_id::FileId,
                         entry: &crate::state::file_id::FileRecord,
+                        media: Option<crate::state::media::Media>,
                         heap: &mut std::collections::BinaryHeap<Ranked>|
      -> bool {
         scanned += 1;
@@ -294,7 +300,8 @@ pub fn handle_search(
         // Folded, so the predicate compares like with like — see the warning
         // at `evaluate`.
         let name_lower = crate::state::keyword_index::fold_for_match(entry.name());
-        if evaluate_prepared(&prepared, &name_lower, entry.size) {
+        let facts = file_facts(entry, want_complete, want_media.then(|| media.unwrap_or_default()));
+        if evaluate_prepared(&prepared, &name_lower, &facts) {
             total_matched += 1;
             // Cheap rejection before the clone: once the heap is full, anything
             // no better than its worst entry cannot survive, and cloning a
@@ -354,7 +361,7 @@ pub fn handle_search(
             // match anyway.
             let keep_going = state
                 .file_slab
-                .with_record(fid, |r| consider(fid, r, &mut heap))
+                .with_record_media(fid, want_media, |r, m| consider(fid, r, m, &mut heap))
                 .unwrap_or(true);
             if !keep_going {
                 break;
@@ -377,13 +384,13 @@ pub fn handle_search(
         // MAX_UNINDEXED_SCAN and the answer is best-effort past that point,
         // which is the correct trade: a metadata-only query has no precise
         // answer to protect, while a stalled server affects everyone.
-        state.file_slab.for_each_live_while(|id, r| {
+        state.file_slab.for_each_live_while_media(want_media, |id, r, m| {
             if n_candidates >= MAX_UNINDEXED_SCAN {
                 scan_capped = true;
                 return false;
             }
             n_candidates += 1;
-            consider(id, r, &mut heap)
+            consider(id, r, m, &mut heap)
         });
     }
 
@@ -513,6 +520,7 @@ pub fn build_search_result_page(
         if ftype != crate::proto::search::ed2k_file_type::ANY {
             tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
         }
+        push_media_tags(state, &file.hash, &mut tags);
 
         write_tag_list(&mut payload, &tags);
     }
@@ -714,5 +722,116 @@ mod pagination_and_largefile_tests {
         assert_eq!(f.payload.len(), 5);
         assert_eq!(&f.payload[..4], &[0, 0, 0, 0]);
         assert_eq!(f.payload[4], 0);
+    }
+}
+
+/// What the search post-filter needs from a record besides its name. The
+/// complete-source count walks the source list, so only when a filter uses it;
+/// `media` likewise is looked up only for a tree that filters on it.
+pub(crate) fn file_facts(
+    entry: &crate::state::file_id::FileRecord,
+    want_complete: bool,
+    media: Option<crate::state::media::Media>,
+) -> FileFacts {
+    FileFacts {
+        size: entry.size,
+        sources: Some(entry.sources.len() as u32),
+        complete_sources: want_complete.then(|| entry.complete_source_count()),
+        media,
+    }
+}
+
+/// The tree a search evaluates: folded once (`prepare`) and with codec names
+/// replaced by their table index. Shared by the TCP and UDP paths.
+pub(crate) fn prepared_tree(state: &ServerState, tree: &SearchNode) -> SearchNode {
+    resolve_codecs(&prepare(tree), &|v| state.file_slab.codecs.lookup(v))
+}
+
+/// FT_MEDIA_LENGTH (0xD3), FT_MEDIA_BITRATE (0xD4) and FT_MEDIA_CODEC (0xD5)
+/// for a result, when the file was offered with them, as Lugdunum sends them.
+/// Both result paths call this, so TCP and UDP answers carry the same tags.
+pub(crate) fn push_media_tags(state: &ServerState, hash: &[u8; 16], tags: &mut Vec<Tag>) {
+    let Some(m) = state.file_slab.media_of_hash(hash) else { return };
+    if m.bitrate() != 0 {
+        tags.push(Tag::byte(0xD4, TagValue::U32(m.bitrate())));
+    }
+    if let Some(c) = state.file_slab.codecs.name(m.codec()) {
+        tags.push(Tag::byte(0xD5, TagValue::String(c.to_string())));
+    }
+    if m.length() != 0 {
+        tags.push(Tag::byte(0xD3, TagValue::U32(m.length())));
+    }
+}
+
+#[cfg(test)]
+mod media_search_tests {
+    use super::*;
+    use crate::proto::search::{BoolOp, CmpOp, SearchTag};
+    use crate::state::media::Media;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn st() -> ServerState {
+        ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::new(crate::config::Config::minimal_test_config()),
+        )
+    }
+
+    fn names(state: &ServerState, tree: SearchNode) -> Vec<String> {
+        let mut v: Vec<String> = handle_search(state, SearchRequest { tree })
+            .iter()
+            .map(|r| r.name().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn length_bitrate_and_codec_filter_as_in_lugdunum() {
+        let state = st();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4));
+        let files = [
+            ([1u8; 16], "euphoria s01e01.mkv", Some((3300u32, 2000u32, "h264"))),
+            ([2u8; 16], "euphoria trailer.mp4", Some((150, 900, "xvid"))),
+            ([3u8; 16], "euphoria soundtrack.zip", None),
+        ];
+        for (h, n, m) in files {
+            state.add_file_with_source(h, 1_000_000, n.into(), ([h[0]; 16], ip, 4662, true));
+            if let Some((len, rate, codec)) = m {
+                let c = state.file_slab.codecs.intern(codec);
+                state.file_slab.merge_media(&h, Media::new(len, rate, c));
+            }
+        }
+        let t = || SearchNode::Term("euphoria".into());
+        let and = |a, b| SearchNode::Bool(BoolOp::And, Box::new(a), Box::new(b));
+        let num = |id, op, value| SearchNode::Numeric { tag_name: SearchTag::Id(id), op, value };
+        let meta = |tag, v: &str| SearchNode::Meta { tag_name: tag, value: v.into() };
+
+        // Length >= 3000: only the episode; a file without metadata has 0.
+        assert_eq!(names(&state, and(t(), num(0xD3, CmpOp::Ge, 3000))), vec!["euphoria s01e01.mkv"]);
+        // Length < 600 keeps the file without metadata too, as Lugdunum would.
+        assert_eq!(
+            names(&state, and(t(), num(0xD3, CmpOp::Lt, 600))),
+            vec!["euphoria soundtrack.zip", "euphoria trailer.mp4"]
+        );
+        assert_eq!(names(&state, and(t(), num(0xD4, CmpOp::Ge, 1000))), vec!["euphoria s01e01.mkv"]);
+        // Codec by ID and by eMule's name, any case.
+        assert_eq!(names(&state, and(t(), meta(SearchTag::Id(0xD5), "H264"))), vec!["euphoria s01e01.mkv"]);
+        assert_eq!(
+            names(&state, and(t(), meta(SearchTag::Name("codec".into()), "xvid"))),
+            vec!["euphoria trailer.mp4"]
+        );
+        // A codec no file was offered with matches nothing.
+        assert!(names(&state, and(t(), meta(SearchTag::Id(0xD5), "vp9"))).is_empty());
+        // Artist (0xD0) is matched as words of the name.
+        assert_eq!(names(&state, and(t(), meta(SearchTag::Id(0xD0), "trailer"))), vec!["euphoria trailer.mp4"]);
+
+        // The result carries the media tags of the file that has them.
+        let hits = handle_search(&state, SearchRequest { tree: and(t(), num(0xD3, CmpOp::Ge, 3000)) });
+        let frame = build_search_result_page(&state, &hits, false);
+        let p = &frame.payload;
+        let has = |needle: &[u8]| p.windows(needle.len()).any(|w| w == needle);
+        assert!(has(b"h264"), "codec tag");
+        assert!(has(&[0xD3]) && has(&3300u32.to_le_bytes()[..2]), "length tag");
     }
 }

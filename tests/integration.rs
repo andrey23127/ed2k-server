@@ -167,13 +167,15 @@ async fn full_client_lifecycle() {
         .await
         .unwrap();
 
-    // 2. Receive welcome batch (5 frames: IDCHANGE, SERVERSTATUS,
-    //    SERVERMESSAGE×1 [welcome[0]], SERVERIDENT, SERVERMESSAGE [welcome[1]])
+    // 2. Receive welcome batch (4 frames: IDCHANGE, SERVERSTATUS,
+    //    SERVERMESSAGE×1 [welcome[0]], SERVERMESSAGE [welcome[1]]). No
+    //    SERVERIDENT for a legacy client: it comes with the server list, as
+    //    from Lugdunum (see login::ident_at_login).
     let mut got_idchange = false;
     let mut got_status = false;
     let mut got_message_count = 0;
     let mut got_ident = false;
-    for _ in 0..5 {
+    for _ in 0..4 {
         let f = tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
             .await
             .expect("timeout reading welcome frame")
@@ -193,7 +195,20 @@ async fn full_client_lifecycle() {
         got_message_count >= 1,
         "must receive at least one SERVERMESSAGE"
     );
-    assert!(got_ident, "must receive SERVERIDENT");
+    assert!(!got_ident, "no SERVERIDENT at login for a legacy client");
+
+    // 2b. GETSERVERLIST → SERVERLIST, then SERVERIDENT.
+    framed.send(Frame::new(0x14, vec![])).await.unwrap();
+    let mut order = Vec::new();
+    for _ in 0..2 {
+        let f = tokio::time::timeout(std::time::Duration::from_secs(2), framed.next())
+            .await
+            .expect("timeout reading server list answer")
+            .expect("connection closed")
+            .expect("frame error");
+        order.push(f.opcode);
+    }
+    assert_eq!(order, vec![0x32, OP_SERVERIDENT], "list first, then ident");
 
     // 3. OFFERFILES — publish a legitimate file
     let file_hash = [0xBBu8; 16];

@@ -197,9 +197,20 @@ pub(crate) fn reported_client_ip(
 }
 
 /// Build the canonical post-login welcome batch (SPEC.md §3.1.2):
-/// IDCHANGE, SERVERSTATUS, SERVERMESSAGE, SERVERIDENT, plus optional
-/// extra welcome lines.
+/// IDCHANGE, SERVERSTATUS, SERVERMESSAGE, SERVERIDENT (only for some clients,
+/// see `ident_at_login`), plus optional extra welcome lines.
 pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHandle) -> Vec<Frame> {
+    build_welcome_batch_with(cfg, state, client, ident_at_login(client))
+}
+
+/// `build_welcome_batch` with the SERVERIDENT decision made by the caller,
+/// which also knows whether the client asked for OFFERFILES v1.
+pub fn build_welcome_batch_with(
+    cfg: &Config,
+    state: &ServerState,
+    client: &ClientHandle,
+    send_ident: bool,
+) -> Vec<Frame> {
     // Hot-reloadable view of the configuration. /api/config swaps `live_cfg`
     // atomically, so everything read through `live` below takes effect for the
     // NEXT client that logs in — no restart needed for the server name,
@@ -254,6 +265,8 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
             // sources, and a server that accepts IPv6 logins but publishes no v6
             // sources would be claiming something it does not do.
             tcp_flags |= SRV_TCPFLG_IPV6;
+            // And the in-session update opcode (issue #34), on its own bit.
+            tcp_flags |= crate::proto::opcodes::SRVFLG_IPV6_UPDATE;
         }
 
         let mut payload = BytesMut::with_capacity(20);
@@ -299,118 +312,11 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
         frames.push(Frame::new(OP_SERVERMESSAGE, payload.to_vec()));
     }
 
-    // 4. SERVERIDENT — server hash + IP + port + tags
-    {
-        let mut payload = BytesMut::new();
-        // Server hash: this server's 16-byte identity, stable and distinct per
-        // server (see server_ident_hash). It used to be one fixed constant for
-        // every server running this code.
-        payload.put_slice(&server_ident_hash(&live));
-
-        // Server IP: use configured this_ip if set, otherwise 0 (client uses TCP source).
-        // This one IS the server's own address — unlike OP_IDCHANGE bytes 12–15.
-        let server_ip: u32 = if live.server.this_ip.is_empty() {
-            0
-        } else {
-            live.server
-                .this_ip
-                .parse::<std::net::Ipv4Addr>()
-                .map(|ip| u32::from_le_bytes(ip.octets()))
-                .unwrap_or(0)
-        };
-        payload.put_u32_le(server_ip);
-        payload.put_u16_le(cfg.network.tcp_port);
-
-        let (soft_files, hard_files) = match &client.offer_policy {
-            Some(p) => (p.soft, p.hard),
-            None => (live.limits.soft_limit_files, live.limits.hard_limit_files),
-        };
-        let mut tags = vec![
-            Tag::byte(ST_SERVERNAME, TagValue::String(live.server.name.clone())),
-            Tag::byte(ST_DESCRIPTION, TagValue::String(live.server.desc.clone())),
-            // ST_VERSION as STRING "major.minor" — same format as our 0xA3 reply.
-            // Some eMule builds don't display UINT32-encoded version in the server
-            // list, so we use the explicit "17.15" string that eMule parses reliably.
-            Tag::byte(
-                ST_VERSION,
-                TagValue::String(format!(
-                    "{}.{}",
-                    live.server.version_major, live.server.version_minor
-                )),
-            ),
-            Tag::byte(ST_MAXUSERS, TagValue::U32(live.limits.max_clients)),
-            // From the connection's OFFERFILES v1 snapshot when it has one, so
-            // the two numbers it is told are the two it is held to (#19).
-            Tag::byte(ST_SOFTFILES, TagValue::U32(soft_files)),
-            Tag::byte(ST_HARDFILES, TagValue::U32(hard_files)),
-            // ST_UDPFLAGS — eMule's SupportsObfuscationTCP() requires either this OR
-            // ST_TCPFLAGS to have bit 0x400 (SRV_UDPFLG_TCPOBFUSCATION) set.
-            // From eMule's server.h: SupportsObfuscationTCP() =
-            //   GetObfuscationPortTCP() != 0 && ((UDPFlags & 0x400) || (TCPFlags & 0x400))
-            // Single source of truth, shared with GLOBSERVSTATRES — see the
-            // per-bit table on SERVER_UDP_FLAGS.
-            Tag::byte(ST_UDPFLAGS, TagValue::U32(SERVER_UDP_FLAGS)),
-            // ST_TCPPORTOBFUSCATION / ST_UDPPORTOBFUSCATION — eMule casts to uint16,
-            // but values are stored in tags as u32 (eMule code: m_nObfuscationPortTCP = (uint16)tag->GetInt()).
-            // Non-zero TCP obf port is required for SupportsObfuscationTCP() to return true.
-            Tag::byte(
-                ST_TCPPORTOBFUSCATION,
-                TagValue::U32(cfg.network.tcp_port as u32),
-            ),
-            Tag::byte(
-                ST_UDPPORTOBFUSCATION,
-                TagValue::U32((cfg.network.tcp_port + 14) as u32),
-            ),
-        ];
-
-        // ST_IPV6 — this server's own public IPv6, so a client that reached us
-        // over IPv4 learns there is a v6 address to come back on.
-        //
-        // Appended rather than placed in the list above, because it is
-        // conditional: a server with no IPv6 must send a byte-identical
-        // SERVERIDENT to the one it sent before this release. An unknown tag is
-        // skipped by every client, but an EMPTY or zero-filled one would be read
-        // as an address.
-        if live.network.ipv6_publish_sources {
-            if let Ok(a) = live.network.this_ip6.trim().parse::<std::net::Ipv6Addr>() {
-                if is_publishable_ipv6(a) {
-                    tags.push(Tag::byte(ST_IPV6, TagValue::Hash16(a.octets())));
-                }
-            }
-
-            // ST_IPV6_STATUS — our verdict on the client's own address.
-            //
-            // Worth sending because the client cannot work it out for itself. A
-            // session connected over IPv4 that advertised CT_MOD_IP_V6 has no
-            // other way to learn whether that address was accepted and whether
-            // it is now being published as a v6 source; without this it would
-            // have to guess, and a client that guesses "yes" wrongly stops
-            // advertising its LowID as well.
-            //
-            // Bits are only ever set to "yes". The tag is omitted entirely when
-            // there is no verdict, so a client that sees it can trust every bit
-            // — an unset bit means no, never unknown.
-            let mut status: u8 = 0;
-            if client.ipv6.is_some() {
-                status |= IPV6ST_HAVE | IPV6ST_REACHABLE;
-            }
-            // IPV6ST_PROBED stays unset: we accept the address on trust (from
-            // the socket, or from the login tag) and never dial it back. Setting
-            // it would claim a check we do not perform.
-            if status != 0 {
-                tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
-            }
-        }
-        // OFFERFILES v1 (issue #19): all three or none, string-named so a
-        // client that does not know them skips them. A legacy session (v1 off,
-        // or a configuration that cannot be advertised) gets a SERVERIDENT
-        // byte-identical to the one before this capability existed.
-        if let Some(p) = &client.offer_policy {
-            tags.extend(p.tags());
-        }
-        write_tag_list(&mut payload, &tags);
-
-        frames.push(Frame::new(OP_SERVERIDENT, payload.to_vec()));
+    // 4. SERVERIDENT — at login only for a client that needs it there; every
+    //    other client gets it in answer to OP_GETSERVERLIST, as from Lugdunum.
+    //    See `ident_at_login`.
+    if send_ident {
+        frames.push(build_server_ident(cfg, state, client));
     }
 
     // 5. Additional welcome lines (welcome[1..N])
@@ -422,6 +328,141 @@ pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHan
     }
 
     frames
+}
+
+/// Does this client get OP_SERVERIDENT in the login batch?
+///
+/// Lugdunum sends SERVERIDENT only in answer to OP_GETSERVERLIST, never at
+/// login. This server used to send it at login to everyone, and some eMule
+/// mods cannot take that: MorphCA 2.2 (and, by the reports, ZZUL-TRA 2.6 and
+/// UltiMatiX) read the tag count from the server IP field in release builds,
+/// because the two lines that skip IP and port sit inside a debug-only block.
+/// The count comes out in the billions, tag parsing runs off the end, the
+/// exception drops the connection, and the mod reconnects in a loop. Against
+/// Lugdunum they never see the packet, because they never ask for the list.
+///
+/// Sent at login only to a client that announced something that needs it
+/// there: OFFERFILES v1 (the policy tags, issue #19; a client that asked gets
+/// it even when v1 is off, to learn that it is legacy, see the connection
+/// handler) or the IPv6 extension (`ST_IPV6`). Both are recent clients with
+/// a correct parser.
+pub fn ident_at_login(client: &ClientHandle) -> bool {
+    client.offer_policy.is_some() || client.ipv6_capable
+}
+
+/// OP_SERVERIDENT: server hash, IP, port and tags.
+pub fn build_server_ident(cfg: &Config, state: &ServerState, client: &ClientHandle) -> Frame {
+    let live = state.live_cfg.load();
+    let mut payload = BytesMut::new();
+    // Server hash: this server's 16-byte identity, stable and distinct per
+    // server (see server_ident_hash). It used to be one fixed constant for
+    // every server running this code.
+    payload.put_slice(&server_ident_hash(&live));
+
+    // Server IP: use configured this_ip if set, otherwise 0 (client uses TCP source).
+    // This one IS the server's own address — unlike OP_IDCHANGE bytes 12–15.
+    let server_ip: u32 = if live.server.this_ip.is_empty() {
+        0
+    } else {
+        live.server
+            .this_ip
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| u32::from_le_bytes(ip.octets()))
+            .unwrap_or(0)
+    };
+    payload.put_u32_le(server_ip);
+    payload.put_u16_le(cfg.network.tcp_port);
+
+    let (soft_files, hard_files) = match &client.offer_policy {
+        Some(p) => (p.soft, p.hard),
+        None => (live.limits.soft_limit_files, live.limits.hard_limit_files),
+    };
+    let mut tags = vec![
+        Tag::byte(ST_SERVERNAME, TagValue::String(live.server.name.clone())),
+        Tag::byte(ST_DESCRIPTION, TagValue::String(live.server.desc.clone())),
+        // ST_VERSION as STRING "major.minor" — same format as our 0xA3 reply.
+        // Some eMule builds don't display UINT32-encoded version in the server
+        // list, so we use the explicit "17.15" string that eMule parses reliably.
+        Tag::byte(
+            ST_VERSION,
+            TagValue::String(format!(
+                "{}.{}",
+                live.server.version_major, live.server.version_minor
+            )),
+        ),
+        Tag::byte(ST_MAXUSERS, TagValue::U32(live.limits.max_clients)),
+        // From the connection's OFFERFILES v1 snapshot when it has one, so
+        // the two numbers it is told are the two it is held to (#19).
+        Tag::byte(ST_SOFTFILES, TagValue::U32(soft_files)),
+        Tag::byte(ST_HARDFILES, TagValue::U32(hard_files)),
+        // ST_UDPFLAGS — eMule's SupportsObfuscationTCP() requires either this OR
+        // ST_TCPFLAGS to have bit 0x400 (SRV_UDPFLG_TCPOBFUSCATION) set.
+        // From eMule's server.h: SupportsObfuscationTCP() =
+        //   GetObfuscationPortTCP() != 0 && ((UDPFlags & 0x400) || (TCPFlags & 0x400))
+        // Single source of truth, shared with GLOBSERVSTATRES — see the
+        // per-bit table on SERVER_UDP_FLAGS.
+        Tag::byte(ST_UDPFLAGS, TagValue::U32(SERVER_UDP_FLAGS)),
+        // ST_TCPPORTOBFUSCATION / ST_UDPPORTOBFUSCATION — eMule casts to uint16,
+        // but values are stored in tags as u32 (eMule code: m_nObfuscationPortTCP = (uint16)tag->GetInt()).
+        // Non-zero TCP obf port is required for SupportsObfuscationTCP() to return true.
+        Tag::byte(
+            ST_TCPPORTOBFUSCATION,
+            TagValue::U32(cfg.network.tcp_port as u32),
+        ),
+        Tag::byte(
+            ST_UDPPORTOBFUSCATION,
+            TagValue::U32((cfg.network.tcp_port + 14) as u32),
+        ),
+    ];
+
+    // ST_IPV6 — this server's own public IPv6, so a client that reached us
+    // over IPv4 learns there is a v6 address to come back on.
+    //
+    // Appended rather than placed in the list above, because it is
+    // conditional: a server with no IPv6 must send a byte-identical
+    // SERVERIDENT to the one it sent before this release. An unknown tag is
+    // skipped by every client, but an EMPTY or zero-filled one would be read
+    // as an address.
+    if live.network.ipv6_publish_sources {
+        if let Ok(a) = live.network.this_ip6.trim().parse::<std::net::Ipv6Addr>() {
+            if is_publishable_ipv6(a) {
+                tags.push(Tag::byte(ST_IPV6, TagValue::Hash16(a.octets())));
+            }
+        }
+
+        // ST_IPV6_STATUS — our verdict on the client's own address.
+        //
+        // Worth sending because the client cannot work it out for itself. A
+        // session connected over IPv4 that advertised CT_MOD_IP_V6 has no
+        // other way to learn whether that address was accepted and whether
+        // it is now being published as a v6 source; without this it would
+        // have to guess, and a client that guesses "yes" wrongly stops
+        // advertising its LowID as well.
+        //
+        // Bits are only ever set to "yes". The tag is omitted entirely when
+        // there is no verdict, so a client that sees it can trust every bit
+        // — an unset bit means no, never unknown.
+        let mut status: u8 = 0;
+        if client.ipv6.is_some() {
+            status |= IPV6ST_HAVE | IPV6ST_REACHABLE;
+        }
+        // IPV6ST_PROBED stays unset: we accept the address on trust (from
+        // the socket, or from the login tag) and never dial it back. Setting
+        // it would claim a check we do not perform.
+        if status != 0 {
+            tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
+        }
+    }
+    // OFFERFILES v1 (issue #19): all three or none, string-named so a
+    // client that does not know them skips them. A legacy session (v1 off,
+    // or a configuration that cannot be advertised) gets a SERVERIDENT
+    // byte-identical to the one before this capability existed.
+    if let Some(p) = &client.offer_policy {
+        tags.extend(p.tags());
+    }
+    write_tag_list(&mut payload, &tags);
+
+    Frame::new(OP_SERVERIDENT, payload.to_vec())
 }
 
 /// Detect HighID/LowID via HighID probe (SPEC.md §3.2).
@@ -483,6 +524,53 @@ pub fn is_publishable_ipv6(a: std::net::Ipv6Addr) -> bool {
         && !(a.octets()[0] & 0xfe == 0xfc)
         // ::ffff:0:0/96 — an IPv4 address in disguise, never a v6 source
         && a.to_ipv4_mapped().is_none()
+}
+
+/// What an `OP_IPV6_UPDATE` did to the session (issue #34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ipv6Update {
+    /// A new usable address is published.
+    Published(std::net::Ipv6Addr),
+    /// An address was given but is not usable as a source (link-local and
+    /// the like): nothing is published, the client keeps parsing sentinels.
+    Unusable,
+    /// All zeros: the client no longer stands behind an IPv6.
+    Withdrawn,
+    /// The session arrived over IPv6, so the observed address stays.
+    IgnoredV6Session,
+    /// Not 16 bytes.
+    Malformed,
+}
+
+/// Apply an `OP_IPV6_UPDATE` to the session's handle, by the same rules as
+/// the login tag: a usable address is published; any address makes the client
+/// sentinel-capable; zeros withdraw both. The caller mirrors `handle.ipv6`
+/// into `ServerState::client_ipv6`.
+///
+/// ⚠ A session that arrived over IPv6 is left alone: its address was observed,
+///   and an observed address beats an asserted one, as at login. Its prefix
+///   cannot change without the session ending.
+pub fn apply_ipv6_update(handle: &mut ClientHandle, payload: &[u8], session_v6: bool) -> Ipv6Update {
+    if session_v6 {
+        return Ipv6Update::IgnoredV6Session;
+    }
+    let Ok(raw) = <[u8; 16]>::try_from(payload) else {
+        return Ipv6Update::Malformed;
+    };
+    if raw == [0; 16] {
+        handle.ipv6 = None;
+        handle.ipv6_capable = false;
+        return Ipv6Update::Withdrawn;
+    }
+    let a = std::net::Ipv6Addr::from(raw);
+    handle.ipv6_capable = true;
+    if is_publishable_ipv6(a) {
+        handle.ipv6 = Some(a);
+        Ipv6Update::Published(a)
+    } else {
+        handle.ipv6 = None;
+        Ipv6Update::Unusable
+    }
 }
 
 /// `CT_MOD_IP_V6` — the client's public IPv6, 16 raw bytes.
@@ -1027,6 +1115,7 @@ pub async fn handle_login(
     //  Fallback: "eD2k-basic" for plain eD2k without eMule extensions
 
     let mut compat_id: Option<u8> = None;
+    let mut emule_version: u32 = 0;
     let mut mod_name_str: Option<String> = None;
     let mut has_emule_ext = false;
     let mut has_emule_ver_tag = false;
@@ -1043,6 +1132,7 @@ pub async fn handle_login(
                 CT_EMULE_VERSION => {
                     if let Some(v) = t.as_u32() {
                         compat_id = Some((v >> 24) as u8);
+                        emule_version = v;
                         has_emule_ver_tag = true;
                     }
                 }
@@ -1144,6 +1234,13 @@ pub async fn handle_login(
         software
     };
 
+    let software_detail = software_detail(
+        &software,
+        has_emule_ver_tag.then_some((compat_id.unwrap_or(0), emule_version)),
+        mod_name_str.as_deref(),
+    );
+    let login_fp = login_fingerprint(&req.tags, server_flags);
+
     let handle = ClientHandle {
         user_hash: req.user_hash,
         assigned_id,
@@ -1184,6 +1281,8 @@ pub async fn handle_login(
         connected_at: Instant::now(),
         country: country.clone(),
         software: software.clone(),
+        software_detail: software_detail.clone(),
+        login_fp,
         csam_attempts: 0,
         soft_limit_warned: false,
         offer_policy: None,
@@ -1196,13 +1295,174 @@ pub async fn handle_login(
 
     info!(
         ip = %peer_ip, nick = %nick, id = assigned_id,
-        high_id = is_high_id, country = %country, software = %software,
+        high_id = is_high_id, country = %country, software = %software_detail,
         flags = format!("0x{:04x}", server_flags),
         "client logged in"
     );
     debug!(?req.tags, "login tags");
 
     handle
+}
+
+/// The version packed in CT_EMULE_VERSION, as the client shows it.
+///
+/// `(major << 17) | (minor << 10) | (update << 7)`, with the compatible-client
+/// ID in the top byte. eMule shows `v0.50a` (the update as a letter); aMule,
+/// MLDonkey and the rest show `v2.3.3`.
+pub fn version_string(compat_id: u8, v: u32) -> Option<String> {
+    let (major, minor, update) = ((v >> 17) & 0x7F, (v >> 10) & 0x7F, (v >> 7) & 0x07);
+    if major == 0 && minor == 0 && update == 0 {
+        return None;
+    }
+    Some(if compat_id == CLIENTID_EMULE {
+        format!("v{major}.{minor}{}", (b'a' + update as u8) as char)
+    } else {
+        format!("v{major}.{minor}.{update}")
+    })
+}
+
+/// "eMule v0.70b", "aMule v2.3.3", "eMule v0.50a [Xtreme 9.1]".
+///
+/// The name is the family the chart groups by, except that a mod name moves
+/// into the brackets (the family already says "eMule-Xtreme"). The mod string
+/// is the client's own and is cut to 40 characters: it is shown, not trusted.
+fn software_detail(family: &str, version: Option<(u8, u32)>, mod_name: Option<&str>) -> String {
+    let base = match family.split_once('-') {
+        Some(("eMule", _)) if mod_name.is_some() => "eMule",
+        _ => family,
+    };
+    let mut s = base.to_string();
+    if let Some(v) = version.and_then(|(cid, v)| version_string(cid, v)) {
+        s.push(' ');
+        s.push_str(&v);
+    }
+    if let Some(m) = mod_name.map(str::trim).filter(|m| !m.is_empty()) {
+        if !m.to_lowercase().starts_with("mldonkey") {
+            let m: String = m.chars().filter(|c| !c.is_control()).take(40).collect();
+            s.push_str(&format!(" [{m}]"));
+        }
+    }
+    s
+}
+
+/// The shape of a login: CT_VERSION, the server flags, and every tag ID in
+/// the order the client sent them. Two programs that both claim to be eMule
+/// v0.50a rarely send the same tags in the same order.
+fn login_fingerprint(tags: &[Tag], server_flags: u32) -> String {
+    let mut version = None;
+    let mut ids = Vec::with_capacity(tags.len());
+    for t in tags.iter().take(32) {
+        match &t.name {
+            TagName::Byte(id) => {
+                if *id == 0x11 {
+                    version = t.as_u32();
+                }
+                ids.push(format!("{id:02x}"));
+            }
+            TagName::Str(n) => {
+                let n: String = n.chars().filter(|c| c.is_ascii_graphic()).take(16).collect();
+                ids.push(format!("'{n}'"));
+            }
+        }
+    }
+    let v = version.map_or_else(|| "-".to_string(), |v| format!("0x{v:x}"));
+    format!("v={v} flags=0x{server_flags:04x} tags={}", ids.join(","))
+}
+
+#[cfg(test)]
+mod ipv6_update_tests {
+    use super::*;
+
+    fn handle() -> ClientHandle {
+        ClientHandle {
+            user_hash: [5; 16],
+            assigned_id: 42,
+            ip: "203.0.113.5".parse().unwrap(),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: 0,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: false,
+            connected_at: Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            offer_policy: None,
+            slot: Default::default(),
+            tx: None,
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    #[test]
+    fn an_update_publishes_replaces_and_withdraws() {
+        let mut h = handle();
+        let a: std::net::Ipv6Addr = "2001:db8:1::5".parse().unwrap();
+        let b: std::net::Ipv6Addr = "2001:db8:2::5".parse().unwrap();
+        // Starts advertising after login.
+        assert_eq!(apply_ipv6_update(&mut h, &a.octets(), false), Ipv6Update::Published(a));
+        assert_eq!((h.ipv6, h.ipv6_capable), (Some(a), true));
+        // Renumbered.
+        assert_eq!(apply_ipv6_update(&mut h, &b.octets(), false), Ipv6Update::Published(b));
+        assert_eq!(h.ipv6, Some(b));
+        // A link-local address: nothing published, still parses sentinels.
+        let ll: std::net::Ipv6Addr = "fe80::1".parse().unwrap();
+        assert_eq!(apply_ipv6_update(&mut h, &ll.octets(), false), Ipv6Update::Unusable);
+        assert_eq!((h.ipv6, h.ipv6_capable), (None, true));
+        // Withdrawn.
+        assert_eq!(apply_ipv6_update(&mut h, &[0; 16], false), Ipv6Update::Withdrawn);
+        assert_eq!((h.ipv6, h.ipv6_capable), (None, false));
+        // Wrong length: nothing changes.
+        h.ipv6 = Some(a);
+        assert_eq!(apply_ipv6_update(&mut h, &[1; 15], false), Ipv6Update::Malformed);
+        assert_eq!(h.ipv6, Some(a));
+    }
+
+    #[test]
+    fn an_ipv6_session_keeps_its_observed_address() {
+        let mut h = handle();
+        let seen: std::net::Ipv6Addr = "2001:db8:9::9".parse().unwrap();
+        h.ipv6 = Some(seen);
+        h.ipv6_capable = true;
+        assert_eq!(apply_ipv6_update(&mut h, &[0; 16], true), Ipv6Update::IgnoredV6Session);
+        assert_eq!((h.ipv6, h.ipv6_capable), (Some(seen), true));
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn v(major: u32, minor: u32, update: u32) -> u32 {
+        (major << 17) | (minor << 10) | (update << 7)
+    }
+
+    #[test]
+    fn versions_read_as_the_clients_show_them() {
+        assert_eq!(version_string(0, v(0, 50, 0)).as_deref(), Some("v0.50a"));
+        assert_eq!(version_string(0, v(0, 70, 1)).as_deref(), Some("v0.70b"));
+        assert_eq!(version_string(0, v(0, 49, 2)).as_deref(), Some("v0.49c"));
+        assert_eq!(version_string(3, (3 << 24) | v(2, 3, 3)).as_deref(), Some("v2.3.3"));
+        assert_eq!(version_string(0, 0), None);
+    }
+
+    #[test]
+    fn detail_carries_version_and_mod() {
+        assert_eq!(software_detail("eMule", Some((0, v(0, 70, 1))), None), "eMule v0.70b");
+        assert_eq!(
+            software_detail("eMule-Xtreme", Some((0, v(0, 50, 0))), Some("Xtreme 9.1")),
+            "eMule v0.50a [Xtreme 9.1]"
+        );
+        assert_eq!(software_detail("aMule", Some((3, v(3, 0, 0))), None), "aMule v3.0.0");
+        assert_eq!(software_detail("mldonkey", Some((10, v(3, 1, 6))), Some("MLDonkey")), "mldonkey v3.1.6");
+        assert_eq!(software_detail("eD2k-basic", None, None), "eD2k-basic");
+    }
 }
 
 #[cfg(test)]
@@ -1260,6 +1520,8 @@ mod tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,
@@ -1267,10 +1529,17 @@ mod tests {
             tx: None,
             last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
-        let frames = build_welcome_batch(&cfg, &state, &client);
-        let ident = frames.iter().find(|f| f.opcode == OP_SERVERIDENT).unwrap();
+        let ident = build_server_ident(&cfg, &state, &client);
         assert_eq!(&ident.payload[..16], &server_ident_hash(&cfg));
         assert_ne!(&ident.payload[..4], b"\xDE\xAD\xBE\xEF");
+        // A legacy client does not get it at login, as from Lugdunum: some
+        // mods misparse it (see `ident_at_login`). A v1 or IPv6 client does.
+        let frames = build_welcome_batch(&cfg, &state, &client);
+        assert!(frames.iter().all(|f| f.opcode != OP_SERVERIDENT));
+        let mut v6 = client.clone();
+        v6.ipv6_capable = true;
+        let frames = build_welcome_batch(&cfg, &state, &v6);
+        assert!(frames.iter().any(|f| f.opcode == OP_SERVERIDENT));
     }
 
     // ── OP_IDCHANGE bytes 12–15 (issue #17) ────────────────────────────────
@@ -1370,6 +1639,8 @@ mod tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,
@@ -1380,7 +1651,7 @@ mod tests {
         let frames = build_welcome_batch(&cfg, &state, &client);
         let idc = frames.iter().find(|f| f.opcode == OP_IDCHANGE).unwrap();
         assert_eq!(&idc.payload[12..16], &[93, 184, 216, 34]);
-        let ident = frames.iter().find(|f| f.opcode == OP_SERVERIDENT).unwrap();
+        let ident = build_server_ident(&cfg, &state, &client);
         assert_eq!(&ident.payload[16..20], &[85, 17, 116, 222]);
     }
 

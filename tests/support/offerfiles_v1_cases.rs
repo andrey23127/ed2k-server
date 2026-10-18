@@ -88,8 +88,11 @@ async fn login_as(port: u16, id: u8, ask_v1: bool) -> (Peer, Vec<ed2k_server::pr
     .await
     .unwrap();
     let mut tags = None;
-    // Same five-frame welcome fixture as full_client_lifecycle; no GETSERVERLIST.
-    for _ in 0..5 {
+    // Five frames with SERVERIDENT for a client that asked for v1; a legacy
+    // client gets four, and SERVERIDENT with the server list, as from
+    // Lugdunum (login::ident_at_login).
+    let welcome = if ask_v1 { 5 } else { 4 };
+    for _ in 0..welcome {
         let frame = tokio::time::timeout(Duration::from_secs(3), peer.next())
             .await
             .unwrap()
@@ -105,7 +108,23 @@ async fn login_as(port: u16, id: u8, ask_v1: bool) -> (Peer, Vec<ed2k_server::pr
             tags = Some(decoded);
         }
     }
-    (peer, tags.expect("post-login SERVERIDENT missing"))
+    if !ask_v1 {
+        assert!(tags.is_none(), "no SERVERIDENT at login for a legacy client");
+        peer.send(Frame::new(OP_GETSERVERLIST, vec![])).await.unwrap();
+        for _ in 0..2 {
+            let frame = tokio::time::timeout(Duration::from_secs(3), peer.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if frame.opcode == OP_SERVERIDENT {
+                let n = u32::from_le_bytes(frame.payload[22..26].try_into().unwrap());
+                let mut rest = &frame.payload[26..];
+                tags = Some((0..n).map(|_| read_tag(&mut rest).unwrap()).collect());
+            }
+        }
+    }
+    (peer, tags.expect("SERVERIDENT missing"))
 }
 
 fn assert_policy_values(tags: &[ed2k_server::proto::Tag], batch: u32, interval: u32, soft: u32, hard: u32) {

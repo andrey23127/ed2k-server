@@ -11,8 +11,9 @@
 //! so it must stay cheap: most work bails out early when the window is small,
 //! and the expensive variance computation only runs once per 5 seconds per IP.
 
-use crate::state::{BotDetection, BotTracker, ServerState};
-use std::net::IpAddr;
+use crate::state::{BotDetection, BotHashes, BotTracker, FileHash, ServerState};
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -28,16 +29,55 @@ const STDDEV_THRESHOLD_MS: f64 = 50.0;
 const MIN_SAMPLES_FOR_VARIANCE: usize = 30;
 const DETECTION_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// Record a single search/sources query from `ip`. Cheap on most packets:
+/// What one UDP query was, for the counters shown with a detection.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryInfo {
+    /// A search; false for a source request.
+    pub search: bool,
+    /// File hashes in a source request, 0 for a search.
+    pub hashes: u32,
+    pub obfuscated: bool,
+    /// The port of ours it arrived on (TCP+4, TCP+12, TCP+14 …).
+    pub our_port: u16,
+}
+
+/// Record a single search/sources query from `peer`. Cheap on most packets:
 /// pushes a timestamp and bails. Heavy work (stddev + insert) is gated by
 /// DETECTION_COOLDOWN.
 ///
-/// `ip` may be either family; it is keyed by source (IPv4 address, IPv6 /64 by
-/// default), so a flood spread across one IPv6 prefix is one bot.
-pub fn record_query(state: &Arc<ServerState>, ip: IpAddr) {
-    let ip = state.source_key(ip);
+/// The address may be either family; it is keyed by source (IPv4 address,
+/// IPv6 /64 by default), so a flood spread across one IPv6 prefix is one bot.
+pub fn record_query(state: &Arc<ServerState>, peer: SocketAddr, q: QueryInfo, hashes: &[FileHash]) {
+    let raw_ip = peer.ip();
+    let ip = state.source_key(raw_ip);
     let now = Instant::now();
     let tracker = state.bot_query_log.entry(ip).or_default();
+    {
+        let m = &tracker.mix;
+        if q.search {
+            m.searches.fetch_add(1, Relaxed);
+        } else {
+            m.source_requests.fetch_add(1, Relaxed);
+            m.source_hashes.fetch_add(q.hashes as u64, Relaxed);
+        }
+        if q.obfuscated {
+            m.obfuscated.fetch_add(1, Relaxed);
+        }
+        let prev = m.last_src_port.swap(peer.port() as u32, Relaxed);
+        if prev != 0 && prev != peer.port() as u32 {
+            m.src_port_changes.fetch_add(1, Relaxed);
+        }
+        m.last_our_port.store(q.our_port as u32, Relaxed);
+    }
+    if !hashes.is_empty() {
+        let mut r = tracker.recent_hashes.lock().unwrap_or_else(|e| e.into_inner());
+        for h in hashes {
+            if r.len() >= BotHashes::TRACKER_RECENT {
+                r.pop_front();
+            }
+            r.push_back(*h);
+        }
+    }
     let mut times = tracker.query_times.lock().unwrap();
     times.push_back(now);
     while let Some(t) = times.front() {
@@ -77,6 +117,15 @@ pub fn record_query(state: &Arc<ServerState>, ip: IpAddr) {
         .map(|(a, b)| b.duration_since(*a).as_secs_f64() * 1000.0)
         .collect();
     drop(times); // release the per-IP mutex before we touch other DashMaps
+    let mix = tracker.mix.snapshot();
+    let seen: Vec<FileHash> = tracker
+        .recent_hashes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .collect();
+    drop(tracker); // and the bot_query_log shard
     let mean = intervals.iter().sum::<f64>() / intervals.len() as f64;
     let var = intervals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / intervals.len() as f64;
     let stddev_ms = var.sqrt();
@@ -97,17 +146,22 @@ pub fn record_query(state: &Arc<ServerState>, ip: IpAddr) {
         return;
     }
 
-    let country = state
+    let (country, provider) = state
         .country_db
         .try_read()
         .ok()
-        .and_then(|db| db.lookup(ip).map(|(c, _)| c))
-        .unwrap_or_else(|| "??".to_string());
+        .map(|db| (db.lookup(ip).map(|(c, _)| c), db.provider(ip)))
+        .unwrap_or((None, None));
+    let country = country.unwrap_or_else(|| "??".to_string());
 
-    let (first_seen, prev_count) = match state.bot_detections.get(&ip) {
-        Some(e) => (e.first_seen, e.query_count),
-        None => (SystemTime::now(), 0),
-    };
+    let prev_client = state.bot_detections.get(&ip).and_then(|e| e.tcp_client.clone());
+    // A UDP query says nothing about the program that sent it. A TCP login
+    // from the same address does, so look for one, but only when the address
+    // has a TCP connection at all: the scan walks every client, and this runs
+    // at most once per DETECTION_COOLDOWN per bot. Behind a NAT this may be a
+    // different program on the same address, which is why it is shown as
+    // "TCP client on this IP", not as the bot's software.
+    let tcp_client = tcp_client_on(state, raw_ip).or(prev_client);
 
     // Auto-ban this flood bot for 24h. Its UDP datagrams will be dropped at
     // the top of the recv loop (before parsing), so the flood becomes free and
@@ -116,24 +170,192 @@ pub fn record_query(state: &Arc<ServerState>, ip: IpAddr) {
     // active flood, and a rotated IP gets flagged + banned the same way.
     state.ban_bot(ip);
 
-    state.bot_detections.insert(
-        ip,
-        BotDetection {
-            first_seen,
-            last_seen: SystemTime::now(),
-            query_count: prev_count + 1,
-            queries_per_minute: qpm,
-            interval_stddev_ms: stddev_ms,
-            country,
-            reason: reason.clone(),
-        },
-    );
+    let now_sys = SystemTime::now();
+    {
+        // Updated in place: the hashes and the after-ban counters of an
+        // earlier detection of the same source carry over.
+        let mut d = state.bot_detections.entry(ip).or_insert_with(|| BotDetection {
+            first_seen: now_sys,
+            last_seen: now_sys,
+            query_count: 0,
+            queries_per_minute: 0.0,
+            interval_stddev_ms: 0.0,
+            country: String::new(),
+            reason: String::new(),
+            mix: Default::default(),
+            tcp_client: None,
+            provider: None,
+            hashes: BotHashes::default(),
+            dropped_after_ban: 0,
+            last_dropped: None,
+        });
+        d.last_seen = now_sys;
+        d.query_count += 1;
+        d.queries_per_minute = qpm;
+        d.interval_stddev_ms = stddev_ms;
+        d.country = country;
+        d.reason = reason.clone();
+        d.mix = mix.clone();
+        d.tcp_client = tcp_client;
+        d.provider = provider;
+        // The tracker kept only the last few hashes; the total before the
+        // ban comes from the counter, so it is not understated.
+        if d.query_count == 1 {
+            d.hashes.total += mix.source_hashes.saturating_sub(seen.len() as u64);
+        }
+        for h in seen {
+            d.hashes.add(h);
+        }
+        ledger(state, ledger_entry("detected", ip, &d));
+    }
 
     // Count UNIQUE detection events (gated by DETECTION_COOLDOWN above), not every packet.
     *state.block_stats.entry("bot".to_string()).or_insert(0) += 1;
 
     tracing::warn!(ip = %ip, qpm = %qpm, stddev_ms = %stddev_ms,
                   reason = %reason, "bot detected — banned 24h");
+}
+
+/// The file hashes in a UDP source request: 0x9A carries bare hashes, 0x94
+/// hash + size (+ 8 bytes when the 32-bit size is 0, a large file). At most
+/// 64, as the handler answers.
+pub fn query_hashes(opcode: u8, payload: &[u8]) -> Vec<FileHash> {
+    const MAX: usize = 64;
+    let mut out = Vec::new();
+    match opcode {
+        0x9A => {
+            for c in payload.chunks_exact(16).take(MAX) {
+                out.push(c.try_into().unwrap());
+            }
+        }
+        0x94 => {
+            let mut i = 0;
+            while i + 20 <= payload.len() && out.len() < MAX {
+                out.push(payload[i..i + 16].try_into().unwrap());
+                let lo = &payload[i + 16..i + 20];
+                i += 20;
+                if lo == [0, 0, 0, 0] {
+                    if i + 8 > payload.len() {
+                        break;
+                    }
+                    i += 8;
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// A datagram from a banned source, dropped. Counted, and the hashes of a
+/// plain source request are kept; nothing is parsed beyond that and nothing
+/// is answered. An obfuscated datagram is only counted: decoding it would
+/// spend on the bot the work the ban saves.
+pub fn note_banned(state: &ServerState, ip: IpAddr, datagram: &[u8]) {
+    let key = state.source_key(ip);
+    let Some(mut d) = state.bot_detections.get_mut(&key) else { return };
+    d.dropped_after_ban += 1;
+    d.last_dropped = Some(SystemTime::now());
+    if datagram.len() > 2 && datagram[0] == 0xE3 {
+        for h in query_hashes(datagram[1], &datagram[2..]) {
+            d.hashes.add(h);
+        }
+    }
+}
+
+/// A source's 24-hour ban ran out: write what it did meanwhile to the ledger.
+pub fn ban_ended(state: &ServerState, key: IpAddr) {
+    if let Some(d) = state.bot_detections.get(&key) {
+        ledger(state, ledger_entry("ban_ended", key, &d));
+    }
+}
+
+/// Where the ledger goes: the configured path, `bot-log.jsonl` next to the
+/// config file when empty, or nowhere for "off".
+pub fn ledger_path(configured: &str, config_file: &std::path::Path) -> Option<std::path::PathBuf> {
+    match configured.trim() {
+        "off" => None,
+        "" => Some(
+            config_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(std::path::Path::new("."))
+                .join("bot-log.jsonl"),
+        ),
+        p => Some(p.into()),
+    }
+}
+
+/// One ledger line. Hex hashes, newest last; no file names, so the ledger can
+/// be shared as it is.
+pub fn ledger_entry(event: &str, key: IpAddr, d: &BotDetection) -> serde_json::Value {
+    let sample: Vec<String> = d.hashes.recent.iter().map(hex::encode).collect();
+    serde_json::json!({
+        "time": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "event": event,
+        "ip": key.to_string(),
+        "country": d.country,
+        "provider": d.provider,
+        "reason": d.reason,
+        "qpm": d.queries_per_minute.round(),
+        "stddev_ms": d.interval_stddev_ms.round(),
+        "tcp_client": d.tcp_client,
+        "searches": d.mix.searches,
+        "source_requests": d.mix.source_requests,
+        "obfuscated": d.mix.obfuscated,
+        "src_port": d.mix.src_port,
+        "src_port_changes": d.mix.src_port_changes,
+        "our_port": d.mix.our_port,
+        "hashes_total": d.hashes.total,
+        "hashes_distinct": d.hashes.distinct.len(),
+        "dropped_after_ban": d.dropped_after_ban,
+        "hash_sample": sample,
+    })
+}
+
+/// Append a line to the ledger, off the caller's thread when there is a
+/// runtime. A failure is logged and otherwise ignored: the ledger is a
+/// record, not something the server depends on.
+pub fn ledger(state: &ServerState, entry: serde_json::Value) {
+    let Some(Some(path)) = state.bot_log_path.get() else { return };
+    let path = path.clone();
+    let write = move || {
+        use std::io::Write;
+        let r = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| writeln!(f, "{entry}"));
+        if let Err(e) = r {
+            tracing::warn!(path = %path.display(), error = %e, "bot ledger write failed");
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) => {
+            h.spawn_blocking(write);
+        }
+        Err(_) => write(),
+    }
+}
+
+/// "eMule v0.50a (nick)" for a client logged in from `ip`, if any; with
+/// several, the count is added.
+fn tcp_client_on(state: &ServerState, ip: IpAddr) -> Option<String> {
+    if !state.conn_per_ip.contains_key(&ip) {
+        return None;
+    }
+    let mut first = None;
+    let mut n = 0u32;
+    for c in state.clients.iter() {
+        if c.ip == ip {
+            n += 1;
+            if first.is_none() {
+                let nick: String = c.nick.chars().take(40).collect();
+                first = Some(format!("{} ({nick})", c.software_detail));
+            }
+        }
+    }
+    first.map(|f| if n > 1 { format!("{f} +{} more", n - 1) } else { f })
 }
 
 // Keep BotTracker visible in the public API.
@@ -147,9 +369,90 @@ mod source_key_tests {
     use super::*;
 
     fn flood(state: &Arc<ServerState>, ips: impl Iterator<Item = IpAddr>) {
+        let q = QueryInfo { search: false, hashes: 1, obfuscated: false, our_port: 4665 };
         for ip in ips {
-            record_query(state, ip);
+            record_query(state, SocketAddr::new(ip, 4672), q, &[[7; 16]]);
         }
+    }
+
+    #[test]
+    fn a_detection_keeps_what_the_bot_sent() {
+        let st = Arc::new(ServerState::for_test());
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        for i in 0..40u16 {
+            let q = QueryInfo { search: i % 4 == 0, hashes: 3, obfuscated: i % 2 == 0, our_port: 4665 };
+            record_query(&st, SocketAddr::new(ip, 4672 + (i / 20)), q, &[[i as u8; 16]]);
+        }
+        // Flagged at the 30th query; the cooldown keeps that snapshot.
+        let d = st.bot_detections.get(&ip).expect("flagged");
+        assert_eq!(d.mix.searches + d.mix.source_requests, 30);
+        assert_eq!(d.mix.searches, 8);
+        assert_eq!(d.mix.source_hashes, 66);
+        assert_eq!(d.mix.obfuscated, 15);
+        assert_eq!(d.mix.src_port, 4673);
+        assert_eq!(d.mix.src_port_changes, 1);
+        assert_eq!(d.mix.our_port, 4665);
+        assert!(d.tcp_client.is_none(), "no TCP session from it");
+        // The tracker's last 16 hashes seed the detection.
+        assert_eq!(d.hashes.recent.len(), BotHashes::TRACKER_RECENT);
+        assert_eq!(*d.hashes.recent.back().unwrap(), [29u8; 16]);
+        drop(d);
+
+        // After the ban: counted, and plain source requests keep their hashes.
+        assert!(st.is_bot_banned(ip));
+        let mut pkt = vec![0xE3, 0x94];
+        pkt.extend_from_slice(&[0xAB; 16]);
+        pkt.extend_from_slice(&1000u32.to_le_bytes());
+        note_banned(&st, ip, &pkt);
+        note_banned(&st, ip, &[0x4F, 0x12, 0x34]); // obfuscated: counted only
+        let d = st.bot_detections.get(&ip).unwrap();
+        assert_eq!(d.dropped_after_ban, 2);
+        assert!(d.hashes.distinct.contains(&[0xAB; 16]));
+        assert_eq!(*d.hashes.recent.back().unwrap(), [0xAB; 16]);
+    }
+
+    #[test]
+    fn source_request_hashes_are_read_exactly() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&[1; 16]);
+        p.extend_from_slice(&5u32.to_le_bytes());
+        p.extend_from_slice(&[2; 16]);
+        p.extend_from_slice(&0u32.to_le_bytes()); // large file: 8 more bytes
+        p.extend_from_slice(&(5u64 << 32).to_le_bytes());
+        p.extend_from_slice(&[3; 16]);
+        p.extend_from_slice(&9u32.to_le_bytes());
+        assert_eq!(query_hashes(0x94, &p), vec![[1; 16], [2; 16], [3; 16]]);
+        assert_eq!(query_hashes(0x9A, &[[4u8; 16], [5; 16]].concat()), vec![[4; 16], [5; 16]]);
+        assert!(query_hashes(0x98, &p).is_empty());
+    }
+
+    #[test]
+    fn ledger_lines_are_appended() {
+        let st = Arc::new(ServerState::for_test());
+        let dir = std::env::temp_dir().join(format!("botlog-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bot-log.jsonl");
+        let _ = std::fs::remove_file(&path);
+        st.bot_log_path.set(Some(path.clone())).unwrap();
+        flood(&st, (0..40).map(|_| "198.51.100.4".parse().unwrap()));
+        ban_ended(&st, "198.51.100.4".parse().unwrap());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<serde_json::Value> =
+            text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "detected");
+        assert_eq!(lines[1]["event"], "ban_ended");
+        assert_eq!(lines[0]["hash_sample"][0], hex::encode([7u8; 16]));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ledger_sits_next_to_the_config_by_default() {
+        let cfg = std::path::Path::new("/etc/ed2k-server/config.toml");
+        assert_eq!(ledger_path("", cfg), Some("/etc/ed2k-server/bot-log.jsonl".into()));
+        assert_eq!(ledger_path("off", cfg), None);
+        assert_eq!(ledger_path("/var/log/bots.jsonl", cfg), Some("/var/log/bots.jsonl".into()));
+        assert_eq!(ledger_path("", std::path::Path::new("c.toml")), Some("./bot-log.jsonl".into()));
     }
 
     #[test]

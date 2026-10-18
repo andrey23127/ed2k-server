@@ -613,6 +613,10 @@ pub struct StorageConfig {
     /// file is missing or unreadable the CSV is used.
     #[serde(default)]
     pub geoip_mmdb_path: String,
+    /// Ledger of detected bots, one JSON line per detection and per ban end.
+    /// Empty = `bot-log.jsonl` next to the config file; `"off"` = none.
+    #[serde(default)]
+    pub bot_log_path: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

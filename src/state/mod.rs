@@ -10,6 +10,7 @@ pub mod cold_store;
 pub mod file_id;
 pub mod file_name;
 pub mod keyword_index;
+pub mod media;
 pub mod name_interner;
 pub mod posting_codec;
 pub mod smart_sources;
@@ -82,7 +83,15 @@ pub struct ClientHandle {
     pub country: String,
     /// Client software name: "eMule", "aMule", "mldonkey", "Shareaza", etc.
     /// Derived from CT_EMULE_VERSION (0xFB) top byte in the login packet.
+    /// The family, for the Software chart and filter; see `software_detail`.
     pub software: String,
+    /// The same with the version and the mod, when the client sent them:
+    /// "eMule v0.70b", "aMule v2.3.3", "eMule v0.50a [Xtreme 9.1]".
+    pub software_detail: String,
+    /// What the login looked like, to tell clients apart that report the
+    /// same software: the CT_VERSION value, the server flags and the tag IDs
+    /// in the order sent. "v=0x3c flags=0x0719 tags=01,11,20,fb".
+    pub login_fp: String,
     /// Counters for §7.6 enforcement
     pub csam_attempts: u32,
     /// The soft-limit server message has been sent on this connection.
@@ -719,6 +728,11 @@ pub struct ServerState {
     pub bot_query_log: DashMap<std::net::IpAddr, BotTracker>,
     /// Aggregated bot detections, for display in the admin UI.
     pub bot_detections: DashMap<std::net::IpAddr, BotDetection>,
+    /// Where detections are appended as JSON lines (see `bot_detector::ledger`);
+    /// `None` = off. Set once at startup.
+    pub bot_log_path: std::sync::OnceLock<Option<std::path::PathBuf>>,
+    /// Media tags in offered files (see `MediaOfferStats`).
+    pub media_offer_stats: MediaOfferStats,
     /// Temporarily-banned flood bots. Keyed by IP, value = ban start instant.
     /// Entries older than BOT_BAN_TTL are swept by the 60s cleanup task. We use
     /// a time-boxed in-memory ban (not the static ipfilter) because flood-bot
@@ -824,6 +838,155 @@ pub struct ServerState {
 pub struct BotTracker {
     /// Timestamps of recent search/sources requests (last 60 seconds).
     pub query_times: std::sync::Mutex<std::collections::VecDeque<std::time::Instant>>,
+    /// What the queries were, since the tracker was created. Shown with a
+    /// detection, to tell one querying program from another.
+    pub mix: BotMix,
+    /// The last file hashes this source asked sources for, newest last; at
+    /// most `BotHashes::TRACKER_RECENT`. Seeds `BotHashes` at detection.
+    pub recent_hashes: std::sync::Mutex<std::collections::VecDeque<FileHash>>,
+}
+
+/// The file hashes a detected bot asked for, before and after its ban.
+///
+/// A source request for one hash at a time, many times a second, is how a
+/// program checks a list of files for who is sharing them. Which files, and
+/// whether two addresses check the same list, is what tells such a campaign
+/// apart from a broken client.
+#[derive(Clone, Default, Debug)]
+pub struct BotHashes {
+    /// The last hashes asked for, newest last; at most `RECENT`.
+    pub recent: std::collections::VecDeque<FileHash>,
+    /// Every distinct hash, up to `MAX_DISTINCT`; `distinct_overflow` once
+    /// a hash did not fit.
+    pub distinct: std::collections::HashSet<FileHash>,
+    pub distinct_overflow: bool,
+    /// Hashes asked for in total, repeats included.
+    pub total: u64,
+}
+
+impl BotHashes {
+    pub const TRACKER_RECENT: usize = 16;
+    pub const RECENT: usize = 64;
+    /// 16 bytes each plus the set's overhead: about 0.6 MB for a bot that
+    /// fills it. Detections are few; the cap is there for the one that walks
+    /// the whole index.
+    pub const MAX_DISTINCT: usize = 20_000;
+
+    pub fn add(&mut self, h: FileHash) {
+        self.total += 1;
+        if let Some(pos) = self.recent.iter().position(|x| *x == h) {
+            self.recent.remove(pos);
+        } else if self.recent.len() >= Self::RECENT {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(h);
+        if !self.distinct.contains(&h) {
+            if self.distinct.len() < Self::MAX_DISTINCT {
+                self.distinct.insert(h);
+            } else {
+                self.distinct_overflow = true;
+            }
+        }
+    }
+}
+
+/// Counters of one source's UDP queries. Relaxed atomics: the detector reads
+/// them once per detection, and an off-by-one there changes nothing.
+#[derive(Default)]
+pub struct BotMix {
+    pub searches: std::sync::atomic::AtomicU64,
+    pub source_requests: std::sync::atomic::AtomicU64,
+    /// File hashes asked for across all source requests.
+    pub source_hashes: std::sync::atomic::AtomicU64,
+    pub obfuscated: std::sync::atomic::AtomicU64,
+    /// The sender's UDP port and the port of ours it wrote to, last packet.
+    pub last_src_port: std::sync::atomic::AtomicU32,
+    pub last_our_port: std::sync::atomic::AtomicU32,
+    /// The sender's port changed between packets this many times.
+    pub src_port_changes: std::sync::atomic::AtomicU64,
+}
+
+/// A snapshot of `BotMix`, kept with a detection.
+#[derive(Clone, Default, Debug)]
+pub struct BotMixSnapshot {
+    pub searches: u64,
+    pub source_requests: u64,
+    pub source_hashes: u64,
+    pub obfuscated: u64,
+    pub src_port: u16,
+    pub our_port: u16,
+    pub src_port_changes: u64,
+}
+
+impl BotMix {
+    pub fn snapshot(&self) -> BotMixSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        BotMixSnapshot {
+            searches: self.searches.load(Relaxed),
+            source_requests: self.source_requests.load(Relaxed),
+            source_hashes: self.source_hashes.load(Relaxed),
+            obfuscated: self.obfuscated.load(Relaxed),
+            src_port: self.last_src_port.load(Relaxed) as u16,
+            our_port: self.last_our_port.load(Relaxed) as u16,
+            src_port_changes: self.src_port_changes.load(Relaxed),
+        }
+    }
+}
+
+/// How often offered files carry media tags (0xD0-0xD5, or the old string
+/// names), to decide whether storing them is worth the memory. Counted over
+/// every OFFERFILES record since start, accepted or not.
+#[derive(Default)]
+pub struct MediaOfferStats {
+    pub files: std::sync::atomic::AtomicU64,
+    /// Records with any of length, bitrate or codec.
+    pub with_any: std::sync::atomic::AtomicU64,
+    pub length: std::sync::atomic::AtomicU64,
+    pub bitrate: std::sync::atomic::AtomicU64,
+    pub codec: std::sync::atomic::AtomicU64,
+    /// Artist, album or title (0xD0-0xD2), which Lugdunum does not store.
+    pub artist_album_title: std::sync::atomic::AtomicU64,
+    /// Bytes of codec strings, to size a codec table.
+    pub codec_bytes: std::sync::atomic::AtomicU64,
+    /// Distinct codec strings, lowercased and cut to 19 bytes as Lugdunum
+    /// does, with their counts. Stops growing at `MAX_CODECS` names; later
+    /// new names are counted in `codecs_overflow`.
+    pub codecs: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    pub codecs_overflow: std::sync::atomic::AtomicU64,
+}
+
+impl MediaOfferStats {
+    /// Lugdunum's codec table has 255 usable slots.
+    pub const MAX_CODECS: usize = 1024;
+
+    pub fn note(&self, m: &crate::server::offerfiles::MediaTags) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.files.fetch_add(1, Relaxed);
+        if m.any() {
+            self.with_any.fetch_add(1, Relaxed);
+        }
+        if m.length.is_some() {
+            self.length.fetch_add(1, Relaxed);
+        }
+        if m.bitrate.is_some() {
+            self.bitrate.fetch_add(1, Relaxed);
+        }
+        if m.artist_album_title {
+            self.artist_album_title.fetch_add(1, Relaxed);
+        }
+        if let Some(c) = &m.codec {
+            self.codec.fetch_add(1, Relaxed);
+            self.codec_bytes.fetch_add(c.len() as u64, Relaxed);
+            let mut map = self.codecs.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(n) = map.get_mut(c.as_str()) {
+                *n += 1;
+            } else if map.len() < Self::MAX_CODECS {
+                map.insert(c.clone(), 1);
+            } else {
+                self.codecs_overflow.fetch_add(1, Relaxed);
+            }
+        }
+    }
 }
 
 /// Aggregated bot-detection record.
@@ -841,6 +1004,20 @@ pub struct BotDetection {
     pub country: String,
     /// Why we flagged this IP as a bot.
     pub reason: String,
+    /// What it sent (see `BotMix`), as of the last detection.
+    pub mix: BotMixSnapshot,
+    /// A TCP client logged in from the same address at detection time:
+    /// software with version, and nick.
+    pub tcp_client: Option<String>,
+    /// The network's provider, for the ledger.
+    pub provider: Option<String>,
+    /// Hashes it asked for, before and after the ban.
+    pub hashes: BotHashes,
+    /// Datagrams dropped because of the ban, and when the last one came: a
+    /// program that keeps sending for a day into silence does not read the
+    /// answers.
+    pub dropped_after_ban: u64,
+    pub last_dropped: Option<std::time::SystemTime>,
 }
 
 /// A peer server's self-description, as shown in the admin Peers tab.
@@ -1008,6 +1185,8 @@ impl ServerState {
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,
@@ -1267,6 +1446,8 @@ impl ServerState {
             live_cfg: arc_swap::ArcSwap::from(cfg),
             bot_query_log: DashMap::new(),
             bot_detections: DashMap::new(),
+            media_offer_stats: MediaOfferStats::default(),
+            bot_log_path: std::sync::OnceLock::new(),
             banned_bots: DashMap::new(),
             banned_publishers: DashMap::new(),
             client_id_index: DashMap::new(),
@@ -1666,7 +1847,9 @@ impl ServerState {
             is_high_id: false,
             connected_at: std::time::Instant::now(),
             country,
+            software_detail: software.clone(),
             software,
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,
@@ -1887,7 +2070,8 @@ impl ServerState {
         );
 
         // ── totals ────────────────────────────────────────────────────────────
-        let slab_total = slab_records + slab_next + slab_buckets + slab_spilled_src;
+        let (_media_files, slab_media) = self.file_slab.media_report();
+        let slab_total = slab_records + slab_next + slab_buckets + slab_spilled_src + slab_media;
         let kw_total = kw_data + kw_headers + kw_slots;
         let names_total = name_bytes + name_arc_ctrl + name_map_slots;
         let uf_total = uf_sets_bytes + uf_map_slots;
@@ -1917,6 +2101,7 @@ impl ServerState {
             ("slab_records_cap".into(), slab_records),
             ("slab_next+buckets_cap".into(), slab_next + slab_buckets),
             ("slab_sources_spilled".into(), slab_spilled_src),
+            ("slab_media_cap".into(), slab_media),
             ("slab_TOTAL".into(), slab_total),
             // keyword index
             ("keyword_posting_data_cap".into(), kw_data),
@@ -2039,6 +2224,8 @@ mod callback_tests {
             connected_at: Instant::now(),
             country: "??".to_string(),
             software: "test".to_string(),
+            software_detail: "test".to_string(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,

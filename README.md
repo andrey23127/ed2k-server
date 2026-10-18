@@ -470,6 +470,7 @@ why.
 | `ipfilter_path` | Path to `guarding.p2p` | **live** (SIGHUP reload) |
 | `country_db_path` | Path to `ip-to-country.csv` (IPv4) | restart; a new file at the path reloads live |
 | `geoip_mmdb_path` | MaxMind DB tried before the CSV (IPv4 + IPv6). Empty = `ipinfo_lite.mmdb` next to the CSV; `"off"` = CSV only | restart; a new file at the path reloads live |
+| `bot_log_path` | Ledger of detected bots, one JSON line per detection and per ban end. Empty = `bot-log.jsonl` next to the config file; `"off"` = none | restart |
 
 ### `[admission]`
 Server-wide ceilings on the work remote peers can cause, however the load is
@@ -784,6 +785,8 @@ Every element is ignored by a client that does not know it.
 | client → server | login tag `CT_MOD_IP_V6` | `0xAE`, 16 raw bytes | the client's public IPv6 |
 | client → server | `CT_SERVER_FLAGS` bit | `0x1000` | client can parse IPv6 sources |
 | server → client | `OP_IDCHANGE` flags / UDP ping flags bit | `0x4000` | server speaks the extension |
+| server → client | `OP_IDCHANGE` flags bit | `0x8000` | server accepts `OP_IPV6_UPDATE` |
+| client → server | `OP_IPV6_UPDATE` | `0x63`, 16 raw bytes | the client's new IPv6, or zeros to withdraw it; only to a server that set `0x8000` |
 | server → client | `OP_SERVERIDENT` tag `ST_IPV6` | `0xAE`, 16 raw bytes | the server's IPv6 (`this_ip6`) |
 | server → client | `OP_SERVERIDENT` tag `ST_IPV6_STATUS` | `0xAB`, u8 | `0x01` address held, `0x02` treated as reachable |
 | server → client | source record in `OP_FOUNDSOURCES` / UDP answer | id `0xFFFFFFFF`, port, then 16 bytes | an IPv6 source |
@@ -798,9 +801,15 @@ Rules the server applies:
 - Only a globally usable IPv6 is published — never link-local, unique-local,
   loopback, multicast or IPv4-mapped.
 - An IPv6 record is sent only for a source that is LowID on IPv4 (a HighID
-  source is reachable already), and only to a requester that can parse it: a
-  TCP client that sent the tag or connected over IPv6, or a UDP query that
-  arrived over IPv6.
+  source is reachable already), and only to a requester that can parse it and
+  has no better route: a TCP client that is LowID itself and sent the tag or
+  connected over IPv6, or a UDP query that arrived over IPv6. A HighID TCP
+  requester gets the low id and reaches the source by callback, which always
+  works for it, rather than an IPv6 address nobody has checked (issue #33).
+- `OP_IPV6_UPDATE` follows the login tag's rules: a usable address is
+  published, any address makes the client able to receive IPv6 records, zeros
+  withdraw both. A session that arrived over IPv6 keeps its observed address
+  and ignores the update (issue #34).
 - Answers carrying IPv6 records bypass the source cache, which is shared with
   clients that cannot parse them.
 
@@ -845,8 +854,9 @@ tag.
 > reads the advertisement, so the client now has to say so.
 
 **The server answers**, only to a client that asked and only when v1 is on and
-valid, in the post-login `OP_SERVERIDENT` (always sent right after login, no
-`OP_GETSERVERLIST` needed) and only there, each exactly once, all `uint32`:
+valid, in the post-login `OP_SERVERIDENT` (always sent right after login to a
+client that asked, no `OP_GETSERVERLIST` needed) and only there, each exactly
+once, all `uint32`:
 
 | Tag | Name kind | Meaning |
 |---|---|---|
@@ -869,8 +879,9 @@ whole life: a configuration change reaches new connections only, and a
 reconnect starts afresh (new snapshot, full bucket, budget counted from what
 the client sources then).
 
-**One advertisement per connection.** The server sends `OP_SERVERIDENT` once,
-right after login, and never again on that connection. It holds a connection to
+**One advertisement per connection.** The server sends a client that asked
+`OP_SERVERIDENT` once, right after login, and never again on that connection
+(not in the answer to `OP_GETSERVERLIST` either). It holds a connection to
 v1 if and only if that SERVERIDENT carried a complete, valid advertisement, so
 a client that finds none there (missing, partial, malformed) is legacy on both
 sides. A client that did get a valid one keeps it for the connection: a later
@@ -1171,18 +1182,70 @@ the codec buffers (`clients_framed_buffers`), the obfuscation buffers and keys
 tasks × the size of one, measured at spawn) and the push channels of logged-in
 clients (`clients_push_channels_est`).
 
-The *Clients* tab searches on the server: free text matches an address or a
-nick (case-insensitive), an IPv4 CIDR such as `82.48.0.0/16` matches by
+The *Clients* tab shows each client's software with its version, as the
+client reported it at login: `eMule v0.70b`, `aMule v2.3.3`, and the mod in
+brackets when the client sends its name (`eMule v0.50a [Xtreme 9.1]`; stock
+eMule and most mods send it only to other clients, not to the server, so the
+server cannot show it). Hovering the software shows the shape of the login,
+`v=0x3c flags=0x0719 tags=01,11,20,fb`: CT_VERSION, the server flags and the
+tag IDs in the order sent, which tells apart programs that report the same
+version. The *Client Software* chart lists the versions under each family.
+
+The *Clients* tab searches on the server: free text matches an address, a
+nick or a software version (case-insensitive), an IPv4 CIDR such as `82.48.0.0/16` matches by
 network, and country, software and High/LowID narrow it further; results are
 sorted and paged 100 at a time. The same filter is available as
 `GET /api/clients/search?q=&country=&software=&id=high|low&sort=connected|files|ip|nick|country|software&dir=asc|desc&offset=&limit=`
 (limit at most 500). `GET /api/clients` still returns every connected client
 for scripts.
 
+`OP_SERVERIDENT` goes out once per connection, as from Lugdunum after
+`OP_SERVERLIST` in the answer to `OP_GETSERVERLIST`; at login only to a client
+that asked for OFFERFILES v1 or speaks the IPv6 extension. Sending it to
+everyone at login broke some eMule mods (MorphCA 2.2, ZZUL-TRA 2.6), whose
+release builds misread it and drop the connection.
+
 The *Peers* tab shows each listed server's name, description and version (its
-answer to UDP `0xA2`), its user and file counts (`0x96`), and its country. Each
+answer to UDP `0xA2`), its user and file counts (`0x96`), and its country and
+provider. Each
 peer is asked at most once an hour on UDP `TCP+4`; a peer that answers only
 obfuscated UDP shows "no answer".
+
+The *Bots* tab shows, for each flagged source, its provider and what it
+sent since it was first seen: searches, source requests with the average
+number of file hashes per request, the share of obfuscated packets, its UDP
+port (and how often it changed) and the port of ours it wrote to. A UDP query
+carries no client name, so the tab also shows the TCP client logged in from
+the same address, if there is one, with its software version and nick. Behind
+a NAT that may be a different program than the one sending the queries.
+
+A detected bot's source requests keep being looked at after its ban, without
+being answered: the tab counts the datagrams dropped since the ban and when the
+last one came, and keeps the file hashes it asks for (the last 64, and up to
+20 000 distinct). Clicking the count opens those files with their names, sizes
+and source counts from the index, and the other bots that asked for the same
+files. A program that checks a list of files one hash at a time, many times a
+second, and keeps going into a ban, is collecting who shares those files.
+
+For keeping a record, `GET /api/bots/export?format=csv` (or JSON lines without
+`format`) exports every detection since start, and every detection and every
+ban end is appended to a ledger, `bot-log.jsonl` next to the config file by
+default (`storage.bot_log_path`), which survives restarts and is served at
+`GET /api/bots/log?tail=N`. Both hold hashes, not file names.
+
+`GET /api/bots/files` lists every file the detected bots asked for since
+start, as CSV (UTF-8, opens in Excel): hash, whether we index it, its name,
+size and sources, and which bots asked for it, most-asked first.
+`?ip=` keeps one bot, `?indexed=1` only the files we index, `?format=json`
+gives JSON lines. Links under the Bots table and in a bot's file list.
+
+Length, bitrate and codec of offered files are stored and searchable, as in
+Lugdunum: a side table of 8 bytes per media file (about one offer in seven
+carries them), shown in `/api/memsize` as `slab_media_cap`. Artist, album
+and title are not stored, by Lugdunum either; a search on them matches words
+of the file name. `GET /api/media_stats` counts the media tags per offer since
+start (how many records carry each, the distinct codecs) and what is stored
+now (`stored_files`, `stored_bytes`, `codec_table`).
 
 Country flags are drawn with a font built into the binary (a 78 KB Twemoji
 subset), because Windows has no flag glyphs and Chrome, Edge and Opera there

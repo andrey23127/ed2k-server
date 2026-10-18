@@ -207,6 +207,9 @@ country_db_path = "/etc/ed2k-server/ip-to-country.csv"
 # MaxMind DB (IPv4 + IPv6, with provider names). Tried first; when it is
 # missing or unreadable the CSV above is used.
 geoip_mmdb_path = "/etc/ed2k-server/ipinfo_lite.mmdb"
+# Ledger of detected bots (JSON lines). Empty = bot-log.jsonl next to this
+# file; "off" = none.
+# bot_log_path = ""
 
 [admin]
 enabled = true

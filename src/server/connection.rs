@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::proto::{opcodes::*, CryptStream, Ed2kCodec, Frame};
 use crate::server::callback::handle_callback_request;
 use crate::server::get_sources::{handle_get_sources, GetSourcesRequest};
-use crate::server::login::{build_welcome_batch, handle_login, LoginRequest};
+use crate::server::login::{handle_login, LoginRequest};
 /// OFFERFILES batches of up to this many records are handled on the runtime.
 const OFFER_INLINE_MAX: usize = 8;
 
@@ -67,6 +67,11 @@ pub(crate) struct SessionAdmission {
     /// OFFERFILES v1 bucket of this connection (issue #19); `Some` exactly
     /// when the client was sent the v1 advertisement.
     pub offer_bucket: Option<crate::server::offer_pacing::Gcra>,
+    /// OP_SERVERIDENT went out on this connection. It is sent at most once:
+    /// at login to a client that needs it there, otherwise with the first
+    /// server list (see `login::ident_at_login`). The OFFERFILES v1 contract
+    /// promises one advertisement per connection.
+    pub ident_sent: bool,
 }
 
 pub async fn handle_connection(
@@ -142,6 +147,7 @@ pub async fn handle_admitted_connection(
     let mut sess = SessionAdmission {
         relay: crate::admission::RelayBudget::new(&state.admission.cfg),
         offer_bucket: None,
+        ident_sent: false,
     };
 
     if live.log.connection_trace {
@@ -681,7 +687,9 @@ async fn dispatch(
                 sl.retain(|s| s.ip() != &client_v4);
             }
             *client = Some(new_client.clone());
-            for f in build_welcome_batch(cfg, state, &new_client) {
+            let ident = wants_v1 || crate::server::login::ident_at_login(&new_client);
+            sess.ident_sent = ident;
+            for f in crate::server::login::build_welcome_batch_with(cfg, state, &new_client, ident) {
                 framed.send(f).await?;
             }
         }
@@ -906,6 +914,34 @@ async fn dispatch(
             }
         }
 
+        OP_IPV6_UPDATE => {
+            // Issue #34: the client's IPv6 changed, or it no longer has one.
+            let Some(c) = client.as_mut() else {
+                return Err(anyhow::anyhow!("IPV6_UPDATE before login"));
+            };
+            let session_v6 =
+                matches!(peer.ip(), std::net::IpAddr::V6(a) if a.to_ipv4_mapped().is_none());
+            let outcome = crate::server::login::apply_ipv6_update(c, &frame.payload, session_v6);
+            use crate::server::login::Ipv6Update::*;
+            if matches!(outcome, Published(_) | Unusable | Withdrawn) {
+                // Side table first, then the client map, as at login: the
+                // source encoder reads the table by user hash.
+                match c.ipv6 {
+                    Some(a) => {
+                        state.client_ipv6.insert(c.user_hash, a);
+                    }
+                    None => {
+                        state.client_ipv6.remove(&c.user_hash);
+                    }
+                }
+                if let Some(mut h) = state.clients.get_mut(&c.user_hash) {
+                    h.ipv6 = c.ipv6;
+                    h.ipv6_capable = c.ipv6_capable;
+                }
+            }
+            debug!(ip = %peer.ip(), ?outcome, "IPv6 update");
+        }
+
         OP_LOWID_HOLEPUNCH_REQUEST => {
             let Some(c) = client.as_ref() else {
                 return Err(anyhow::anyhow!("HOLEPUNCH_REQUEST before login"));
@@ -953,6 +989,15 @@ async fn dispatch(
         OP_GETSERVERLIST => {
             let payload = crate::server::gossip::build_tcp_server_list(state).await;
             framed.send(Frame::new(OP_SERVERLIST, payload)).await?;
+            // Then SERVERIDENT, as Lugdunum answers 0x14: list first, ident
+            // after. This is where most clients get our name and description
+            // over TCP; see `ident_at_login` for why not at login.
+            if let Some(c) = client.as_ref().filter(|_| !sess.ident_sent) {
+                framed
+                    .send(crate::server::login::build_server_ident(cfg, state, c))
+                    .await?;
+                sess.ident_sent = true;
+            }
         }
 
         OP_DISCONNECT => {
@@ -1088,6 +1133,8 @@ mod session_end_tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,

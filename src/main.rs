@@ -484,6 +484,13 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    let _ = state.bot_log_path.set(ed2k_server::server::bot_detector::ledger_path(
+        &cfg.storage.bot_log_path,
+        &args.config,
+    ));
+    if let Some(Some(p)) = state.bot_log_path.get() {
+        tracing::info!(path = %p.display(), "bot ledger");
+    }
     // OFFERFILES v1 (issue #19): say at startup what new logins will be told,
     // or why nothing (the same check logs the error again only if the values
     // change). An unusable configuration is not fatal: the server is a legacy
@@ -885,9 +892,17 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
                 // Sweep expired flood-bot bans (24h TTL). Keeps banned_bots
                 // bounded by the number of bots seen in a rolling 24h window.
-                state_clean
-                    .banned_bots
-                    .retain(|_, since| since.elapsed() < ServerState::BOT_BAN_TTL);
+                let mut ended = Vec::new();
+                state_clean.banned_bots.retain(|ip, since| {
+                    let keep = since.elapsed() < ServerState::BOT_BAN_TTL;
+                    if !keep {
+                        ended.push(*ip);
+                    }
+                    keep
+                });
+                for ip in ended {
+                    ed2k_server::server::bot_detector::ban_ended(&state_clean, ip);
+                }
 
                 // Q1: sweep expired CSAM-publisher bans and stale per-user
                 // distinct-file sets. Both use publisher_blacklist_seconds — for

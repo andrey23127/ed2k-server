@@ -20,6 +20,34 @@ pub struct OfferedFile {
     pub port: u16,
     pub filename: String,
     pub size: u64,
+    /// Media tags the record carried. Only counted for now (see
+    /// `MediaOfferStats`), not stored.
+    pub media: MediaTags,
+}
+
+/// Which media tags an offered file carried, by ID (0xD0-0xD5) or by the
+/// old string names eMule uses ("length", "bitrate", "codec").
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MediaTags {
+    /// Seconds; a number, or text such as "1:30:00".
+    pub length: Option<u32>,
+    pub bitrate: Option<u32>,
+    /// Normalised as stored (`CodecTable::normalise`).
+    pub codec: Option<String>,
+    pub artist_album_title: bool,
+}
+
+impl MediaTags {
+    /// What is stored for the file, Lugdunum's way: a zero is "not given",
+    /// and a codec takes a table index.
+    pub fn to_media(&self, codecs: &crate::state::media::CodecTable) -> crate::state::media::Media {
+        let codec = self.codec.as_deref().map_or(0, |c| codecs.intern(c));
+        crate::state::media::Media::new(self.length.unwrap_or(0), self.bitrate.unwrap_or(0), codec)
+    }
+
+    pub fn any(&self) -> bool {
+        self.length.is_some() || self.bitrate.is_some() || self.codec.is_some()
+    }
 }
 
 pub fn parse_offerfiles(payload: &[u8]) -> Result<Vec<OfferedFile>> {
@@ -52,8 +80,30 @@ pub fn parse_offerfiles(payload: &[u8]) -> Result<Vec<OfferedFile>> {
         let mut filename = String::new();
         let mut size_lo: u32 = 0;
         let mut size_hi: u32 = 0;
+        let mut media = MediaTags::default();
 
         for tag in read_tag_list(&mut slice, tag_count) {
+            let media_id = match &tag.name {
+                TagName::Byte(b) => Some(*b),
+                TagName::Str(n) if n.eq_ignore_ascii_case("length") => Some(0xD3),
+                TagName::Str(n) if n.eq_ignore_ascii_case("bitrate") => Some(0xD4),
+                TagName::Str(n) if n.eq_ignore_ascii_case("codec") => Some(0xD5),
+                _ => None,
+            };
+            match media_id {
+                Some(0xD0..=0xD2) => media.artist_album_title = true,
+                Some(0xD3) => {
+                    media.length = tag
+                        .as_u32()
+                        .or_else(|| tag.str_value().map(crate::state::media::parse_length_text))
+                        .filter(|v| *v != 0);
+                }
+                Some(0xD4) => media.bitrate = tag.as_u32().filter(|v| *v != 0),
+                Some(0xD5) => {
+                    media.codec = tag.str_value().and_then(crate::state::media::CodecTable::normalise);
+                }
+                _ => {}
+            }
             if let TagName::Byte(b) = tag.name {
                 match b {
                     FT_FILENAME => {
@@ -84,6 +134,7 @@ pub fn parse_offerfiles(payload: &[u8]) -> Result<Vec<OfferedFile>> {
             port,
             filename,
             size,
+            media,
         });
     }
 
@@ -98,6 +149,9 @@ pub fn handle_offerfiles(
 ) -> (u32, u32) {
     let mut accepted = 0u32;
     let mut blocked = 0u32;
+    for f in &files {
+        state.media_offer_stats.note(&f.media);
+    }
 
     // SOFT FILE LIMIT (`limits.soft_limit_files`, live; 0 = no limit).
     //
@@ -301,6 +355,9 @@ pub fn handle_offerfiles(
         let stored_name = crate::proto::tags::cap_string(&file.filename, max_string).to_string();
         state.add_file_with_source(file.hash, file.size, stored_name, source);
         accepted += 1;
+        if file.media.any() {
+            state.file_slab.merge_media(&file.hash, file.media.to_media(&state.file_slab.codecs));
+        }
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             debug!(
@@ -517,6 +574,8 @@ mod soft_limit_tests {
             connected_at: Instant::now(),
             country: "??".into(),
             software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,
@@ -539,6 +598,7 @@ mod soft_limit_tests {
                     port: SELF_COMPLETE_PORT,
                     filename: format!("holiday clip number {n}.avi"),
                     size: 1_000_000 + n as u64,
+                    media: Default::default(),
                 }
             })
             .collect()
@@ -707,6 +767,7 @@ mod string_size_tests {
             port: SELF_COMPLETE_PORT,
             filename: name.to_string(),
             size: 123_456,
+            media: Default::default(),
         }
     }
 
@@ -726,6 +787,8 @@ mod string_size_tests {
             connected_at: std::time::Instant::now(),
             country: "??".into(),
             software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,

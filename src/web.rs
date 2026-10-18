@@ -637,6 +637,11 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/config", get(api_config_get))
             .route("/api/config", post(api_config_set))
             .route("/api/bots", get(api_bots))
+            .route("/api/media_stats", get(api_media_stats))
+            .route("/api/bots/detail", get(api_bot_detail))
+            .route("/api/bots/export", get(api_bots_export))
+            .route("/api/bots/log", get(api_bots_log))
+            .route("/api/bots/files", get(api_bots_files))
             .route("/api/block_stats", get(api_block_stats))
             .route("/api/memdebug", get(api_memdebug))
             .route("/api/memsize", get(api_memsize))
@@ -1055,6 +1060,10 @@ struct ClientRow {
     nick: String,
     country: String,
     software: String,
+    /// With version and mod: "eMule v0.70b [AI v1.6.0]".
+    software_detail: String,
+    /// The login's shape (see `ClientHandle::login_fp`), shown as a tooltip.
+    login_fp: String,
     shared_files: u32,
     high_id: bool,
     connected_seconds: u64,
@@ -1080,6 +1089,8 @@ fn client_row(s: &WebState, c: &crate::state::ClientHandle, now: Instant) -> Cli
         nick: c.nick.clone(),
         country: c.country.clone(),
         software: c.software.clone(),
+        software_detail: c.software_detail.clone(),
+        login_fp: c.login_fp.clone(),
         // Counted from the source index, the same count the soft limit uses.
         // The handle had its own counter that nothing ever incremented, so
         // this column read 0 for everyone.
@@ -1243,6 +1254,7 @@ impl ClientQuery {
         }
         c.ip.to_string().contains(&self.text)
             || c.nick.to_lowercase().contains(&self.text)
+            || c.software_detail.to_lowercase().contains(&self.text)
             || c.ipv6.is_some_and(|a| a.to_string().contains(&self.text))
     }
 }
@@ -1338,6 +1350,10 @@ struct PeerRow {
     /// are NOT propagated — the mldonkey filter.
     verified: bool,
     country: Option<String>,
+    /// The network's provider ("AS24940 Hetzner Online GmbH"), when the GeoIP
+    /// database carries it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     /// From the peer's own OP_SERVER_DESC_RES, once it has answered.
     name: Option<String>,
     desc: Option<String>,
@@ -1367,6 +1383,7 @@ async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
                 verified: s.server.verified_sockets.contains_key(addr)
                     || s.server.seed_server_keys.contains_key(addr),
                 country: geo.lookup(*addr.ip()).map(|(c, _)| c),
+                provider: geo.provider(*addr.ip()),
                 name: info.name,
                 desc: info.desc,
                 version: info.version,
@@ -1588,20 +1605,69 @@ async fn api_reload(State(s): State<WebState>) -> impl IntoResponse {
 struct ClientStatEntry {
     software: String,
     count: u64,
+    /// The versions within the family (`software_detail`), most common
+    /// first, at most `VERSIONS_SHOWN`; the rest are summed in `other_versions`.
+    versions: Vec<(String, u64)>,
+    other_versions: u64,
 }
 
 async fn api_client_stats(State(s): State<WebState>) -> Json<Vec<ClientStatEntry>> {
+    const VERSIONS_SHOWN: usize = 12;
     // Compute from CURRENTLY connected clients (not cumulative history).
-    let mut map: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    use std::collections::HashMap;
+    let mut map: HashMap<String, (u64, HashMap<String, u64>)> = HashMap::new();
     for entry in s.server.clients.iter() {
-        *map.entry(entry.value().software.clone()).or_insert(0) += 1;
+        let c = entry.value();
+        let e = map.entry(c.software.clone()).or_default();
+        e.0 += 1;
+        *e.1.entry(c.software_detail.clone()).or_insert(0) += 1;
     }
     let mut entries: Vec<ClientStatEntry> = map
         .into_iter()
-        .map(|(software, count)| ClientStatEntry { software, count })
+        .map(|(software, (count, versions))| {
+            let mut versions: Vec<(String, u64)> = versions.into_iter().collect();
+            versions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let other_versions = versions.iter().skip(VERSIONS_SHOWN).map(|v| v.1).sum();
+            versions.truncate(VERSIONS_SHOWN);
+            ClientStatEntry { software, count, versions, other_versions }
+        })
         .collect();
     entries.sort_by(|a, b| b.count.cmp(&a.count));
     Json(entries)
+}
+
+/// How often offered files carry media tags (`MediaOfferStats`): the numbers
+/// that decide whether storing length, bitrate and codec is worth the memory.
+async fn api_media_stats(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let m = &s.server.media_offer_stats;
+    let mut codecs: Vec<(String, u64)> = m
+        .codecs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    codecs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let distinct = codecs.len();
+    codecs.truncate(40);
+    let (stored, stored_bytes) = s.server.file_slab.media_report();
+    Json(serde_json::json!({
+        "files": m.files.load(Relaxed),
+        "with_any": m.with_any.load(Relaxed),
+        "length": m.length.load(Relaxed),
+        "bitrate": m.bitrate.load(Relaxed),
+        "codec": m.codec.load(Relaxed),
+        "artist_album_title": m.artist_album_title.load(Relaxed),
+        "codec_bytes": m.codec_bytes.load(Relaxed),
+        "distinct_codecs": distinct,
+        "codecs_overflow": m.codecs_overflow.load(Relaxed),
+        "top_codecs": codecs,
+        // What is held now, in the index (not counted per offer).
+        "stored_files": stored,
+        "stored_bytes": stored_bytes,
+        "codec_table": s.server.file_slab.codecs.len(),
+    }))
 }
 
 #[derive(Serialize)]
@@ -1866,10 +1932,62 @@ struct BotRow {
     /// True if this IP is currently within its 24h flood-ban window (its UDP
     /// traffic is being dropped at the recv loop).
     banned: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
+    /// What it sent, counted from its first query (see `BotMix`).
+    searches: u64,
+    source_requests: u64,
+    source_hashes: u64,
+    obfuscated: u64,
+    src_port: u16,
+    our_port: u16,
+    src_port_changes: u64,
+    /// A TCP client logged in from the same address: at detection time, or
+    /// now if there was none then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tcp_client: Option<String>,
+    /// File hashes it asked sources for: distinct, and in total.
+    hashes_distinct: usize,
+    hashes_total: u64,
+    /// Datagrams dropped since the ban, and how long ago the last one came.
+    dropped_after_ban: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_dropped_secs_ago: Option<u64>,
+}
+
+/// "eMule v0.50a (nick)" for every address in `ips` that has a TCP client
+/// logged in now. One pass over the clients for the whole table.
+fn tcp_clients_on(
+    s: &WebState,
+    ips: &std::collections::HashSet<std::net::IpAddr>,
+) -> std::collections::HashMap<std::net::IpAddr, String> {
+    let mut out = std::collections::HashMap::new();
+    let ips: std::collections::HashSet<_> =
+        ips.iter().filter(|ip| s.server.conn_per_ip.contains_key(ip)).copied().collect();
+    if ips.is_empty() {
+        return out;
+    }
+    for c in s.server.clients.iter() {
+        if ips.contains(&c.ip) && !out.contains_key(&c.ip) {
+            let nick: String = c.nick.chars().take(40).collect();
+            out.insert(c.ip, format!("{} ({nick})", c.software_detail));
+        }
+    }
+    out
 }
 
 async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
     let now = std::time::SystemTime::now();
+    let geo = s.server.country_db.read().await;
+    // Only IPv4 keys are addresses; an IPv6 key is a prefix with no client.
+    let wanted: std::collections::HashSet<std::net::IpAddr> = s
+        .server
+        .bot_detections
+        .iter()
+        .filter(|e| e.value().tcp_client.is_none() && e.key().is_ipv4())
+        .map(|e| *e.key())
+        .collect();
+    let live = tcp_clients_on(&s, &wanted);
     let mut rows: Vec<BotRow> = s
         .server
         .bot_detections
@@ -1910,12 +2028,293 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
                 banned: s.server.is_bot_banned(*e.key()),
+                provider: geo.provider(*e.key()),
+                searches: d.mix.searches,
+                source_requests: d.mix.source_requests,
+                source_hashes: d.mix.source_hashes,
+                obfuscated: d.mix.obfuscated,
+                src_port: d.mix.src_port,
+                our_port: d.mix.our_port,
+                src_port_changes: d.mix.src_port_changes,
+                tcp_client: d.tcp_client.clone().or_else(|| live.get(e.key()).cloned()),
+                hashes_distinct: d.hashes.distinct.len(),
+                hashes_total: d.hashes.total,
+                dropped_after_ban: d.dropped_after_ban,
+                last_dropped_secs_ago: d
+                    .last_dropped
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs()),
             }
         })
         .collect();
     // total_cmp gives a total order on f64 (no panic on NaN). Sort by qpm desc.
     rows.sort_by(|a, b| b.queries_per_minute.total_cmp(&a.queries_per_minute));
     Json(rows)
+}
+
+/// `a=1&b=x%20y` → map, values URL-decoded.
+fn query_map(qs: Option<&str>) -> std::collections::HashMap<String, String> {
+    qs.unwrap_or("")
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (k.to_string(), url_decode(v))
+        })
+        .collect()
+}
+
+/// The bot key for an `ip` query parameter: an address, or an IPv6 prefix as
+/// the Bots table shows it ("2001:db8::/64").
+fn bot_key(s: &WebState, q: &str) -> Option<std::net::IpAddr> {
+    let ip: std::net::IpAddr = q.split('/').next()?.trim().parse().ok()?;
+    Some(s.server.source_key(ip))
+}
+
+/// One bot in detail: the hashes it asked for, newest first, with the name,
+/// size and source count of each one we index, and the other bots that asked
+/// for the same files.
+async fn api_bot_detail(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let Some(key) = q.get("ip").and_then(|v| bot_key(&s, v)) else {
+        return (StatusCode::BAD_REQUEST, "ip= missing or not an address").into_response();
+    };
+    let Some(d) = s.server.bot_detections.get(&key) else {
+        return (StatusCode::NOT_FOUND, "no such bot").into_response();
+    };
+    let recent: Vec<serde_json::Value> = d
+        .hashes
+        .recent
+        .iter()
+        .rev()
+        .map(|h| {
+            let rec = s.server.file_slab.with_record_by_hash(h, |_, r| {
+                (r.name().to_string(), r.size, r.sources.len() as u32)
+            });
+            match rec {
+                Some((name, size, sources)) => serde_json::json!({
+                    "hash": hex::encode(h), "name": name, "size": size, "sources": sources,
+                }),
+                None => serde_json::json!({ "hash": hex::encode(h), "indexed": false }),
+            }
+        })
+        .collect();
+    let mine = d.hashes.distinct.clone();
+    let (distinct, total, overflow) =
+        (d.hashes.distinct.len(), d.hashes.total, d.hashes.distinct_overflow);
+    drop(d);
+    // Overlap with every other bot. Detections are few and the sets are
+    // capped, so this is a few thousand set lookups at most.
+    let mut overlap: Vec<(String, usize)> = s
+        .server
+        .bot_detections
+        .iter()
+        .filter(|e| *e.key() != key)
+        .filter_map(|e| {
+            let (small, big) = if e.hashes.distinct.len() < mine.len() {
+                (&e.hashes.distinct, &mine)
+            } else {
+                (&mine, &e.hashes.distinct)
+            };
+            let n = small.iter().filter(|h| big.contains(*h)).count();
+            (n > 0).then(|| (e.key().to_string(), n))
+        })
+        .collect();
+    overlap.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    overlap.truncate(50);
+    Json(serde_json::json!({
+        "ip": key.to_string(),
+        "hashes_distinct": distinct,
+        "hashes_total": total,
+        "hashes_distinct_capped": overflow,
+        "recent": recent,
+        "shares_hashes_with": overlap.iter().map(|(ip, n)| serde_json::json!({"ip": ip, "common": n})).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// Every bot detection in memory (since start), as CSV or JSON lines for
+/// keeping. No file names: hashes only, so the export can be shared.
+async fn api_bots_export(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let mut rows: Vec<serde_json::Value> = s
+        .server
+        .bot_detections
+        .iter()
+        .map(|e| crate::server::bot_detector::ledger_entry("snapshot", *e.key(), e.value()))
+        .collect();
+    rows.sort_by(|a, b| a["ip"].as_str().cmp(&b["ip"].as_str()));
+    if q.get("format").map(String::as_str) == Some("csv") {
+        let cols = [
+            "ip", "country", "provider", "reason", "qpm", "stddev_ms", "tcp_client", "searches",
+            "source_requests", "obfuscated", "src_port", "src_port_changes", "our_port",
+            "hashes_total", "hashes_distinct", "dropped_after_ban",
+        ];
+        let cell = |v: &serde_json::Value| -> String {
+            let t = match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                o => o.to_string(),
+            };
+            if t.contains([',', '"', '\n']) {
+                format!("\"{}\"", t.replace('"', "\"\""))
+            } else {
+                t
+            }
+        };
+        let mut out = cols.join(",");
+        out.push('\n');
+        for r in &rows {
+            out.push_str(&cols.iter().map(|c| cell(&r[*c])).collect::<Vec<_>>().join(","));
+            out.push('\n');
+        }
+        return ([(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")], out).into_response();
+    }
+    let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], body).into_response()
+}
+
+/// Every file the detected bots asked sources for, one row per hash: name,
+/// size and sources from the index (empty when we do not index it), and
+/// which bots asked. `?ip=` keeps one bot's files, `?indexed=1` only the ones
+/// we index, `?format=json` gives JSON lines instead of CSV.
+///
+/// Built from each bot's distinct set (up to `BotHashes::MAX_DISTINCT`), so
+/// it covers what was asked since start, before and after the ban.
+async fn api_bots_files(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let only = match q.get("ip").filter(|v| !v.is_empty()) {
+        Some(v) => match bot_key(&s, v) {
+            Some(k) => Some(k),
+            None => return (StatusCode::BAD_REQUEST, "ip= is not an address").into_response(),
+        },
+        None => None,
+    };
+    let indexed_only = q.get("indexed").is_some_and(|v| v == "1");
+    // hash → the bots that asked for it.
+    let mut by_hash: std::collections::BTreeMap<crate::state::FileHash, Vec<String>> =
+        Default::default();
+    for e in s.server.bot_detections.iter() {
+        if only.is_some_and(|k| k != *e.key()) {
+            continue;
+        }
+        let ip = e.key().to_string();
+        for h in &e.hashes.distinct {
+            by_hash.entry(*h).or_default().push(ip.clone());
+        }
+    }
+    struct Row {
+        hash: String,
+        name: Option<String>,
+        size: Option<u64>,
+        sources: Option<u32>,
+        bots: Vec<String>,
+    }
+    let mut rows: Vec<Row> = by_hash
+        .into_iter()
+        .filter_map(|(h, mut bots)| {
+            bots.sort();
+            let rec = s.server.file_slab.with_record_by_hash(&h, |_, r| {
+                (r.name().to_string(), r.size, r.sources.len() as u32)
+            });
+            if indexed_only && rec.is_none() {
+                return None;
+            }
+            Some(Row {
+                hash: hex::encode(h),
+                name: rec.as_ref().map(|r| r.0.clone()),
+                size: rec.as_ref().map(|r| r.1),
+                sources: rec.map(|r| r.2),
+                bots,
+            })
+        })
+        .collect();
+    // Most-asked first (by how many bots), then by name.
+    rows.sort_by(|a, b| {
+        b.bots.len().cmp(&a.bots.len()).then_with(|| a.name.cmp(&b.name)).then_with(|| a.hash.cmp(&b.hash))
+    });
+    if q.get("format").map(String::as_str) == Some("json") {
+        let body: String = rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "hash": r.hash, "indexed": r.name.is_some(), "name": r.name,
+                        "size": r.size, "sources": r.sources, "bots": r.bots,
+                    })
+                )
+            })
+            .collect();
+        return ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], body).into_response();
+    }
+    let cell = |t: &str| -> String {
+        if t.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", t.replace('"', "\"\""))
+        } else {
+            t.to_string()
+        }
+    };
+    // UTF-8 with a BOM, so Excel shows non-Latin names correctly.
+    let mut out = String::from("\u{feff}hash,indexed,name,size,sources,bot_count,bots\n");
+    for r in &rows {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{}\n",
+            r.hash,
+            if r.name.is_some() { "yes" } else { "no" },
+            cell(r.name.as_deref().unwrap_or("")),
+            r.size.map_or(String::new(), |v| v.to_string()),
+            r.sources.map_or(String::new(), |v| v.to_string()),
+            r.bots.len(),
+            cell(&r.bots.join(" ")),
+        ));
+    }
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"bot-files.csv\""),
+        ],
+        out,
+    )
+        .into_response()
+}
+
+/// The ledger file (`storage.bot_log_path`), which survives restarts.
+/// `?tail=N` returns the last N lines.
+async fn api_bots_log(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    let q = query_map(qs.as_deref());
+    let Some(Some(path)) = s.server.bot_log_path.get().cloned() else {
+        return (StatusCode::NOT_FOUND, "bot ledger is off (storage.bot_log_path = \"off\")")
+            .into_response();
+    };
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{}: {e}", path.display()))
+                .into_response()
+        }
+    };
+    let text = match q.get("tail").and_then(|v| v.parse::<usize>().ok()) {
+        Some(n) => {
+            let lines: Vec<&str> = text.lines().collect();
+            lines[lines.len().saturating_sub(n)..].iter().map(|l| format!("{l}\n")).collect()
+        }
+        None => text,
+    };
+    ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], text).into_response()
 }
 
 #[derive(Serialize)]
@@ -3181,6 +3580,12 @@ tr:hover td{background:#1e2035}
       IPs flagged for abnormal query patterns. Thresholds: <strong>flood</strong> &gt; 600 qpm OR <strong>uniform timing</strong> &gt; 200 qpm with stddev &lt; 50 ms. Flagged IPs are <strong>auto-banned for 24h</strong> — their UDP traffic (global search/sources) is dropped at the recv loop; their TCP session, if any, is unaffected. Bans auto-expire; a rotated IP is re-flagged the same way.
     </p>
     <div id="bots-table"></div>
+    <p class="sub" style="margin-top:8px">Keep a record: <a href="/api/bots/export?format=csv" style="color:inherit">export CSV</a> ·
+      <a href="/api/bots/export" style="color:inherit">JSON lines</a> ·
+      <a href="/api/bots/log" style="color:inherit">ledger</a> (detections and ban ends, kept across restarts) ·
+      files asked: <a href="/api/bots/files" style="color:inherit">all</a>,
+      <a href="/api/bots/files?indexed=1" style="color:inherit">indexed only</a> (CSV with names)</p>
+    <div id="bot-detail"></div>
   </div>
 </div>
 
@@ -3359,6 +3764,10 @@ async function refreshClients() {
             <span style="font-size:.78rem;color:#9ca3af">${e.count} (${pct}%)</span>
           </div>
           <div class="bar-wrap"><div class="bar" style="width:${pct}%"></div></div>
+          ${(e.versions||[]).length > 1 || ((e.versions||[])[0]||[''])[0] !== e.software
+            ? `<div class="sub" style="margin-top:3px">${e.versions.map(([v, n]) =>
+                `${escapeHtml(v)} <span style="color:#9ca3af">${n}</span>`).join(' · ')}${e.other_versions ? ` · other ${e.other_versions}` : ''}</div>`
+            : ''}
         </div>`;
       }).join('');
   const ctotal = countries.reduce((a,e)=>a+e.count,0);
@@ -3390,7 +3799,7 @@ async function refreshClients() {
           `<tr><td><a href="#" style="color:inherit" title="${escapeHtml(c.provider||'')}" onclick="return clientsSearchFor('${escapeHtml(c.ip)}')">${escapeHtml(c.ip)}</a>`
           + `${c.provider ? `<br><span class="sub">${escapeHtml(c.provider)}</span>` : ''}</td>`
           + `<td>${countryFlag(c.country)} ${escapeHtml(c.country)}</td>`
-          + `<td><span class="tag">${escapeHtml(c.software||'?')}</span></td>`
+          + `<td><span class="tag" title="${escapeHtml(c.login_fp||'')}">${escapeHtml(c.software_detail||c.software||'?')}</span></td>`
           + `<td>${escapeHtml(c.nick)}</td>`
           + `<td>${(c.shared_files||0).toLocaleString()}</td>`
           + `<td><span class="badge ${c.high_id?'yes':'no'}">${c.high_id?'High':'Low'}</span></td>`
@@ -3444,7 +3853,8 @@ async function refreshPeers() {
       + r.map(p => `<tr><td>${p.name ? escapeHtml(p.name) : `<span class="sub">${p.asked ? 'no answer' : 'not asked yet'}</span>`}`
                + `${p.desc ? `<br><span class="sub">${escapeHtml(p.desc)}</span>` : ''}</td>`
                + `<td><code style="font-size:11px">${escapeHtml(p.ip)}:${p.port}</code></td>`
-               + `<td>${p.country ? countryFlag(p.country) + ' ' + escapeHtml(p.country) : ''}</td>`
+               + `<td>${p.country ? countryFlag(p.country) + ' ' + escapeHtml(p.country) : ''}`
+               + `${p.provider ? `<br><span class="sub">${escapeHtml(p.provider)}</span>` : ''}</td>`
                + `<td>${num(p.users)}</td><td>${num(p.files)}</td>`
                + `<td>${p.version ? escapeHtml(p.version) : ''}</td>`
                + `<td><span class="badge ${p.verified?'yes':'no'}">${p.verified?'yes':'no'}</span></td>`
@@ -3559,19 +3969,63 @@ async function refreshBots() {
   }
   el.innerHTML = '<table><thead><tr>'
     + '<th>IP</th><th>Country</th><th>QPM</th><th>Stddev (ms)</th>'
+    + '<th>Sent</th><th>Files asked</th><th>TCP client on this IP</th>'
     + '<th>Reason</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>'
     + rows.map(b => {
         // -1 is our sentinel for "not enough samples to compute stddev"
         const stddev = (b.interval_stddev_ms < 0) ? '—' : b.interval_stddev_ms.toFixed(0);
-        return `<tr><td>${b.ip}</td>`
-          + `<td>${countryFlag(b.country)} ${b.country}</td>`
+        const total = (b.searches||0) + (b.source_requests||0);
+        const pct = n => total ? Math.round(n * 100 / total) + '%' : '—';
+        const sent = total === 0 ? '<span class="sub">—</span>'
+          : `${b.searches ? `search ${b.searches.toLocaleString()}` : ''}`
+            + `${b.searches && b.source_requests ? ' · ' : ''}`
+            + `${b.source_requests ? `sources ${b.source_requests.toLocaleString()} `
+                + `(${(b.source_hashes / b.source_requests).toFixed(1)} hash/req)` : ''}`
+            + `<br><span class="sub">obf ${pct(b.obfuscated)} · from :${b.src_port}`
+            + `${b.src_port_changes ? ` (${b.src_port_changes} port changes)` : ''} → :${b.our_port}</span>`;
+        return `<tr><td>${escapeHtml(b.ip)}</td>`
+          + `<td>${countryFlag(b.country)} ${escapeHtml(b.country)}`
+          + `${b.provider ? `<br><span class="sub">${escapeHtml(b.provider)}</span>` : ''}</td>`
           + `<td>${b.queries_per_minute.toFixed(0)}</td>`
           + `<td>${stddev}</td>`
-          + `<td><span class="badge no">${b.reason}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}</td>`
+          + `<td>${sent}</td>`
+          + `<td>${b.hashes_distinct ? `<a href="#" style="color:inherit" onclick="return botDetail('${escapeHtml(b.ip)}')">${b.hashes_distinct.toLocaleString()} distinct</a>`
+                + `<br><span class="sub">${b.hashes_total.toLocaleString()} asked`
+                + `${b.dropped_after_ban ? ` · ${b.dropped_after_ban.toLocaleString()} dropped since ban`
+                    + (b.last_dropped_secs_ago != null ? `, last ${fmtDur(b.last_dropped_secs_ago)} ago` : '') : ''}</span>`
+              : '<span class="sub">—</span>'}</td>`
+          + `<td>${b.tcp_client ? escapeHtml(b.tcp_client) : '<span class="sub">none</span>'}</td>`
+          + `<td><span class="badge no">${escapeHtml(b.reason)}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}</td>`
           + `<td>${fmtDur(b.first_seen_secs_ago)} ago</td>`
           + `<td>${fmtDur(b.last_seen_secs_ago)} ago</td></tr>`;
       }).join('')
     + '</tbody></table>';
+}
+
+async function botDetail(ip) {
+  const el = document.getElementById('bot-detail');
+  el.innerHTML = '<div class="empty">Loading…</div>';
+  const r = await fetch('/api/bots/detail?ip=' + encodeURIComponent(ip));
+  if (!r.ok) { el.innerHTML = `<div class="empty">${escapeHtml(await r.text())}</div>`; return false; }
+  const d = await r.json();
+  const size = n => n >= 1073741824 ? (n/1073741824).toFixed(2)+' GB' : (n/1048576).toFixed(1)+' MB';
+  el.innerHTML = `<h3 style="margin-top:16px">Files asked by ${escapeHtml(d.ip)}</h3>`
+    + `<p class="sub">${d.hashes_distinct.toLocaleString()} distinct of ${d.hashes_total.toLocaleString()} asked`
+    + `${d.hashes_distinct_capped ? ' (distinct count capped)' : ''}. Last ${d.recent.length}, newest first. `
+    + `All of them: <a href="/api/bots/files?ip=${encodeURIComponent(d.ip)}" style="color:inherit">CSV</a>.</p>`
+    + (d.shares_hashes_with.length
+        ? `<p style="font-size:.85rem">Same files asked by: ${d.shares_hashes_with.map(o =>
+            `<a href="#" style="color:inherit" onclick="return botDetail('${escapeHtml(o.ip)}')">${escapeHtml(o.ip)}</a> (${o.common})`).join(', ')}</p>`
+        : '<p class="sub">No other bot asked for the same files.</p>')
+    + '<table><thead><tr><th>Hash</th><th>Name</th><th>Size</th><th>Sources</th></tr></thead><tbody>'
+    + d.recent.map(f => `<tr><td><code style="font-size:11px">${f.hash}</code></td>`
+        + (f.indexed === false
+            ? '<td colspan="3"><span class="sub">not in the index</span></td>'
+            : `<td>${escapeHtml(f.name)}</td><td>${size(f.size)}</td><td>${f.sources}</td>`)
+        + '</tr>').join('')
+    + '</tbody></table>';
+  el.scrollIntoView({behavior: 'smooth'});
+  return false;
 }
 
 async function refreshBlocks() {
@@ -3878,6 +4332,8 @@ mod client_search_tests {
             connected_at: Instant::now(),
             country: country.into(),
             software: sw.into(),
+            software_detail: sw.into(),
+            login_fp: String::new(),
             csam_attempts: 0,
             soft_limit_warned: false,
             offer_policy: None,

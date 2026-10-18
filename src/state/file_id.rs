@@ -258,6 +258,9 @@ struct SlabShard {
     /// FIFO by free-time (front = oldest). A slot is only reused once it has aged
     /// past the quarantine window, so no in-flight search can still hold it.
     free: std::collections::VecDeque<(u32, u32)>,
+    /// Length, bitrate and codec of the slots whose file carried them (see
+    /// `state::media`). Removed with the record at tombstone.
+    media: crate::state::media::SlotMap,
 }
 
 /// Initial bucket count per shard (power of two). Shards start empty and grow by
@@ -272,6 +275,7 @@ impl SlabShard {
             buckets: vec![NIL; SLAB_SHARD_INIT_BUCKETS],
             bucket_mask: (SLAB_SHARD_INIT_BUCKETS - 1) as u32,
             free: std::collections::VecDeque::new(),
+            media: Default::default(),
         }
     }
 
@@ -406,6 +410,7 @@ impl SlabShard {
                 self.free.pop_front();
                 let i = idx as usize;
                 self.records[i] = rec; // overwrite the dead record in place
+                self.media.remove(&idx); // gone at tombstone; be explicit
                 self.next[i] = NIL; // already unlinked at tombstone; be explicit
                 self.link(idx); // link into the NEW hash's bucket
                 return idx;
@@ -439,6 +444,8 @@ pub struct FileSlab {
     /// in-flight search, so id reuse needs no generation counters. 60s in prod;
     /// overridable to 0 in tests.
     quarantine_secs: u32,
+    /// Codec names for the media side tables (see `state::media`).
+    pub codecs: crate::state::media::CodecTable,
 }
 
 /// Default slot quarantine window (seconds). Far exceeds a search's id-resolve
@@ -462,6 +469,7 @@ impl FileSlab {
             live: AtomicU32::new(0),
             epoch: Instant::now(),
             quarantine_secs: SLOT_QUARANTINE_SECS,
+            codecs: Default::default(),
         }
     }
 
@@ -599,6 +607,7 @@ impl FileSlab {
         // slot dead and free the heavy fields. Stale ids resolve to None via the
         // alive flag / chain absence until the slot is reused.
         sh.unlink(idx as u32, &hash);
+        sh.media.remove(&(idx as u32));
         let name = {
             let r = &mut sh.records[idx];
             r.sources = SourceVec::new();
@@ -837,6 +846,77 @@ impl FileSlab {
             return None;
         }
         Some(f(make_id(shard_no, idx), r))
+    }
+
+    /// Record the media fields of a file, filling only what it lacks (a
+    /// re-offer does not overwrite, as in Lugdunum). No-op for an unknown hash
+    /// or empty `m`.
+    pub fn merge_media(&self, hash: &FileHash, m: crate::state::media::Media) {
+        if m.is_empty() {
+            return;
+        }
+        let shard_no = shard_of_hash(hash);
+        let mut sh = self.shards[shard_no as usize].write().unwrap();
+        let Some(idx) = sh.find(hash) else { return };
+        let e = sh.media.entry(idx).or_default();
+        *e = e.merged(m);
+    }
+
+    /// The media fields of a file, if any were offered.
+    pub fn media_of_hash(&self, hash: &FileHash) -> Option<crate::state::media::Media> {
+        let shard_no = shard_of_hash(hash);
+        let sh = self.shards[shard_no as usize].read().unwrap();
+        let idx = sh.find(hash)?;
+        sh.media.get(&idx).copied()
+    }
+
+    /// `with_record` that also hands over the file's media fields, looked up
+    /// under the same lock, when `want` (a search that filters on them).
+    pub fn with_record_media<R, F: FnOnce(&FileRecord, Option<crate::state::media::Media>) -> R>(
+        &self,
+        id: FileId,
+        want: bool,
+        f: F,
+    ) -> Option<R> {
+        let shard = self.shards.get(id_shard(id))?;
+        let sh = shard.read().unwrap();
+        let idx = id_index(id);
+        let r = sh.records.get(idx).filter(|r| r.alive())?;
+        let m = if want { sh.media.get(&(idx as u32)).copied() } else { None };
+        Some(f(r, m))
+    }
+
+    /// `for_each_live_while` with the media fields, as `with_record_media`.
+    pub fn for_each_live_while_media<
+        F: FnMut(FileId, &FileRecord, Option<crate::state::media::Media>) -> bool,
+    >(
+        &self,
+        want: bool,
+        mut f: F,
+    ) {
+        for (s_no, shard) in self.shards.iter().enumerate() {
+            let sh = shard.read().unwrap();
+            for (i, r) in sh.records.iter().enumerate() {
+                if !r.alive() {
+                    continue;
+                }
+                let m = if want { sh.media.get(&(i as u32)).copied() } else { None };
+                if !f(make_id(s_no as u32, i as u32), r, m) {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// (files with media fields, bytes the side tables hold).
+    pub fn media_report(&self) -> (u64, u64) {
+        let (mut n, mut bytes) = (0u64, 0u64);
+        for s in &self.shards {
+            let sh = s.read().unwrap();
+            n += sh.media.len() as u64;
+            bytes += crate::state::media::slot_map_bytes(&sh.media);
+        }
+        (n, bytes)
     }
 
     /// Like `for_each_live`, but stops as soon as `f` returns false.
@@ -1092,6 +1172,29 @@ mod tests {
         }
         assert_eq!(slab.slot_count(), 100);
         assert_eq!(slab.live_count(), 100);
+    }
+
+    #[test]
+    fn media_follows_its_file_and_dies_with_it() {
+        use crate::state::media::Media;
+        let slab = FileSlab::new();
+        let h = [0x42u8; 16];
+        let src = Source::new([1; 16], "203.0.113.1".parse().unwrap(), 4662, true);
+        let (id, _) = slab.get_or_insert(h, 1000, "movie.avi", src);
+        assert_eq!(slab.media_of_hash(&h), None);
+        slab.merge_media(&h, Media::new(0, 1200, 0));
+        slab.merge_media(&h, Media::new(5400, 999, 3));
+        let m = slab.media_of_hash(&h).unwrap();
+        assert_eq!((m.length(), m.bitrate(), m.codec()), (5400, 1200, 3));
+        assert_eq!(slab.with_record_media(id, true, |_, m| m), Some(Some(m)));
+        assert_eq!(slab.with_record_media(id, false, |_, m| m), Some(None));
+        assert_eq!(slab.media_report().0, 1);
+        assert!(slab.tombstone(id));
+        assert_eq!(slab.media_report().0, 0);
+        assert_eq!(slab.media_of_hash(&h), None);
+        // Unknown hash: nothing stored.
+        slab.merge_media(&[9; 16], Media::new(1, 1, 1));
+        assert_eq!(slab.media_report().0, 0);
     }
 
     #[test]
