@@ -440,6 +440,29 @@ impl UdpServer {
                 crate::server::bot_detector::note_banned(&self.state, peer.ip(), data);
                 continue;
             }
+            // A throttled source: `bots.throttle_qpm` gets through, the rest
+            // is dropped like a banned source's, and counted the same way.
+            if self.state.bot_throttle_admit(peer.ip()) == Some(false) {
+                crate::server::bot_detector::note_banned(&self.state, peer.ip(), data);
+                continue;
+            }
+            // The IP filter applies to UDP too: an address added to it for
+            // scanning (server::bot_ipfilter) mostly scans over UDP. try_read:
+            // during the rare swap of a reloaded filter, let the packet pass
+            // rather than stall the receive loop.
+            if let std::net::IpAddr::V4(v4) = peer.ip() {
+                if let Ok(f) = self.state.ip_filter.try_read() {
+                    if f.is_blocked(v4) {
+                        drop(f);
+                        *self
+                            .state
+                            .block_stats
+                            .entry("ipfilter_udp".to_string())
+                            .or_insert(0) += 1;
+                        continue;
+                    }
+                }
+            }
 
             // admission (issue #25): every datagram is charged on arrival,
             // server-wide first and then to its source, before any parsing or

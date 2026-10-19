@@ -254,6 +254,8 @@ pub fn build_welcome_batch_with(
         );
         //   0x4000 IPV6           — added only when the server actually speaks it
         let mut tcp_flags: u32 = 0x0000_05DD;
+        // LowID hole punch is always on: say so (issue #35).
+        tcp_flags |= crate::proto::opcodes::SRVFLG_LOWID_HOLEPUNCH;
         if live.network.ipv6_publish_sources {
             // ⚠ 0x4000 server→client. The client→server capability bit is
             //   0x1000 in CT_SERVER_FLAGS — a different word in a different

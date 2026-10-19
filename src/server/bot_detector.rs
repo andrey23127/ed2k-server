@@ -97,6 +97,14 @@ pub fn record_query(state: &Arc<ServerState>, peer: SocketAddr, q: QueryInfo, ha
         .duration_since(*times.front().unwrap())
         .as_secs_f64()
         .max(0.001);
+    // ⚠ A RATE NEEDS TIME TO BE ONE. Thirty packets in a burst of 15 ms read as
+    //   120 000 qpm and earned a 24-hour ban, though the source sent 67
+    //   requests in all: an aMule user behind a VPN exit. Judge a source only
+    //   once its window spans `bots.min_span_secs`.
+    let min_span = state.live_cfg.load().bots.min_span_secs as f64;
+    if window_secs < min_span {
+        return;
+    }
     let qpm = (n as f64 / window_secs) * 60.0;
     if qpm < RATE_THRESHOLD {
         return;
@@ -131,9 +139,11 @@ pub fn record_query(state: &Arc<ServerState>, peer: SocketAddr, q: QueryInfo, ha
     let stddev_ms = var.sqrt();
 
     let mut reason = String::new();
+    let mut flood = false;
     // Flag if rate alone is extreme.
     if qpm > FLOOD_RATE {
         reason = format!("flood {:.0} qpm", qpm);
+        flood = true;
     }
     // OR if high-rate (>200) AND uniform timing.
     else if qpm > RATE_THRESHOLD && stddev_ms < STDDEV_THRESHOLD_MS {
@@ -168,7 +178,18 @@ pub fn record_query(state: &Arc<ServerState>, peer: SocketAddr, q: QueryInfo, ha
     // record_query() stops being called for it. The static ipfilter is no use
     // here — these IPs are dynamic — but a time-boxed in-memory ban kills the
     // active flood, and a rotated IP gets flagged + banned the same way.
-    state.ban_bot(ip);
+    // A flood is banned. A "uniform timing" source is, by what the panel has
+    // shown, mostly one client build with broken UDP pacing (~567 qpm, one
+    // hash per packet, a few dozen downloads): ordinary users. It is
+    // throttled to `bots.throttle_qpm` and still answered, unless the config
+    // says "ban".
+    let bots_cfg = state.live_cfg.load().bots.clone();
+    let throttled = !flood && bots_cfg.throttle_uniform();
+    if throttled {
+        state.throttle_bot(ip, bots_cfg.throttle_qpm);
+    } else {
+        state.ban_bot(ip);
+    }
 
     let now_sys = SystemTime::now();
     {
@@ -188,7 +209,10 @@ pub fn record_query(state: &Arc<ServerState>, peer: SocketAddr, q: QueryInfo, ha
             hashes: BotHashes::default(),
             dropped_after_ban: 0,
             last_dropped: None,
+            throttled: false,
+            ipfilter_added: false,
         });
+        d.throttled = throttled;
         d.last_seen = now_sys;
         d.query_count += 1;
         d.queries_per_minute = qpm;
@@ -251,7 +275,7 @@ pub fn query_hashes(opcode: u8, payload: &[u8]) -> Vec<FileHash> {
 /// plain source request are kept; nothing is parsed beyond that and nothing
 /// is answered. An obfuscated datagram is only counted: decoding it would
 /// spend on the bot the work the ban saves.
-pub fn note_banned(state: &ServerState, ip: IpAddr, datagram: &[u8]) {
+pub fn note_banned(state: &Arc<ServerState>, ip: IpAddr, datagram: &[u8]) {
     let key = state.source_key(ip);
     let Some(mut d) = state.bot_detections.get_mut(&key) else { return };
     d.dropped_after_ban += 1;
@@ -261,12 +285,27 @@ pub fn note_banned(state: &ServerState, ip: IpAddr, datagram: &[u8]) {
             d.hashes.add(h);
         }
     }
+    // Kept sending into silence long enough: into the IP filter for good.
+    // Exactly at the threshold, so it is tried once per source.
+    let min = state.live_cfg.load().bots.ipfilter_min_dropped;
+    let need = if d.throttled { min.saturating_mul(10) } else { min };
+    if min > 0 && !d.ipfilter_added && d.dropped_after_ban >= need {
+        if let IpAddr::V4(v4) = key {
+            d.ipfilter_added = true;
+            let entry = ledger_entry("ipfilter_added", key, &d);
+            drop(d);
+            ledger(state, entry);
+            crate::server::bot_ipfilter::add_async(state, v4);
+        }
+    }
 }
 
-/// A source's 24-hour ban ran out: write what it did meanwhile to the ledger.
+/// A source's 24-hour ban (or throttle) ran out: write what it did meanwhile
+/// to the ledger.
 pub fn ban_ended(state: &ServerState, key: IpAddr) {
     if let Some(d) = state.bot_detections.get(&key) {
-        ledger(state, ledger_entry("ban_ended", key, &d));
+        let ev = if d.throttled { "throttle_ended" } else { "ban_ended" };
+        ledger(state, ledger_entry(ev, key, &d));
     }
 }
 
@@ -309,6 +348,8 @@ pub fn ledger_entry(event: &str, key: IpAddr, d: &BotDetection) -> serde_json::V
         "hashes_total": d.hashes.total,
         "hashes_distinct": d.hashes.distinct.len(),
         "dropped_after_ban": d.dropped_after_ban,
+        "action": if d.throttled { "throttled" } else { "banned" },
+        "ipfilter_added": d.ipfilter_added,
         "hash_sample": sample,
     })
 }
@@ -368,6 +409,70 @@ const _: fn() = || {
 mod source_key_tests {
     use super::*;
 
+    /// A state whose detector judges at once (no minimum span), so the tests
+    /// can send their packets back to back.
+    fn test_state() -> Arc<ServerState> {
+        let st = Arc::new(ServerState::for_test());
+        let mut cfg = (**st.live_cfg.load()).clone();
+        cfg.bots.min_span_secs = 0;
+        st.live_cfg.store(Arc::new(cfg));
+        st
+    }
+
+    #[test]
+    fn a_short_burst_is_not_a_flood() {
+        // Default span: 40 packets in a burst are judged as nothing.
+        let st = Arc::new(ServerState::for_test());
+        let q = QueryInfo { search: false, hashes: 1, obfuscated: false, our_port: 6086 };
+        for _ in 0..40 {
+            record_query(&st, SocketAddr::new("198.51.100.20".parse().unwrap(), 4672), q, &[[1; 16]]);
+        }
+        assert!(st.bot_detections.is_empty());
+        assert!(!st.is_bot_banned("198.51.100.20".parse().unwrap()));
+    }
+
+    #[test]
+    fn uniform_timing_is_throttled_and_a_flood_banned() {
+        let st = test_state();
+        let ip: IpAddr = "198.51.100.30".parse().unwrap();
+        // ~600 qpm with even 100 ms gaps, faked by spreading the timestamps.
+        {
+            let t = st.bot_query_log.entry(st.source_key(ip)).or_default();
+            let mut times = t.query_times.lock().unwrap();
+            let now = Instant::now();
+            for k in (0..40u64).rev() {
+                times.push_back(now - Duration::from_millis(k * 110));
+            }
+        }
+        let q = QueryInfo { search: false, hashes: 1, obfuscated: false, our_port: 6086 };
+        record_query(&st, SocketAddr::new(ip, 4672), q, &[[2; 16]]);
+        assert!(st.is_bot_throttled(ip), "uniform → throttled");
+        assert!(!st.is_bot_banned(ip));
+        // The throttle lets a few through, then drops.
+        let passed = (0..20).filter(|_| st.bot_throttle_admit(ip) == Some(true)).count();
+        assert!((1..=6).contains(&passed), "burst of 5 (+refill), got {passed}");
+        assert!(st.bot_detections.get(&ip).unwrap().throttled);
+    }
+
+    #[test]
+    fn a_source_that_keeps_sending_through_its_ban_is_marked_for_the_ipfilter() {
+        let st = test_state();
+        let mut cfg = (**st.live_cfg.load()).clone();
+        cfg.bots.ipfilter_min_dropped = 3;
+        st.live_cfg.store(Arc::new(cfg));
+        let ip: IpAddr = "203.0.113.77".parse().unwrap();
+        let q = QueryInfo { search: false, hashes: 1, obfuscated: false, our_port: 6086 };
+        for _ in 0..40 {
+            record_query(&st, SocketAddr::new(ip, 4672), q, &[[3; 16]]);
+        }
+        assert!(st.is_bot_banned(ip));
+        note_banned(&st, ip, &[0x4F]);
+        note_banned(&st, ip, &[0x4F]);
+        assert!(!st.bot_detections.get(&ip).unwrap().ipfilter_added);
+        note_banned(&st, ip, &[0x4F]);
+        assert!(st.bot_detections.get(&ip).unwrap().ipfilter_added, "at the threshold");
+    }
+
     fn flood(state: &Arc<ServerState>, ips: impl Iterator<Item = IpAddr>) {
         let q = QueryInfo { search: false, hashes: 1, obfuscated: false, our_port: 4665 };
         for ip in ips {
@@ -377,7 +482,7 @@ mod source_key_tests {
 
     #[test]
     fn a_detection_keeps_what_the_bot_sent() {
-        let st = Arc::new(ServerState::for_test());
+        let st = test_state();
         let ip: IpAddr = "203.0.113.7".parse().unwrap();
         for i in 0..40u16 {
             let q = QueryInfo { search: i % 4 == 0, hashes: 3, obfuscated: i % 2 == 0, our_port: 4665 };
@@ -428,7 +533,7 @@ mod source_key_tests {
 
     #[test]
     fn ledger_lines_are_appended() {
-        let st = Arc::new(ServerState::for_test());
+        let st = test_state();
         let dir = std::env::temp_dir().join(format!("botlog-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("bot-log.jsonl");
@@ -457,7 +562,7 @@ mod source_key_tests {
 
     #[test]
     fn an_ipv6_flood_spread_over_one_prefix_is_one_banned_bot() {
-        let st = Arc::new(ServerState::for_test());
+        let st = test_state();
         // 40 queries, each from a different address in 2001:db8:1:2::/64.
         flood(&st, (1..=40u16).map(|i| {
             IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 7, i))
@@ -471,7 +576,7 @@ mod source_key_tests {
 
     #[test]
     fn ipv4_and_mapped_ipv4_are_the_same_source() {
-        let st = Arc::new(ServerState::for_test());
+        let st = test_state();
         let v4: IpAddr = "203.0.113.9".parse().unwrap();
         let mapped: IpAddr = "::ffff:203.0.113.9".parse().unwrap();
         flood(&st, (0..20).map(|_| v4).chain((0..20).map(|_| mapped)));
@@ -482,7 +587,7 @@ mod source_key_tests {
 
     #[test]
     fn a_slow_querier_is_not_flagged() {
-        let st = Arc::new(ServerState::for_test());
+        let st = test_state();
         flood(&st, (0..10).map(|_| "2001:db8::1".parse().unwrap()));
         assert!(st.bot_detections.is_empty());
         assert!(!st.is_bot_banned("2001:db8::1".parse().unwrap()));

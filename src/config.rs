@@ -26,6 +26,8 @@ pub struct Config {
     pub updates: UpdatesConfig,
     #[serde(default)]
     pub admission: AdmissionConfig,
+    #[serde(default)]
+    pub bots: BotsConfig,
 }
 
 /// Server-wide work admission (issue #25). Restart-only. No value accepts 0
@@ -105,6 +107,57 @@ pub struct AdmissionConfig {
     /// pending logins, search jobs) has stayed full this long.
     #[serde(default = "default_adm_ready_window")]
     pub readiness_window_secs: u64,
+}
+
+/// Bot detection (`[bots]`). Restart-only. Every key is optional.
+#[derive(Debug, Deserialize, Clone)]
+pub struct BotsConfig {
+    /// A source is judged only once its queries span this long. A burst of 30
+    /// packets in 15 ms used to read as "120 000 qpm" and earned a 24-hour ban.
+    #[serde(default = "default_bots_min_span")]
+    pub min_span_secs: u64,
+    /// What a "uniform timing" source (high rate, regular intervals, not a
+    /// flood) gets: "throttle" (default) or "ban". Throttled sources keep
+    /// `throttle_qpm` and are answered; the rest is dropped.
+    #[serde(default = "default_bots_uniform_action")]
+    pub uniform_action: String,
+    #[serde(default = "default_bots_throttle_qpm")]
+    pub throttle_qpm: u32,
+    /// Add a banned source to `storage.ipfilter_path` once this many of its
+    /// datagrams were dropped during the ban: it kept sending into silence
+    /// for that long. A throttled source needs ten times as many. 0 = never.
+    #[serde(default = "default_bots_ipfilter_min_dropped")]
+    pub ipfilter_min_dropped: u64,
+}
+
+impl Default for BotsConfig {
+    fn default() -> Self {
+        Self {
+            min_span_secs: default_bots_min_span(),
+            uniform_action: default_bots_uniform_action(),
+            throttle_qpm: default_bots_throttle_qpm(),
+            ipfilter_min_dropped: default_bots_ipfilter_min_dropped(),
+        }
+    }
+}
+
+impl BotsConfig {
+    pub fn throttle_uniform(&self) -> bool {
+        !self.uniform_action.trim().eq_ignore_ascii_case("ban")
+    }
+}
+
+fn default_bots_min_span() -> u64 {
+    10
+}
+fn default_bots_uniform_action() -> String {
+    "throttle".into()
+}
+fn default_bots_throttle_qpm() -> u32 {
+    60
+}
+fn default_bots_ipfilter_min_dropped() -> u64 {
+    10_000
 }
 
 impl Default for AdmissionConfig {

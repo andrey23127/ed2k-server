@@ -740,6 +740,13 @@ pub struct ServerState {
     /// IP for 24h kills the current flood, and a rotated IP is re-flagged and
     /// re-banned the same way.
     pub banned_bots: DashMap<std::net::IpAddr, std::time::Instant>,
+    /// Sources throttled instead of banned: since when, and the bucket that
+    /// lets `bots.throttle_qpm` through. Same TTL and sweep as the bans.
+    pub throttled_bots:
+        DashMap<std::net::IpAddr, (std::time::Instant, crate::admission::TokenBucket)>,
+    /// Where `server::bot_ipfilter` records the addresses it added, to put
+    /// them back after the IP filter file is replaced. Set once at startup.
+    pub bot_ipfilter_list: std::sync::OnceLock<Option<std::path::PathBuf>>,
     /// CSAM publishers banned by USER_HASH (not IP). IP is dynamic for most
     /// clients (changes ~every few days), while user_hash only changes on eMule
     /// reinstall — a far more stable identifier. Value = ban start time. Checked
@@ -1018,6 +1025,11 @@ pub struct BotDetection {
     /// answers.
     pub dropped_after_ban: u64,
     pub last_dropped: Option<std::time::SystemTime>,
+    /// Throttled rather than banned (a "uniform timing" source, see
+    /// `BotsConfig::uniform_action`).
+    pub throttled: bool,
+    /// Written to the IP filter file (`server::bot_ipfilter`).
+    pub ipfilter_added: bool,
 }
 
 /// A peer server's self-description, as shown in the admin Peers tab.
@@ -1273,6 +1285,40 @@ impl ServerState {
         }
     }
 
+    /// Throttle a "uniform timing" source for BOT_BAN_TTL instead of banning
+    /// it: `qpm` datagrams a minute still get through, with a small burst.
+    pub fn throttle_bot(&self, ip: std::net::IpAddr, qpm: u32) {
+        let per_s = qpm.div_ceil(60).max(1);
+        let now = std::time::Instant::now();
+        let was_new = self
+            .throttled_bots
+            .insert(
+                self.source_key(ip),
+                (now, crate::admission::TokenBucket::new(per_s, 5, now)),
+            )
+            .is_none();
+        if was_new {
+            *self.block_stats.entry("bot_throttle".to_string()).or_insert(0) += 1;
+        }
+    }
+
+    /// For a throttled source, whether this datagram may pass; None when the
+    /// source is not throttled (or the throttle expired).
+    pub fn bot_throttle_admit(&self, ip: std::net::IpAddr) -> Option<bool> {
+        let mut e = self.throttled_bots.get_mut(&self.source_key(ip))?;
+        if e.0.elapsed() >= Self::BOT_BAN_TTL {
+            return None;
+        }
+        Some(e.1.take(1, std::time::Instant::now()))
+    }
+
+    pub fn is_bot_throttled(&self, ip: std::net::IpAddr) -> bool {
+        self.throttled_bots
+            .get(&self.source_key(ip))
+            .map(|e| e.0.elapsed() < Self::BOT_BAN_TTL)
+            .unwrap_or(false)
+    }
+
     /// True if `ip` is currently banned (within BOT_BAN_TTL). Called on the UDP
     /// hot path before any parsing, so it must stay a single cheap lookup.
     /// Expired entries are not removed here (the 60s cleanup task sweeps them);
@@ -1449,6 +1495,8 @@ impl ServerState {
             media_offer_stats: MediaOfferStats::default(),
             bot_log_path: std::sync::OnceLock::new(),
             banned_bots: DashMap::new(),
+            throttled_bots: DashMap::new(),
+            bot_ipfilter_list: std::sync::OnceLock::new(),
             banned_publishers: DashMap::new(),
             client_id_index: DashMap::new(),
             file_aliases: DashMap::new(),

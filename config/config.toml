@@ -298,6 +298,14 @@ hash_banlist = "https://ed2k.emule-security.org/files/hash_banlist.txt"
 hash_filter = "https://ed2k.emule-security.org/files/hash_filter.txt"
 whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"
 
+[bots]
+# UDP bot detection (README, [bots]). All optional; these are the defaults.
+# min_span_secs = 10             # judge a source only over this long a window
+# uniform_action = "throttle"    # "uniform timing" sources: "throttle" or "ban"
+# throttle_qpm = 60              # what a throttled source still gets per minute
+# ipfilter_min_dropped = 10000   # into storage.ipfilter_path after this many
+#                                # datagrams sent into a ban; 0 = never
+
 [admission]
 # Server-wide ceilings on remotely caused work (issue #25). Restart-only; no
 # value accepts 0. Every key is optional — the defaults are shown. See README.

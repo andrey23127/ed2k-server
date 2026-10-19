@@ -467,10 +467,33 @@ why.
 ### `[storage]`
 | Key | Meaning | Apply |
 |---|---|---|
-| `ipfilter_path` | Path to `guarding.p2p` | **live** (SIGHUP reload) |
+| `ipfilter_path` | Path to `guarding.p2p`. Applies to TCP connections and, since 0.9.84, to UDP. The bot detector may append lines to it (see `[bots]`) | **live**: a change on disk is picked up within 30 s; also SIGHUP / `/api/reload` |
 | `country_db_path` | Path to `ip-to-country.csv` (IPv4) | restart; a new file at the path reloads live |
 | `geoip_mmdb_path` | MaxMind DB tried before the CSV (IPv4 + IPv6). Empty = `ipinfo_lite.mmdb` next to the CSV; `"off"` = CSV only | restart; a new file at the path reloads live |
 | `bot_log_path` | Ledger of detected bots, one JSON line per detection and per ban end. Empty = `bot-log.jsonl` next to the config file; `"off"` = none | restart |
+
+### `[bots]`
+UDP bot detection. Every key optional; restart-only.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `min_span_secs` | 10 | A source is judged only once its queries span this long, so a burst of 30 packets in a few milliseconds is not read as a flood of 100 000 qpm |
+| `uniform_action` | `"throttle"` | What a "uniform timing" source (over 200 qpm, regular intervals, not a flood) gets for 24 h: `"throttle"` (still answered, at `throttle_qpm`) or `"ban"` |
+| `throttle_qpm` | 60 | What a throttled source still gets through, per minute |
+| `ipfilter_min_dropped` | 10000 | A banned source that sends this many datagrams into its ban is added to `storage.ipfilter_path` for good (ten times as many for a throttled one); `0` = never |
+
+A line added to the IP filter looks like the rest of the file, marked `bot`:
+
+```
+071.231.168.221 - 071.231.168.221 , 000 , bot
+```
+
+It is written only when no line of the file already covers the address, and
+the filter is reloaded at once. The address is also recorded in
+`bot-ipfilter.txt` next to the config file: when the filter file is replaced
+(an update from the update service, or by hand), the recorded addresses are
+appended again before it is loaded. To take one out for good, delete its line
+in both files.
 
 ### `[admission]`
 Server-wide ceilings on the work remote peers can cause, however the load is
@@ -702,6 +725,11 @@ login request, value `((kadUDPPort << 16) | clientUDPPort)`. This tells the serv
 your client UDP port and flags you as NAT-T capable. Lugdunum-style servers already
 parse `0xF9`, so sending it is safe against any server.
 
+**Is this server doing it?** A server that coordinates the punch sets bit
+`0x20000` in the `OP_IDCHANGE` TCP flags (issue #35). Send `0x60` only to a
+server that set it: some servers drop the connection on an unknown opcode.
+Lugdunum's own NAT callback is a different scheme, announced with `0x1000`.
+
 **2. Refresh your external UDP port — the keepalive (critical).** While connected,
 send `OP_SERVER_NATT_KEEPALIVE` (`0x9F`) **from your client UDP socket** (not the TCP
 link) to the server's UDP port (`= server TCP port + 4`), payload = your 16-byte
@@ -725,24 +753,46 @@ learn your real post-NAT UDP port — the port peers must actually punch.
 | `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1>` |
 | `OP_LOWID_HOLEPUNCH_FAIL` | `0x62` | server → client (TCP) | `<target_id 4><reason 1>` |
 | `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>` |
+| `OP_IDCHANGE` TCP flags bit | `0x20000` | server → client (TCP) | set when the server accepts `0x60` |
 
 To download from a LowID source **B**, send `0x60` with B's assigned id and your UDP
 port. The server replies `0x61` to **both** you and B — each gets the other's address
 plus a role byte — or `0x62` if B is HighID, gone, or has a dead session. On `0x61`
 both sides punch and raise the tunnel; on `0x62` retry or fall back. The `role` byte
-is advisory: in the reference client both sides initiate, so order does not matter.
+is advisory: when both sides initiate, as they should, order does not matter.
 (`0x60`–`0x62` are unused in the server TCP opcode space, which runs `0x01`–`0x44`,
 and `0x9F` was free in the server UDP namespace — no conflict on the server link.)
 
-**4. Peer ↔ peer opcodes** (over `OP_EMULEPROT`, sent directly between the two
-clients — **the server never sees these**; listed only so the full path is clear):
-`OP_NATT_HOLEPUNCH` (`0xB3`, opens the pin-hole), `OP_NAT_SYN` / `OP_NAT_SYN_ACK`
-(`0xD0`/`0xD1`, tunnel handshake), `OP_NAT_DATA` (`0xD2`, carries the tunnel packets),
-and `0xD3`–`0xD7` (ack/close/reset/ping). The transport *inside* the tunnel is the
-mod's own choice — the reference mod runs a UserModeTCP-over-QUIC tunnel — and the
-server is agnostic to it. Both sides should send SYN (symmetric handshake) so the
-peer behind the stricter NAT opens its own mapping; a per-run 4-byte session nonce on
-`0xB3`/`0xD0`/`0xD1` lets a peer restart be detected and the stale tunnel rebuilt.
+**4. Peer ↔ peer.** What the two clients do after `0x61` (the punch, the tunnel,
+the transport inside it) goes directly between them; **the server never sees it**
+and doesn't care which scheme a client uses. The one practical advice: both sides
+should punch and open the tunnel (a symmetric handshake), so the peer behind the
+stricter NAT opens its own mapping, and a per-run nonce in the handshake lets a
+peer restart be detected and the stale tunnel rebuilt.
+
+The eMule 0.72a "NAT-T edition" that was the first client of this interface is
+retired and its guide is out of date. Its tunnel framed data as `0xB2` frame type
+`0x01`, which collides with eMuleAI's QUIC (issue #36); don't copy that. A new
+client should pick a free frame type from the table below.
+
+#### `0xB2` frame types
+
+`0xB2` (`OP_UDPRESERVEDPROT2`) on the peer UDP socket has no opcode table of its
+own: the byte after it is a frame type that each client family defines. So that
+two schemes never read each other's datagrams, the values known to be taken:
+
+| Frame type | Used by | Meaning |
+|---|---|---|
+| `0x00` | eMuleAI | uTP |
+| `0x01` | eMuleAI | QUIC (NAT-T transport) |
+| `0x02` | eMuleAI | NAT-T capability exchange |
+| `0x03` | eMuleAI | NAT-T capability ack |
+| `0x10` | emule-qt (planned) | reliable-UDP layer |
+| `0xFF` | eMuleAI | key frame |
+
+Pick anything else, and open an issue or a PR here to add your row. The server
+never sends or reads `0xB2`; the table is kept here only because the NAT-T clients
+already meet in this README.
 
 **5. Keep your LowID source alive.** A share-only client is TCP-silent for hours.
 This server keeps such a source by **(a)** counting your `0x9F` UDP keepalive as
@@ -783,7 +833,6 @@ Every element is ignored by a client that does not know it.
 | Direction | Element | Value | Meaning |
 |---|---|---|---|
 | client → server | login tag `CT_MOD_IP_V6` | `0xAE`, 16 raw bytes | the client's public IPv6 |
-| client → server | `CT_SERVER_FLAGS` bit | `0x1000` | client can parse IPv6 sources |
 | server → client | `OP_IDCHANGE` flags / UDP ping flags bit | `0x4000` | server speaks the extension |
 | server → client | `OP_IDCHANGE` flags bit | `0x8000` | server accepts `OP_IPV6_UPDATE` |
 | client → server | `OP_IPV6_UPDATE` | `0x63`, 16 raw bytes | the client's new IPv6, or zeros to withdraw it; only to a server that set `0x8000` |
@@ -791,8 +840,11 @@ Every element is ignored by a client that does not know it.
 | server → client | `OP_SERVERIDENT` tag `ST_IPV6_STATUS` | `0xAB`, u8 | `0x01` address held, `0x02` treated as reachable |
 | server → client | source record in `OP_FOUNDSOURCES` / UDP answer | id `0xFFFFFFFF`, port, then 16 bytes | an IPv6 source |
 
-The client-flag bit (`0x1000`) and the server-flag bit (`0x4000`) are different
-numbers on purpose; they must not be "unified".
+The client announces the extension with the `CT_MOD_IP_V6` tag alone. An
+earlier version of this table also listed `CT_SERVER_FLAGS` bit `0x1000`; do
+not send it: on Lugdunum that bit is `SRVCAP_NATTRAVERSAL`, and a client that
+sets it gets an odd LowID, a longer `OP_IDCHANGE` and NAT callback notices
+(issue #35). This server never read it.
 
 Rules the server applies:
 
@@ -1218,6 +1270,14 @@ port (and how often it changed) and the port of ours it wrote to. A UDP query
 carries no client name, so the tab also shows the TCP client logged in from
 the same address, if there is one, with its software version and nick. Behind
 a NAT that may be a different program than the one sending the queries.
+
+A flood (over 600 qpm, sustained for `bots.min_span_secs`) is banned for
+24 h. A "uniform timing" source is throttled for 24 h instead and still
+answered at `bots.throttle_qpm`: that pattern turned out to be mostly one
+client build with broken UDP pacing (about 567 qpm, one hash per packet, a
+few dozen downloads), ordinary users. A source that keeps sending through its
+ban is a scanner, not a client; past `bots.ipfilter_min_dropped` dropped
+datagrams it is added to the IP filter file (see `[bots]`).
 
 A detected bot's source requests keep being looked at after its ban, without
 being answered: the tab counts the datagrams dropped since the ban and when the

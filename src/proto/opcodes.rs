@@ -136,12 +136,13 @@ pub const CAPABLE_SUPPORTCRYPT: u32 = 0x0200;
 pub const CAPABLE_REQUESTCRYPT: u32 = 0x0400;
 /// The client accepts nothing else — a plain connection to it will be dropped.
 pub const CAPABLE_REQUIRECRYPT: u32 = 0x0800;
-/// The client speaks the IPv6 source extension.
-///
-/// ⚠ The two directions use DIFFERENT values. This one is client→server in
-///   CT_SERVER_FLAGS; server→client is 0x4000 in the OP_IDCHANGE and ping flag
-///   words (`login::SRV_TCPFLG_IPV6`). Both published specs define the
-///   asymmetry deliberately.
+/// ⚠ NOT AN IPv6 BIT ANY MORE, AND THE SERVER DOES NOT READ IT (issue #35).
+///   The IPv6 contract first named 0x1000 in CT_SERVER_FLAGS as "can parse
+///   IPv6 sources". On Lugdunum the same bit is SRVCAP_NATTRAVERSAL: a client
+///   that sets it gets an odd LowID, a longer OP_IDCHANGE and NAT callback
+///   notices (seen on eMule Sunrise). eMuleQt withdrew it and aMule stops
+///   sending it; IPv6 capability is the `CT_MOD_IP_V6` tag alone. Kept only so
+///   the collision tests name the bit.
 pub const CAPABLE_IPV6: u32 = 0x1000;
 
 // Server flags advertised in IDCHANGE
@@ -208,6 +209,16 @@ pub const SRVFLG_IPV6: u32 = 0x0000_4000;
 /// the opcode, so a client that saw only 0x4000 must not send it. Set under the
 /// same condition as 0x4000 (`ipv6_publish_sources`).
 pub const SRVFLG_IPV6_UPDATE: u32 = 0x0000_8000;
+
+/// Server accepts `OP_LOWID_HOLEPUNCH_REQUEST` (0x60) and coordinates the
+/// punch (0x61/0x62, UDP 0x9F), in the `OP_IDCHANGE` flags (issue #35).
+///
+/// A client that knows both this scheme and Lugdunum's NAT callback (TCP flag
+/// 0x1000) could not tell which one a server runs, and sending 0x60 to a
+/// server that does not know it can cost the connection. Bits already taken on
+/// the public network: 0x05DD, 0x1000 (Lugdunum NatT), 0x4000 and 0x8000
+/// (IPv6), 0x10000 (eNode-go meta search).
+pub const SRVFLG_LOWID_HOLEPUNCH: u32 = 0x0002_0000;
 
 // OFFERFILES self-source markers - SPEC.md §3.3
 pub const SELF_COMPLETE_ID: u32 = 0xFBFB_FBFB;
@@ -282,6 +293,14 @@ mod capability_tests {
         // The update bit is its own, clear of both (issue #34).
         assert_eq!(SRVFLG_IPV6_UPDATE.count_ones(), 1);
         assert_eq!((0x0000_05DD | SRVFLG_IPV6) & SRVFLG_IPV6_UPDATE, 0);
+        // The hole-punch bit (issue #35) is clear of every bit in use on the
+        // network: ours, Lugdunum's NatT 0x1000 and eNode-go's 0x10000.
+        assert_eq!(SRVFLG_LOWID_HOLEPUNCH.count_ones(), 1);
+        assert_eq!(
+            (0x0000_05DD | 0x1000 | SRVFLG_IPV6 | SRVFLG_IPV6_UPDATE | 0x0001_0000)
+                & SRVFLG_LOWID_HOLEPUNCH,
+            0
+        );
     }
 
     #[test]

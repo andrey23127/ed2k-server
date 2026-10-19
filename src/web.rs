@@ -1932,6 +1932,10 @@ struct BotRow {
     /// True if this IP is currently within its 24h flood-ban window (its UDP
     /// traffic is being dropped at the recv loop).
     banned: bool,
+    /// Throttled to `bots.throttle_qpm` instead of banned, now.
+    throttled: bool,
+    /// Written to the IP filter file for good (server::bot_ipfilter).
+    ipfilter_added: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
     /// What it sent, counted from its first query (see `BotMix`).
@@ -2028,6 +2032,8 @@ async fn api_bots(State(s): State<WebState>) -> Json<Vec<BotRow>> {
                     .map(|d| d.as_secs())
                     .unwrap_or(0),
                 banned: s.server.is_bot_banned(*e.key()),
+                throttled: s.server.is_bot_throttled(*e.key()),
+                ipfilter_added: d.ipfilter_added,
                 provider: geo.provider(*e.key()),
                 searches: d.mix.searches,
                 source_requests: d.mix.source_requests,
@@ -3577,7 +3583,7 @@ tr:hover td{background:#1e2035}
   <div class="section">
     <h3>Bot Detection</h3>
     <p style="font-size:.78rem;color:#9ca3af;margin-bottom:10px">
-      IPs flagged for abnormal query patterns. Thresholds: <strong>flood</strong> &gt; 600 qpm OR <strong>uniform timing</strong> &gt; 200 qpm with stddev &lt; 50 ms. Flagged IPs are <strong>auto-banned for 24h</strong> — their UDP traffic (global search/sources) is dropped at the recv loop; their TCP session, if any, is unaffected. Bans auto-expire; a rotated IP is re-flagged the same way.
+      IPs flagged for abnormal UDP query patterns, judged over at least <code>bots.min_span_secs</code> (10 s) so a short burst is not a flood. <strong>Flood</strong> &gt; 600 qpm: <strong>banned for 24h</strong>, its UDP traffic dropped at the recv loop. <strong>Uniform timing</strong> &gt; 200 qpm with stddev &lt; 50 ms: <strong>throttled for 24h</strong> to <code>bots.throttle_qpm</code> (60), still answered — mostly one client build with broken pacing. A source that keeps sending through its ban (<code>bots.ipfilter_min_dropped</code>, 10 000 dropped; ten times that when throttled) is added to the IP filter file for good, marked <code>bot</code>. TCP sessions are not affected until then.
     </p>
     <div id="bots-table"></div>
     <p class="sub" style="margin-top:8px">Keep a record: <a href="/api/bots/export?format=csv" style="color:inherit">export CSV</a> ·
@@ -3991,11 +3997,13 @@ async function refreshBots() {
           + `<td>${sent}</td>`
           + `<td>${b.hashes_distinct ? `<a href="#" style="color:inherit" onclick="return botDetail('${escapeHtml(b.ip)}')">${b.hashes_distinct.toLocaleString()} distinct</a>`
                 + `<br><span class="sub">${b.hashes_total.toLocaleString()} asked`
-                + `${b.dropped_after_ban ? ` · ${b.dropped_after_ban.toLocaleString()} dropped since ban`
+                + `${b.dropped_after_ban ? ` · ${b.dropped_after_ban.toLocaleString()} dropped since ${b.throttled ? 'throttle' : 'ban'}`
                     + (b.last_dropped_secs_ago != null ? `, last ${fmtDur(b.last_dropped_secs_ago)} ago` : '') : ''}</span>`
               : '<span class="sub">—</span>'}</td>`
           + `<td>${b.tcp_client ? escapeHtml(b.tcp_client) : '<span class="sub">none</span>'}</td>`
-          + `<td><span class="badge no">${escapeHtml(b.reason)}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}</td>`
+          + `<td><span class="badge no">${escapeHtml(b.reason)}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}`
+          + `${b.throttled ? ' <span class="badge no" style="background:#78350f;color:#fde68a;border-color:#b45309">THROTTLED 24h</span>' : ''}`
+          + `${b.ipfilter_added ? ' <span class="badge no" style="background:#1e1b4b;color:#c7d2fe;border-color:#4338ca">IP FILTER</span>' : ''}</td>`
           + `<td>${fmtDur(b.first_seen_secs_ago)} ago</td>`
           + `<td>${fmtDur(b.last_seen_secs_ago)} ago</td></tr>`;
       }).join('')
