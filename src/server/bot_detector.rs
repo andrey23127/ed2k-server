@@ -240,6 +240,176 @@ pub fn record_query(state: &Arc<ServerState>, peer: SocketAddr, q: QueryInfo, ha
                   reason = %reason, "bot detected — banned 24h");
 }
 
+/// One hour of source requests from one source, for the scanner and hammer
+/// rules (`record_sources`).
+#[derive(Default)]
+pub struct ScanWindow {
+    start: Option<Instant>,
+    /// Files asked in source requests (TCP and UDP), repeats included.
+    files: u32,
+    /// Different files, counted once the window has `HLL_FROM` files: an
+    /// ordinary client asks fewer than 200 an hour (live, 2026-10-20), so
+    /// most sources never pay for the 64 bytes.
+    distinct: Option<Box<crate::server::activity::Hll>>,
+    /// Judged in this window already.
+    flagged: bool,
+}
+
+const SCAN_WINDOW: Duration = Duration::from_secs(3600);
+const HLL_FROM: u32 = 200;
+
+impl ScanWindow {
+    fn distinct(&self) -> f64 {
+        self.distinct.as_ref().map_or(0.0, |h| h.estimate().min(self.files as f64))
+    }
+    pub fn has_distinct(&self) -> bool {
+        self.distinct.is_some()
+    }
+    pub fn expired(&self) -> bool {
+        self.start.map_or(true, |s| s.elapsed() >= SCAN_WINDOW)
+    }
+}
+
+/// Source requests of `raw_ip` (TCP or UDP), judged per hour against two
+/// rules measured on the live server (2026-10-20, 91 000 sources over 7 h):
+///
+/// - **Scanner**: at least `bots.scan_min_files` files asked (2 000) of which
+///   at least `bots.scan_min_distinct` different (1 000). It walks a list.
+///   An ordinary eMule asks 15 files every 5 minutes, about 180 an hour,
+///   however long its download list; the busiest ordinary source asked
+///   under 1 000 an hour. Banned by default (`scan_action`).
+/// - **Hammer**: at least `bots.hammer_min_files` files asked (3 000) of
+///   fewer than `bots.hammer_max_distinct` different ones (100): the same
+///   file or two, over and over, up to 10 a second. Mostly one mobile client
+///   build with a bug; its users are real, so it is throttled by default.
+pub fn record_sources(state: &Arc<ServerState>, raw_ip: IpAddr, hashes: &[FileHash], tcp: bool) {
+    if hashes.is_empty() {
+        return;
+    }
+    let ip = state.source_key(raw_ip);
+    let cfg = state.live_cfg.load();
+    let b = &cfg.bots;
+    let verdict = {
+        let mut w = state.scan_windows.entry(ip).or_default();
+        if w.expired() {
+            *w = ScanWindow { start: Some(Instant::now()), ..Default::default() };
+        }
+        w.files = w.files.saturating_add(hashes.len() as u32);
+        if w.files >= HLL_FROM || w.distinct.is_some() {
+            let h = w.distinct.get_or_insert_with(Default::default);
+            for x in hashes {
+                h.add(x);
+            }
+        }
+        if w.flagged {
+            return;
+        }
+        let files = w.files as u64;
+        // Cheap test first: both rules need this many files.
+        if files < b.scan_min_files.min(b.hammer_min_files) {
+            return;
+        }
+        let distinct = w.distinct();
+        let mins = w.start.map_or(0.0, |s| s.elapsed().as_secs_f64() / 60.0).max(1.0);
+        let v = if files >= b.scan_min_files && distinct >= b.scan_min_distinct as f64 {
+            Some((
+                format!("scanner: {files} files ({distinct:.0} different) in {mins:.0} min"),
+                b.scan_action.clone(),
+            ))
+        } else if files >= b.hammer_min_files && distinct < b.hammer_max_distinct as f64 {
+            Some((
+                format!("hammer: {files} requests for {distinct:.0} file(s) in {mins:.0} min"),
+                b.hammer_action.clone(),
+            ))
+        } else {
+            None
+        };
+        if v.is_some() {
+            w.flagged = true;
+        }
+        v.map(|(r, a)| (r, a, files as f64 / mins))
+    };
+    let Some((reason, action, per_min)) = verdict else { return };
+    let action = action.trim().to_ascii_lowercase();
+    if action == "log" || action == "off" {
+        tracing::warn!(%ip, tcp, %reason, "bot rule matched (action = log, nothing done)");
+        ledger(state, serde_json::json!({
+            "time": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "event": "matched", "ip": ip.to_string(), "reason": reason, "tcp": tcp,
+        }));
+        return;
+    }
+    let throttled = action == "throttle";
+    flag(state, ip, raw_ip, reason, per_min, -1.0, throttled, hashes);
+}
+
+/// Ban or throttle `ip` for 24 h and record it as a detection, as the rate
+/// rules do. Used by `record_sources`.
+#[allow(clippy::too_many_arguments)]
+fn flag(
+    state: &Arc<ServerState>,
+    ip: IpAddr,
+    raw_ip: IpAddr,
+    reason: String,
+    qpm: f64,
+    stddev_ms: f64,
+    throttled: bool,
+    hashes: &[FileHash],
+) {
+    if throttled {
+        state.throttle_bot(ip, state.live_cfg.load().bots.throttle_qpm);
+    } else {
+        state.ban_bot(ip);
+    }
+    let (country, provider) = state
+        .country_db
+        .try_read()
+        .ok()
+        .map(|db| (db.lookup(ip).map(|(c, _)| c), db.provider(ip)))
+        .unwrap_or((None, None));
+    let mix = state.bot_query_log.get(&ip).map(|t| t.mix.snapshot()).unwrap_or_default();
+    let tcp_client = tcp_client_on(state, raw_ip);
+    let now_sys = SystemTime::now();
+    {
+        let mut d = state.bot_detections.entry(ip).or_insert_with(|| BotDetection {
+            first_seen: now_sys,
+            last_seen: now_sys,
+            query_count: 0,
+            queries_per_minute: 0.0,
+            interval_stddev_ms: 0.0,
+            country: String::new(),
+            reason: String::new(),
+            mix: Default::default(),
+            tcp_client: None,
+            provider: None,
+            hashes: BotHashes::default(),
+            dropped_after_ban: 0,
+            last_dropped: None,
+            throttled: false,
+            ipfilter_added: false,
+        });
+        d.throttled = throttled;
+        d.last_seen = now_sys;
+        d.query_count += 1;
+        d.queries_per_minute = qpm;
+        d.interval_stddev_ms = stddev_ms;
+        d.country = country.unwrap_or_else(|| "??".to_string());
+        d.reason = reason.clone();
+        d.mix = mix;
+        if tcp_client.is_some() {
+            d.tcp_client = tcp_client;
+        }
+        d.provider = provider;
+        for h in hashes {
+            d.hashes.add(*h);
+        }
+        ledger(state, ledger_entry("detected", ip, &d));
+    }
+    *state.block_stats.entry("bot".to_string()).or_insert(0) += 1;
+    tracing::warn!(%ip, %reason, action = if throttled { "throttled" } else { "banned" },
+                   "bot detected — 24h");
+}
+
 /// The file hashes in a UDP source request: 0x9A carries bare hashes, 0x94
 /// hash + size (+ 8 bytes when the 32-bit size is 0, a large file). At most
 /// 64, as the handler answers.
@@ -591,5 +761,110 @@ mod source_key_tests {
         flood(&st, (0..10).map(|_| "2001:db8::1".parse().unwrap()));
         assert!(st.bot_detections.is_empty());
         assert!(!st.is_bot_banned("2001:db8::1".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod scan_rule_tests {
+    use super::*;
+
+    fn h(i: u32) -> FileHash {
+        let mut x = [0u8; 16];
+        x[..4].copy_from_slice(&i.to_le_bytes());
+        x[8..12].copy_from_slice(&i.wrapping_mul(2_654_435_761).to_le_bytes());
+        x
+    }
+
+    fn st() -> Arc<ServerState> {
+        Arc::new(ServerState::for_test())
+    }
+
+    #[test]
+    fn an_ordinary_client_with_a_long_list_is_left_alone() {
+        // 15 files every 5 minutes is what eMule does; even a whole hour of
+        // it, over a list of 3 000 files, is nowhere near the rule.
+        let s = st();
+        let ip: IpAddr = "198.51.100.30".parse().unwrap();
+        for i in 0..180 {
+            record_sources(&s, ip, &[h(i)], true);
+        }
+        assert!(!s.is_bot_banned(ip));
+        assert!(s.bot_throttle_admit(ip).is_none());
+        assert!(s.bot_detections.get(&ip).is_none());
+    }
+
+    #[test]
+    fn a_list_scanner_is_banned() {
+        let s = st();
+        let ip: IpAddr = "198.51.100.31".parse().unwrap();
+        for i in 0..1999 {
+            record_sources(&s, ip, &[h(i)], true);
+        }
+        assert!(!s.is_bot_banned(ip), "not before 2 000 files");
+        record_sources(&s, ip, &[h(1999)], true);
+        assert!(s.is_bot_banned(ip));
+        let d = s.bot_detections.get(&ip).unwrap();
+        assert!(d.reason.starts_with("scanner"), "{}", d.reason);
+        assert!(!d.throttled);
+    }
+
+    #[test]
+    fn batched_udp_requests_count_by_file() {
+        let s = st();
+        let ip: IpAddr = "198.51.100.32".parse().unwrap();
+        for r in 0..80u32 {
+            let batch: Vec<FileHash> = (0..25).map(|k| h(r * 25 + k)).collect();
+            record_sources(&s, ip, &batch, false);
+        }
+        assert!(s.is_bot_banned(ip), "2 000 different files in 80 requests");
+    }
+
+    #[test]
+    fn a_hammer_is_throttled_not_banned() {
+        let s = st();
+        let ip: IpAddr = "198.51.100.33".parse().unwrap();
+        for i in 0..3000u32 {
+            record_sources(&s, ip, &[h(i % 2)], true);
+        }
+        assert!(!s.is_bot_banned(ip));
+        assert!(s.bot_throttle_admit(ip).is_some());
+        let d = s.bot_detections.get(&ip).unwrap();
+        assert!(d.reason.starts_with("hammer"), "{}", d.reason);
+        assert!(d.throttled);
+    }
+
+    #[test]
+    fn many_files_asked_a_few_times_each_is_neither() {
+        // 2 500 requests over 500 files: above the hammer's distinct limit,
+        // below the scanner's.
+        let s = st();
+        let ip: IpAddr = "198.51.100.34".parse().unwrap();
+        for i in 0..2500u32 {
+            record_sources(&s, ip, &[h(i % 500)], true);
+        }
+        assert!(!s.is_bot_banned(ip));
+        assert!(s.bot_throttle_admit(ip).is_none());
+    }
+
+    #[test]
+    fn action_log_only_records() {
+        let s = st();
+        let mut cfg = (**s.live_cfg.load()).clone();
+        cfg.bots.scan_action = "log".into();
+        s.live_cfg.store(Arc::new(cfg));
+        let ip: IpAddr = "198.51.100.35".parse().unwrap();
+        for i in 0..2000 {
+            record_sources(&s, ip, &[h(i)], true);
+        }
+        assert!(!s.is_bot_banned(ip));
+        assert!(s.bot_detections.get(&ip).is_none());
+    }
+
+    #[test]
+    fn a_ban_wakes_the_tcp_sessions() {
+        let s = st();
+        let rx = s.ip_filter_gen.subscribe();
+        s.ban_bot("198.51.100.36".parse().unwrap());
+        assert!(rx.has_changed().unwrap());
     }
 }

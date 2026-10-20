@@ -230,6 +230,17 @@ pub async fn handle_admitted_connection(
     // How often a logged-in session re-checks whether it has been replaced.
     let replaced_recheck = std::time::Duration::from_secs(60);
     let mut last_activity = tokio::time::Instant::now();
+    // A banned bot gets no session for its 24 hours, over TCP as over UDP.
+    if state.is_bot_banned(peer.ip()) {
+        crate::server::bot_detector::note_banned(&state, peer.ip(), &[]);
+        *state.block_stats.entry("bot_tcp_refused".to_string()).or_insert(0) += 1;
+        return Ok(());
+    }
+    // A new IP filter (a bot added to it, the file changed, a reload) or a
+    // bot ban wakes this session to check its own address: the filter is otherwise only
+    // read at accept, and a scanner added to it stayed connected for hours.
+    let mut ipf_gen = state.ip_filter_gen.subscribe();
+    let mut ipf_open = true;
 
     loop {
         // The next deadline depends on whether the client has logged in yet.
@@ -347,6 +358,26 @@ pub async fn handle_admitted_connection(
                     }
                 }
             }
+            changed = ipf_gen.changed(), if ipf_open => {
+                if changed.is_err() {
+                    ipf_open = false;
+                    continue;
+                }
+                if state.ip_filter_blocks(peer.ip()).await {
+                    let nick = client.as_ref().map(|c| c.nick.as_str()).unwrap_or("");
+                    info!(ip = %peer.ip(), nick = %nick,
+                          "address is now in the IP filter — closing its connection");
+                    *state.block_stats.entry("ipfilter_kick".to_string()).or_insert(0) += 1;
+                    break;
+                }
+                if state.is_bot_banned(peer.ip()) {
+                    let nick = client.as_ref().map(|c| c.nick.as_str()).unwrap_or("");
+                    info!(ip = %peer.ip(), nick = %nick,
+                          "address banned as a bot — closing its connection");
+                    *state.block_stats.entry("bot_kick".to_string()).or_insert(0) += 1;
+                    break;
+                }
+            }
             Some(frame) = rx.recv() => {
                 if let Err(e) = framed.send(frame).await {
                     debug!(ip = %peer.ip(), error = %e, "send error on pushed frame");
@@ -432,6 +463,9 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         // stale entry here survives indefinitely because nothing else
         // references it.
         state.client_ipv6.remove(&c.user_hash);
+        // Its keepalive port goes too: a reconnect from another address
+        // must not be handed out with the old mapping (issue #37).
+        state.natt_udp_ports.remove(&c.user_hash);
         // Retract the id→user mapping. Guarded inside by user hash.
         state.unindex_client_id(c.assigned_id, &c.user_hash);
         state.remove_sources_of(&c.user_hash);
@@ -861,6 +895,8 @@ async fn dispatch(
                         None => Vec::new(),
                     };
                     let mut all = all;
+                    state.note_activity(peer.ip(), crate::server::activity::Kind::TcpSearch, &[], true);
+                    state.note_activity_results(peer.ip(), all.len());
                     // Keep the full result set in this connection's pending
                     // buffer.
                     let first_len = all.len().min(search_page_size(state));
@@ -887,6 +923,19 @@ async fn dispatch(
                 return Err(anyhow::anyhow!("GETSOURCES before login"));
             };
             if let Ok(req) = GetSourcesRequest::parse(&frame.payload) {
+                state.note_activity(
+                    peer.ip(),
+                    crate::server::activity::Kind::TcpSources,
+                    &[req.file_hash],
+                    true,
+                );
+                crate::server::bot_detector::record_sources(state_arc, peer.ip(), &[req.file_hash], true);
+                // A throttled source (the hammer rule) gets `bots.throttle_qpm`
+                // answers a minute; the rest go unanswered, as over UDP.
+                if state.bot_throttle_admit(peer.ip()) == Some(false) {
+                    crate::server::bot_detector::note_banned(state_arc, peer.ip(), &[]);
+                    return Ok(());
+                }
                 framed.send(handle_get_sources(state, c, req)).await?;
             }
         }
@@ -1008,6 +1057,7 @@ async fn dispatch(
             // Client wants the next page of the last search. Drain another
             // page from this connection's pending buffer.
             use crate::server::search::{build_search_result_page, search_page_size};
+            state.note_activity(peer.ip(), crate::server::activity::Kind::TcpMore, &[], true);
             if pending_search.is_empty() {
                 // Nothing buffered — reply with an empty, "no more" result
                 // so the client's More button settles.

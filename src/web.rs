@@ -642,6 +642,9 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/bots/export", get(api_bots_export))
             .route("/api/bots/log", get(api_bots_log))
             .route("/api/bots/files", get(api_bots_files))
+            .route("/api/activity", get(api_activity))
+            .route("/api/activity/sources", get(api_activity_sources))
+            .route("/api/activity/reset", post(api_activity_reset))
             .route("/api/block_stats", get(api_block_stats))
             .route("/api/memdebug", get(api_memdebug))
             .route("/api/memsize", get(api_memsize))
@@ -2068,6 +2071,146 @@ fn query_map(qs: Option<&str>) -> std::collections::HashMap<String, String> {
             (k.to_string(), url_decode(v))
         })
         .collect()
+}
+
+/// Search activity, server-wide and its spread over sources (temporary; see
+/// `server::activity`).
+async fn api_activity(State(s): State<WebState>) -> impl IntoResponse {
+    let rows = s.server.activity.snapshot();
+    let mut v = s.server.activity.summary(&rows);
+    let cfg = s.server.live_cfg.load();
+    v["enabled"] = serde_json::json!(cfg.bots.activity_stats);
+    v["max_sources"] = serde_json::json!(cfg.bots.activity_max_sources);
+    Json(v)
+}
+
+/// Start a new period: every record and total dropped.
+async fn api_activity_reset(State(s): State<WebState>) -> impl IntoResponse {
+    s.server.activity.reset();
+    (StatusCode::OK, "activity statistics reset")
+}
+
+/// One row per source. `sort` = requests (default) | searches | sources |
+/// files | distinct | peak | per_hour | repeats; `limit` (default 200, 0 =
+/// all); `min` = least requests; `format=csv`.
+async fn api_activity_sources(
+    State(s): State<WebState>,
+    axum::extract::RawQuery(qs): axum::extract::RawQuery,
+) -> impl IntoResponse {
+    use crate::server::activity::{GAP_BUCKETS, PER_REQ_BUCKETS};
+    let q = query_map(qs.as_deref());
+    let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(200);
+    let min: u64 = q.get("min").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let sort = q.get("sort").map(String::as_str).unwrap_or("requests").to_string();
+    let mut rows: Vec<_> = s
+        .server
+        .activity
+        .snapshot()
+        .into_iter()
+        .filter(|(_, r)| r.requests() >= min)
+        .collect();
+    let key = |r: &crate::server::activity::Rec| -> f64 {
+        match sort.as_str() {
+            "searches" => r.searches() as f64,
+            "sources" => r.source_requests() as f64,
+            "files" => r.hashes as f64,
+            "distinct" => r.distinct_est(),
+            "peak" => r.peak_per_min as f64,
+            "per_hour" => r.per_hour(),
+            "repeats" => r.hashes as f64 / r.distinct_est().max(1.0),
+            _ => r.requests() as f64,
+        }
+    };
+    rows.sort_by(|a, b| key(&b.1).partial_cmp(&key(&a.1)).unwrap_or(std::cmp::Ordering::Equal));
+    if limit > 0 {
+        rows.truncate(limit);
+    }
+    let wanted: std::collections::HashSet<std::net::IpAddr> =
+        rows.iter().filter(|(ip, r)| r.tcp && ip.is_ipv4()).map(|(ip, _)| *ip).collect();
+    let live = tcp_clients_on(&s, &wanted);
+    let geo = s.server.country_db.read().await;
+    let start = s.server.activity.started_at();
+    let at = |secs: u32| -> String {
+        chrono::DateTime::<chrono::Utc>::from(start + std::time::Duration::from_secs(secs as u64))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let prefix = s.server.admission.cfg.ipv6_source_prefix_bits;
+    let round2 = |x: f64| (x * 100.0).round() / 100.0;
+    let out: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(ip, r)| {
+            let mut o = serde_json::json!({
+                "ip": match ip {
+                    std::net::IpAddr::V6(v6) => format!("{v6}/{prefix}"),
+                    v4 => v4.to_string(),
+                },
+                "country": geo.lookup(*ip).map(|(c, _)| c).unwrap_or_default(),
+                "provider": geo.provider(*ip).unwrap_or_default(),
+                "tcp_client": live.get(ip).cloned().unwrap_or_default(),
+                "logged_in": r.tcp,
+                "first_seen": at(r.first_s),
+                "last_seen": at(r.last_s),
+                "active_secs": r.active_secs(),
+                "requests": r.requests(),
+                "tcp_searches": r.n[0],
+                "udp_searches": r.n[1],
+                "more_results": r.n[2],
+                "tcp_source_requests": r.n[3],
+                "udp_source_requests": r.n[4],
+                "files_asked": r.hashes,
+                "files_per_request": round2(r.hashes as f64 / r.source_requests().max(1) as f64),
+                "distinct_files": r.distinct_est().round() as u64,
+                "repeats_per_file": round2(r.hashes as f64 / r.distinct_est().max(1.0)),
+                "results": r.results,
+                "zero_result_searches": r.zero_result,
+                "peak_per_min": r.peak_per_min,
+                "requests_per_hour": round2(r.per_hour()),
+            });
+            for (name, n) in PER_REQ_BUCKETS.iter().zip(r.per_req) {
+                o[format!("req_files_{name}")] = n.into();
+            }
+            for (name, n) in GAP_BUCKETS.iter().zip(r.gaps) {
+                o[format!("gap_{name}")] = n.into();
+            }
+            o
+        })
+        .collect();
+    drop(geo);
+    if q.get("format").map(String::as_str) == Some("csv") {
+        // In this order; a JSON object has its keys sorted.
+        let mut cols: Vec<String> = [
+            "ip", "country", "provider", "tcp_client", "logged_in", "first_seen", "last_seen",
+            "active_secs", "requests", "tcp_searches", "udp_searches", "more_results",
+            "tcp_source_requests", "udp_source_requests", "files_asked", "files_per_request",
+            "distinct_files", "repeats_per_file", "results", "zero_result_searches",
+            "peak_per_min", "requests_per_hour",
+        ]
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+        cols.extend(PER_REQ_BUCKETS.iter().map(|n| format!("req_files_{n}")));
+        cols.extend(GAP_BUCKETS.iter().map(|n| format!("gap_{n}")));
+        let cell = |v: &serde_json::Value| -> String {
+            let t = match v {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                o => o.to_string(),
+            };
+            if t.contains([',', '"', '\n']) {
+                format!("\"{}\"", t.replace('"', "\"\""))
+            } else {
+                t
+            }
+        };
+        let mut body = cols.join(",");
+        body.push('\n');
+        for o in &out {
+            body.push_str(&cols.iter().map(|c| cell(&o[c.as_str()])).collect::<Vec<_>>().join(","));
+            body.push('\n');
+        }
+        return ([(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")], body).into_response();
+    }
+    Json(out).into_response()
 }
 
 /// The bot key for an `ip` query parameter: an address, or an IPv6 prefix as

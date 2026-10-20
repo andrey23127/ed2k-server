@@ -5,8 +5,11 @@ Earlier releases are described in their release commit messages.
 ## 0.9.84
 
 Bot detection that stops banning ordinary users, scanners into the IP filter
-for good, and the LowID hole-punch flag (issue #35). One new optional section,
-`[bots]`.
+for good (and off their TCP sessions), search activity per source to find
+better criteria, and LowID hole punching: the support flag (issue #35), the
+right UDP port for two clients behind one IP (#37), the peer ID in 0x61
+(#38). One new optional
+section, `[bots]`.
 
 ### Bots
 
@@ -33,7 +36,61 @@ for good, and the LowID hole-punch flag (issue #35). One new optional section,
   scanners it now catches scan over UDP.
 - **The IP filter file is watched**: a change on disk is applied within 30 s.
   Before, only SIGHUP or `/api/reload` reloaded it.
+- **A new IP filter closes the TCP sessions it now blocks.** The filter was
+  read only when a connection was accepted, so a scanner added to it stayed
+  logged in until it reconnected (seen: 3 hours). Every filter swap (a bot
+  added, the file changed, SIGHUP, `/api/reload`) now wakes each session to
+  check its own address. Counted as `ipfilter_kick`.
 - The Bots tab shows THROTTLED and IP FILTER next to BANNED.
+
+### Scanners and hammers, over TCP too
+
+Seven hours of `/api/activity` (91 000 sources) showed where the rate rules
+fall short. An ordinary eMule asks its server for sources of 15 files every
+5 minutes, about 180 an hour, however long its download list; the busiest
+ordinary source stayed under 1 000. Two kinds of source did not, and nearly
+all of them over TCP, where nothing was judged before:
+
+- **Scanners**, walking a list: 2 000 to 20 000 files an hour, nearly all
+  different (one asked 3 900 files in 6 minutes). New rule: at least
+  `bots.scan_min_files` (2 000) files in an hour, at least
+  `bots.scan_min_distinct` (1 000) different → `scan_action` ("ban").
+  Over the 7 hours it matches 4 to 7 sources.
+- **Hammers**, the same file or two up to 10 times a second, mostly one
+  mobile client build: at least `bots.hammer_min_files` (3 000) in an hour,
+  fewer than `bots.hammer_max_distinct` (100) different → `hammer_action`
+  ("throttle": `throttle_qpm` answers a minute, the session stays). About
+  20 sources.
+- Both count TCP `OP_GETSOURCES` and UDP source requests by file, per
+  source, over an hour from its first request. Different files are
+  estimated from the 200th file on, so most sources cost a counter only.
+- A bot ban now covers TCP: its sessions are closed and it can't log in for
+  the 24 hours (`bot_kick`, `bot_tcp_refused`). A throttled source's TCP
+  source requests beyond its allowance go unanswered.
+- `"log"` as an action only writes the match to the log and the ledger.
+
+### Search activity (temporary)
+
+The rate detector misses a list scanner: one walked 4 400 files at about 150
+requests a minute, below the 200 qpm a source needs to be looked at, and was
+caught before only because a burst of its requests read as 605 qpm. What sets
+such a source apart is how many different files it asks about. To pick that
+threshold, and others, from real traffic:
+
+- Per source (IPv4 address, IPv6 /64): searches over TCP and UDP, "more
+  results" pages and results; source requests over TCP and UDP, files per
+  request, files asked and different files (HyperLogLog, ±13%, no hash
+  kept); gaps between requests, the busiest minute, requests per hour.
+- `GET /api/activity`: totals, requests by UTC hour, and the spread of each
+  figure over sources (mean, p50/p90/p99/p99.9, max) with histograms.
+  `GET /api/activity/sources`: one row per source, sortable, as JSON or
+  `format=csv`. `POST /api/activity/reset` starts a new period.
+- The distinct-files estimate mixes each hash first: sources asking 700
+  files were estimated at 6 000, from hashes with long runs of zero bytes.
+  It is also never above the files asked.
+- `bots.activity_stats` (on) and `bots.activity_max_sources` (100 000
+  records, about 200 bytes each; further sources only in the totals). Both
+  apply from the Settings tab without a restart.
 
 ### LowID hole punch flag (issue #35)
 
@@ -45,6 +102,29 @@ for good, and the LowID hole-punch flag (issue #35). One new optional section,
 - The IPv6 contract in the README no longer lists `CT_SERVER_FLAGS` `0x1000`.
   On Lugdunum that bit is `SRVCAP_NATTRAVERSAL`; eMuleQt withdrew it and aMule
   stops sending it. This server only ever keyed on the `CT_MOD_IP_V6` tag.
+
+### Hole punch: per-client UDP port (issue #37)
+
+- The UDP port handed to a peer in `OP_LOWID_HOLEPUNCH_INFO` came from a map
+  keyed by IP and written by every 0x9F and every global query from it. With
+  two LowID clients behind one public IP, the last packet won, and a client
+  was told its own port as its peer's. Now each client's last 0x9F source
+  port is kept by user hash and preferred; the per-IP port is used only for
+  a client alone on its IP; the announced port comes last.
+- A 0x9F counts only from the session's own IP: a user hash is no secret,
+  and a keepalive from elsewhere could have sent the client's peers there.
+- The 0x60 port, the client's local one, no longer replaces a keepalive port.
+  Global queries (aMule sends them from TCP + 3) no longer either.
+- The port is dropped with the session, so a reconnect from another address
+  does not inherit it.
+
+### Hole punch: peer ID in 0x61 (issue #38)
+
+- `OP_LOWID_HOLEPUNCH_INFO` ends with `peer_id(4)`, the server ID of the
+  peer described: the requester gets its 0x60 target, the target gets the
+  requester. A requester can now keep several 0x60 in flight and match each
+  answer, where before it had only the TCP port (often 4662) to go by. The
+  payload is 29 bytes; clients read the ID only from 29 bytes or more.
 
 ### NAT-T documentation (issue #36)
 

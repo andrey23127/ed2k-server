@@ -564,7 +564,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
             }
         }
         let f = IpFilter::load(ipfilter_path);
-        *state.ip_filter.write().await = f;
+        state.swap_ip_filter(f).await;
     }
     // Country database: the MaxMind DB (IPv4 + IPv6) if present, else
     // ip-to-country.csv (IPv4). Used for display and stats only, not blocking.
@@ -894,10 +894,14 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 state_clean
                     .observed_udp_ports
                     .retain(|_, (_, ts)| ts.elapsed() < OBSERVED_PORT_TTL);
+                state_clean
+                    .natt_udp_ports
+                    .retain(|_, (_, ts)| ts.elapsed() < OBSERVED_PORT_TTL);
                 // Bot detector keeps per-IP sliding windows. IPs that haven't
                 // queried in 5 minutes can be dropped — their window is empty
                 // and re-creating it on next query is cheap. Without this
                 // cleanup, bot_query_log grew unbounded (memory leak under load).
+                state_clean.scan_windows.retain(|_, w| !w.expired());
                 state_clean.bot_query_log.retain(|_, tracker| {
                     let times = tracker.query_times.lock().unwrap();
                     times.back().is_some_and(|t| t.elapsed().as_secs() < 300)
@@ -1183,7 +1187,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     .await;
                     if let Ok((f, m)) = loaded {
                         let ranges = f.len();
-                        *state_ipf.ip_filter.write().await = f;
+                        state_ipf.swap_ip_filter(f).await;
                         // The mtime after a possible re-append, so our own
                         // write does not trigger a second reload.
                         last_mtime = m.or(Some(mtime));
@@ -1756,7 +1760,7 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     {
                         Ok(new_filter) => {
                             let ranges = new_filter.len();
-                            *state_reload.ip_filter.write().await = new_filter;
+                            state_reload.swap_ip_filter(new_filter).await;
                             info!(
                                 ranges,
                                 path = &cfg_reload.storage.ipfilter_path,

@@ -305,6 +305,14 @@ whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"
 # throttle_qpm = 60              # what a throttled source still gets per minute
 # ipfilter_min_dropped = 10000   # into storage.ipfilter_path after this many
 #                                # datagrams sent into a ban; 0 = never
+# scan_min_files = 2000          # scanner: files asked for sources in an hour
+# scan_min_distinct = 1000       #   ... of which this many different
+# scan_action = "ban"            #   "ban", "throttle" or "log"
+# hammer_min_files = 3000        # hammer: files asked in an hour
+# hammer_max_distinct = 100      #   ... fewer than this many different
+# hammer_action = "throttle"     #   "throttle", "ban" or "log"
+# activity_stats = true          # search activity per source for /api/activity
+# activity_max_sources = 100000  # records kept (~200 bytes each)
 
 [admission]
 # Server-wide ceilings on remotely caused work (issue #25). Restart-only; no

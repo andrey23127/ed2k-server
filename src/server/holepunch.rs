@@ -55,20 +55,37 @@ use tracing::{debug, warn};
 /// (the next keepalive overwrites it within ~2 min anyway).
 const OBSERVED_UDP_FRESH: Duration = Duration::from_secs(600);
 
-/// Return the external (post-NAT) UDP port we last saw `ip` send from, if it is
-/// fresh enough to trust. Falls back to None so the caller uses the announced
-/// port. Only meaningful for IPv4 (eD2k is IPv4-only).
-fn observed_udp_port(state: &ServerState, ip: IpAddr, announced: u16) -> u16 {
+/// The UDP port to hand a peer for the client `user_hash` at `ip` (issue #37).
+/// In order:
+///  1. the source port of the client's own last 0x9F keepalive, if fresh: it
+///     is per client, so two clients behind one public IP each get theirs;
+///  2. the last UDP port seen from `ip` (keepalives and global queries), only
+///     when no other client is connected from that address, since it is
+///     shared by every client there;
+///  3. the port the client announced (0xF9 at login, or in its 0x60).
+fn observed_udp_port(state: &ServerState, user_hash: &[u8; 16], ip: IpAddr, announced: u16) -> u16 {
+    if let Some(e) = state.natt_udp_ports.get(user_hash) {
+        let (port, seen) = *e;
+        if port != 0 && seen.elapsed() < OBSERVED_UDP_FRESH {
+            return port;
+        }
+    }
     if let IpAddr::V4(v4) = ip {
-        if let Some(entry) = state.observed_udp_ports.get(&v4) {
-            let (port, seen) = *entry;
-            if port != 0 && seen.elapsed() < OBSERVED_UDP_FRESH {
-                return port;
+        let alone = state.conn_per_ip.get(&ip).map_or(true, |n| *n <= 1);
+        if alone {
+            if let Some(entry) = state.observed_udp_ports.get(&v4) {
+                let (port, seen) = *entry;
+                if port != 0 && seen.elapsed() < OBSERVED_UDP_FRESH {
+                    return port;
+                }
             }
         }
     }
     announced
 }
+
+/// Length of an OP_LOWID_HOLEPUNCH_INFO payload (25 before the peer id).
+pub const INFO_LEN: usize = 4 + 2 + 2 + 16 + 1 + 4;
 
 /// Reasons sent in OP_LOWID_HOLEPUNCH_FAIL.
 pub const FAIL_TARGET_NOT_CONNECTED: u8 = 1;
@@ -95,9 +112,13 @@ pub fn handle_holepunch_request(
     target_id: u32,
 ) -> Option<u8> {
     // Record the requester's UDP port so that, if it is later a target, the
-    // server already knows how to reach it. Cheap single-shard update.
-    if let Some(mut me) = state.clients.get_mut(requester_user_hash) {
-        me.udp_port = requester_udp_port;
+    // server already knows how to reach it. Cheap single-shard update. This is
+    // the announced port, the last resort of `observed_udp_port`: the port of
+    // a fresh keepalive still wins over it (issue #37).
+    if requester_udp_port != 0 {
+        if let Some(mut me) = state.clients.get_mut(requester_user_hash) {
+            me.udp_port = requester_udp_port;
+        }
     }
 
     // A client asking to punch to itself is a no-op/bug.
@@ -190,15 +211,20 @@ pub fn handle_holepunch_request(
     // Prefer the external (post-NAT) UDP port we actually observed each side
     // send from, falling back to the announced port. This is what makes the
     // punch reach a NATed peer on cone-type NATs.
-    let t_udp_eff = observed_udp_port(state, t_ip, t_udp);
-    let requester_udp_eff = observed_udp_port(state, requester_ip, requester_udp_port);
+    let t_udp_eff = observed_udp_port(state, &t_hash, t_ip, t_udp);
+    let requester_udp_eff =
+        observed_udp_port(state, requester_user_hash, requester_ip, requester_udp_port);
 
+    // Each side also gets the server ID of the peer described (issue #38):
+    // the requester its 0x60 target id, so it can tell which of several
+    // requests in flight this answers; the target the requester's id.
     let to_requester = build_info(
         t_ip,
         t_tcp,
         t_udp_eff,
         &t_hash,
         if requester_is_initiator { 0 } else { 1 },
+        target_id,
     );
     let to_target = build_info(
         requester_ip,
@@ -206,6 +232,7 @@ pub fn handle_holepunch_request(
         requester_udp_eff,
         requester_user_hash,
         if requester_is_initiator { 1 } else { 0 },
+        requester_id,
     );
 
     // Both lookups below take fresh short-lived guards (the earlier target guard
@@ -322,11 +349,20 @@ pub fn schedule_info_retries(
     });
 }
 
-/// OP_LOWID_HOLEPUNCH_INFO payload:
+/// OP_LOWID_HOLEPUNCH_INFO payload, 29 bytes:
 ///   peer_ip(4 LE) + peer_tcp_port(2 LE) + peer_udp_port(2 LE)
-///   + peer_user_hash(16) + role(1)
-fn build_info(ip: IpAddr, tcp_port: u16, udp_port: u16, user_hash: &[u8; 16], role: u8) -> Frame {
-    let mut p = BytesMut::with_capacity(4 + 2 + 2 + 16 + 1);
+///   + peer_user_hash(16) + role(1) + peer_id(4 LE)
+/// `peer_id` (issue #38) is the server ID of the peer described; a client
+/// reads it only from a payload of 29 bytes or more (it was 25 before).
+fn build_info(
+    ip: IpAddr,
+    tcp_port: u16,
+    udp_port: u16,
+    user_hash: &[u8; 16],
+    role: u8,
+    peer_id: u32,
+) -> Frame {
+    let mut p = BytesMut::with_capacity(INFO_LEN);
     match ip {
         // eD2k stores IPv4 as a u32; writing the octets in order is equivalent
         // to u32::from_le_bytes(octets) written little-endian.
@@ -337,6 +373,7 @@ fn build_info(ip: IpAddr, tcp_port: u16, udp_port: u16, user_hash: &[u8; 16], ro
     p.put_u16_le(udp_port);
     p.put_slice(user_hash);
     p.put_u8(role);
+    p.put_u32_le(peer_id);
     Frame::new(OP_LOWID_HOLEPUNCH_INFO, p.to_vec())
 }
 
@@ -367,14 +404,71 @@ mod tests {
     #[test]
     fn info_payload_format() {
         let hash = [7u8; 16];
-        let frame = build_info(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0);
+        let frame = build_info(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0, 0x0102_0304);
         assert_eq!(frame.opcode, OP_LOWID_HOLEPUNCH_INFO);
-        assert_eq!(frame.payload.len(), 25);
+        assert_eq!(frame.payload.len(), 29);
         assert_eq!(&frame.payload[0..4], &[1, 2, 3, 4]); // ip
         assert_eq!(&frame.payload[4..6], &[0x36, 0x12]); // 4662 LE
         assert_eq!(&frame.payload[6..8], &[0x40, 0x12]); // 4672 LE
         assert_eq!(&frame.payload[8..24], &hash); // user hash
         assert_eq!(frame.payload[24], 0); // role
+        assert_eq!(&frame.payload[25..29], &[4, 3, 2, 1]); // peer id LE
+    }
+
+    fn info_of(rx: &mut tokio::sync::mpsc::Receiver<Frame>) -> (u16, u16, [u8; 16], u32) {
+        let f = rx.try_recv().expect("an INFO frame");
+        assert_eq!(f.opcode, OP_LOWID_HOLEPUNCH_INFO);
+        let p = &f.payload;
+        let tcp = u16::from_le_bytes([p[4], p[5]]);
+        let udp = u16::from_le_bytes([p[6], p[7]]);
+        let hash: [u8; 16] = p[8..24].try_into().unwrap();
+        let id = u32::from_le_bytes(p[25..29].try_into().unwrap());
+        (tcp, udp, hash, id)
+    }
+
+    /// Issue #37, as reported: two LowID clients behind one public IP, each
+    /// with its own keepalive port. Each must get the other's port, whatever
+    /// UDP packet came last from that IP, and B's 0x60 port (its local one)
+    /// must not replace B's keepalive port.
+    #[test]
+    fn two_clients_behind_one_ip_each_get_the_others_port() {
+        let state = ServerState::for_test();
+        let ip = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8));
+        let (a, b) = ([0xAA; 16], [0xBB; 16]);
+        let mut rx_a = state.register_test_client_at(a, 100, false, 24825, ip);
+        let mut rx_b = state.register_test_client_at(b, 200, false, 24835, ip);
+        state.conn_per_ip.insert(ip, 2);
+        let now = std::time::Instant::now();
+        // Keepalives as the NAT mapped them, then a global query from A's
+        // other socket (aMule: TCP + 3) last of all.
+        state.natt_udp_ports.insert(a, (40001, now));
+        state.natt_udp_ports.insert(b, (40002, now));
+        state.observed_udp_ports.insert(Ipv4Addr::new(5, 6, 7, 8), (40099, now));
+
+        // B asks for A; its 0x60 carries its local port.
+        let r = handle_holepunch_request(&state, &b, 200, ip, 24830, 24835, 100);
+        assert_eq!(r, None);
+        let (_, udp, hash, id) = info_of(&mut rx_b);
+        assert_eq!((udp, hash, id), (40001, a, 100), "B is told A's port and id");
+        let (tcp, udp, hash, id) = info_of(&mut rx_a);
+        assert_eq!((tcp, udp, hash, id), (24830, 40002, b, 200), "A is told B's port and id");
+    }
+
+    #[test]
+    fn the_per_ip_port_is_used_only_for_a_client_alone_on_its_ip() {
+        let state = ServerState::for_test();
+        let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 11));
+        let h = [3u8; 16];
+        state
+            .observed_udp_ports
+            .insert(Ipv4Addr::new(9, 9, 9, 11), (51000, std::time::Instant::now()));
+        state.conn_per_ip.insert(ip, 1);
+        assert_eq!(observed_udp_port(&state, &h, ip, 4672), 51000);
+        state.conn_per_ip.insert(ip, 2);
+        assert_eq!(observed_udp_port(&state, &h, ip, 4672), 4672);
+        // The client's own keepalive port wins either way.
+        state.natt_udp_ports.insert(h, (52000, std::time::Instant::now()));
+        assert_eq!(observed_udp_port(&state, &h, ip, 4672), 52000);
     }
 
     #[test]
@@ -465,13 +559,13 @@ mod tests {
         let state = ServerState::for_test();
         let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
         // No observation yet → falls back to announced.
-        assert_eq!(observed_udp_port(&state, ip, 4672), 4672);
+        assert_eq!(observed_udp_port(&state, &[0u8; 16], ip, 4672), 4672);
         // Record a fresh external port → it wins over the announced one.
         state.observed_udp_ports.insert(
             Ipv4Addr::new(9, 9, 9, 9),
             (51000, std::time::Instant::now()),
         );
-        assert_eq!(observed_udp_port(&state, ip, 4672), 51000);
+        assert_eq!(observed_udp_port(&state, &[0u8; 16], ip, 4672), 51000);
     }
 
     #[test]
@@ -485,11 +579,11 @@ mod tests {
         state
             .observed_udp_ports
             .insert(Ipv4Addr::new(9, 9, 9, 10), (51000, stale));
-        assert_eq!(observed_udp_port(&state, ip, 4672), 4672);
+        assert_eq!(observed_udp_port(&state, &[0u8; 16], ip, 4672), 4672);
         // A zero observed port is meaningless → fall back.
         state
             .observed_udp_ports
             .insert(Ipv4Addr::new(9, 9, 9, 10), (0, std::time::Instant::now()));
-        assert_eq!(observed_udp_port(&state, ip, 4672), 4672);
+        assert_eq!(observed_udp_port(&state, &[0u8; 16], ip, 4672), 4672);
     }
 }

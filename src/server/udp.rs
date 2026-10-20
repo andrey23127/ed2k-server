@@ -791,6 +791,16 @@ impl UdpServer {
                     OP_GLOB_SEARCHREQ | OP_GLOB_SEARCHREQ2 | OP_GLOB_SEARCHREQ3
                 );
                 let hashes = crate::server::bot_detector::query_hashes(opcode, payload);
+                self.state.note_activity(
+                    peer.ip(),
+                    if search {
+                        crate::server::activity::Kind::UdpSearch
+                    } else {
+                        crate::server::activity::Kind::UdpSources
+                    },
+                    &hashes,
+                    false,
+                );
                 crate::server::bot_detector::record_query(
                     &self.state,
                     peer,
@@ -802,6 +812,7 @@ impl UdpServer {
                     },
                     &hashes,
                 );
+                crate::server::bot_detector::record_sources(&self.state, peer.ip(), &hashes, false);
                 // The other two records stay IPv4-only, and need nothing more:
                 // the gossip server list holds IPv4 servers only, so an IPv6
                 // client can never leak into it; and hole punching is for
@@ -839,19 +850,35 @@ impl UdpServer {
                     let mut uh = [0u8; 16];
                     uh.copy_from_slice(&payload[..16]);
                     let matched = if let Some(mut h) = self.state.clients.get_mut(&uh) {
-                        h.udp_port = peer.port();
+                        // The port is believed only from the session's own
+                        // address: a user hash is no secret, and a keepalive
+                        // from elsewhere would send the client's peers there.
+                        let same_ip = canon_ip(h.ip) == canon_ip(peer.ip());
+                        if same_ip {
+                            // Issue #37: kept per client. The login port
+                            // (`udp_port`, 0xF9) stays as announced; it is
+                            // filled from here only if the client sent none,
+                            // which makes it a hole-punch target.
+                            if h.udp_port == 0 {
+                                h.udp_port = peer.port();
+                            }
+                            self.state
+                                .natt_udp_ports
+                                .insert(uh, (peer.port(), std::time::Instant::now()));
+                        }
                         // Count this UDP keepalive as client activity so the TCP
                         // connection task's idle timer is reset. A NAT-T LowID
                         // source is otherwise silent on TCP and would be wrongly
                         // evicted after the idle timeout despite a live link.
                         h.touch_activity();
-                        true
+                        same_ip
                     } else {
                         false
                     };
                     // DIAGNOSTIC: shows in the server log whether NAT-T keepalives
                     // actually arrive and whether the userhash matches a connected
-                    // client. If you see "matched=false", the hash in the packet
+                    // client. "matched=false" also when the keepalive came from
+                    // another address than the session. If you see "matched=false", the hash in the packet
                     // differs from the login hash (so the wrong client is kept
                     // warm). If you see no line at all every ~2 min, the keepalive
                     // never reaches the server (wrong UDP port / NAT / firewall).
@@ -1984,6 +2011,7 @@ impl UdpServer {
                 }
                 sent += 1;
             }
+            state.note_activity_results(peer.ip(), sent);
             debug!(ip = %peer.ip(), results = sent, "glob_search");
         });
         Ok(())
@@ -2218,6 +2246,15 @@ const OP_GLOB_SEARCHREQ2: u8 = 0x92;
 // NAT-traversal: client→server UDP keepalive carrying the sender's userhash.
 // Lets us record the client's external (post-NAT) UDP port for hole punching.
 const OP_SERVER_NATT_KEEPALIVE: u8 = 0x9F;
+
+/// An IPv4-mapped IPv6 address as the IPv4 one, so a dual-stack socket's view
+/// of a client compares equal to the TCP session's.
+fn canon_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+        v4 => v4,
+    }
+}
 
 const OP_GLOB_FOUNDSOURCES: u8 = 0x9B;
 const OP_GLOB_SERVSTATRES: u8 = 0x97;

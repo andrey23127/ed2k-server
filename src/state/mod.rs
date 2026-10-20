@@ -622,6 +622,13 @@ pub struct ServerState {
     /// destination, so this can't help them — we fall back to the announced port.
     /// Value carries the observation time so stale entries can be ignored.
     pub observed_udp_ports: DashMap<std::net::Ipv4Addr, (u16, Instant)>,
+    /// The source port of each client's last NAT-T keepalive (0x9F), keyed by
+    /// user hash (issue #37). Two clients behind one public IP share the
+    /// per-IP entry above, and the last packet from either won, so a client
+    /// could be handed its own port as its peer's. This one is per client,
+    /// written only by 0x9F sent from the session's own IP, and preferred by
+    /// the hole-punch coordinator. Swept with `observed_udp_ports`.
+    pub natt_udp_ports: DashMap<UserHash, (u16, Instant)>,
     /// Map of local UDP port → bound UdpSocket. Lets any handler send from a
     /// specific port (e.g. send an obfuscated reply from our :4675 even when
     /// the request came in on our :4665). Lugdunum's FUN_0042c480 looks up
@@ -632,6 +639,13 @@ pub struct ServerState {
     /// IP filter — blocks connections from ranges in guarding.p2p.
     /// Reloaded in-place on SIGHUP without restart.
     pub ip_filter: tokio::sync::RwLock<crate::filter::ipfilter::IpFilter>,
+    /// Bumped each time a new IP filter is put in place (`swap_ip_filter`).
+    /// Every TCP session watches it and closes itself when its address is
+    /// now blocked: the filter is otherwise checked only at accept, so a
+    /// scanner added to it stayed connected until it reconnected.
+    pub ip_filter_gen: tokio::sync::watch::Sender<u64>,
+    /// Search activity per source, for `/api/activity` (temporary).
+    pub activity: crate::server::activity::Activity,
     /// Country DB from ip-to-country.csv.
     pub country_db: tokio::sync::RwLock<crate::filter::geoip::CountryDb>,
     /// Per-country connection counter. key = ISO-2 code.
@@ -740,6 +754,9 @@ pub struct ServerState {
     /// IP for 24h kills the current flood, and a rotated IP is re-flagged and
     /// re-banned the same way.
     pub banned_bots: DashMap<std::net::IpAddr, std::time::Instant>,
+    /// One hour of source requests per source key, for the scanner and
+    /// hammer rules (`bot_detector::record_sources`). Swept when expired.
+    pub scan_windows: DashMap<std::net::IpAddr, crate::server::bot_detector::ScanWindow>,
     /// Sources throttled instead of banned: since when, and the bucket that
     /// lets `bots.throttle_qpm` through. Same TTL and sweep as the bans.
     pub throttled_bots:
@@ -1174,6 +1191,21 @@ impl ServerState {
     /// none). Used by holepunch tests.
     #[cfg(test)]
     pub fn register_test_client(&self, user_hash: UserHash, id: u32, high_id: bool, udp: u16) {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, (id % 250) as u8 + 1));
+        std::mem::forget(self.register_test_client_at(user_hash, id, high_id, udp, ip));
+    }
+
+    /// Test-only: as `register_test_client`, at `ip`, returning the receiver
+    /// of the frames pushed to the client.
+    #[cfg(test)]
+    pub fn register_test_client_at(
+        &self,
+        user_hash: UserHash,
+        id: u32,
+        high_id: bool,
+        udp: u16,
+        ip: std::net::IpAddr,
+    ) -> mpsc::Receiver<Frame> {
         // send_frame is fire-and-forget (`let _ = tx.try_send`), so even though
         // we don't service the receiver here, the handler under test still
         // exercises the full lookup + build + send path without error. We keep
@@ -1181,11 +1213,10 @@ impl ServerState {
         // true — otherwise the hole-punch staleness check would treat every test
         // client as a dead session and short-circuit to FAIL.
         let (tx, rx) = mpsc::channel(16);
-        std::mem::forget(rx);
         let handle = ClientHandle {
             user_hash,
             assigned_id: id,
-            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, (id % 250) as u8 + 1)),
+            ip,
             port: 4662,
             udp_port: udp,
             natt_capable: udp != 0,
@@ -1210,6 +1241,7 @@ impl ServerState {
         };
         self.index_client_id(handle.assigned_id, user_hash);
         self.clients.insert(user_hash, handle);
+        rx
     }
 
     /// Resolve a protocol-level `assigned_id` to the connected client.
@@ -1282,6 +1314,8 @@ impl ServerState {
             .is_none();
         if was_new {
             *self.block_stats.entry("bot_ban".to_string()).or_insert(0) += 1;
+            // Its TCP sessions close too (see `ip_filter_gen`).
+            self.ip_filter_gen.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
 
@@ -1336,6 +1370,48 @@ impl ServerState {
     /// default) — the same source the admission budgets count by.
     pub fn source_key(&self, ip: std::net::IpAddr) -> std::net::IpAddr {
         crate::admission::SourceKey::of(ip, self.admission.cfg.ipv6_source_prefix_bits).as_ip()
+    }
+
+    /// Put a new IP filter in place and tell every TCP session, so the ones
+    /// from an address it now blocks close (see `ip_filter_gen`).
+    pub async fn swap_ip_filter(&self, f: crate::filter::ipfilter::IpFilter) {
+        *self.ip_filter.write().await = f;
+        self.ip_filter_gen.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Is `ip` blocked by the IP filter? IPv4 and IPv4-mapped IPv6 only: the
+    /// filter has no IPv6 ranges.
+    pub async fn ip_filter_blocks(&self, ip: std::net::IpAddr) -> bool {
+        let v4 = match ip {
+            std::net::IpAddr::V4(v4) => v4,
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => v4,
+                None => return false,
+            },
+        };
+        self.ip_filter.read().await.is_blocked(v4)
+    }
+
+    /// Record a search or source request of `ip` for `/api/activity`, when
+    /// `bots.activity_stats` is on.
+    pub fn note_activity(
+        &self,
+        ip: std::net::IpAddr,
+        kind: crate::server::activity::Kind,
+        hashes: &[FileHash],
+        tcp: bool,
+    ) {
+        let cfg = self.live_cfg.load();
+        if cfg.bots.activity_stats {
+            self.activity.note(self.source_key(ip), kind, hashes, tcp, cfg.bots.activity_max_sources);
+        }
+    }
+
+    /// The number of results a search of `ip` got, after `note_activity`.
+    pub fn note_activity_results(&self, ip: std::net::IpAddr, n: usize) {
+        if self.live_cfg.load().bots.activity_stats {
+            self.activity.note_results(self.source_key(ip), n);
+        }
     }
 
     /// Record a DISTINCT blocked CSAM file hash for a publisher's user_hash and
@@ -1471,9 +1547,12 @@ impl ServerState {
             seed_server_keys: DashMap::new(),
             incoming_seed_challenges: DashMap::new(),
             observed_udp_ports: DashMap::new(),
+            natt_udp_ports: DashMap::new(),
             our_sent_random_parts: DashMap::new(),
             udp_sockets: DashMap::new(),
             ip_filter: tokio::sync::RwLock::new(crate::filter::ipfilter::IpFilter::default()),
+            ip_filter_gen: tokio::sync::watch::channel(0).0,
+            activity: Default::default(),
             country_db: tokio::sync::RwLock::new(crate::filter::geoip::CountryDb::default()),
             country_stats: DashMap::new(),
             client_type_stats: DashMap::new(),
@@ -1496,6 +1575,7 @@ impl ServerState {
             bot_log_path: std::sync::OnceLock::new(),
             banned_bots: DashMap::new(),
             throttled_bots: DashMap::new(),
+            scan_windows: DashMap::new(),
             bot_ipfilter_list: std::sync::OnceLock::new(),
             banned_publishers: DashMap::new(),
             client_id_index: DashMap::new(),
@@ -1989,6 +2069,8 @@ impl ServerState {
             ),
             ("bot_query_log".into(), self.bot_query_log.len() as u64),
             ("bot_detections".into(), self.bot_detections.len() as u64),
+            ("activity_sources".into(), self.activity.len() as u64),
+            ("scan_windows".into(), self.scan_windows.len() as u64),
         ]
     }
 
@@ -2097,6 +2179,7 @@ impl ServerState {
         misc += dm_slots(self.seed_server_keys.capacity(), SOCKV4, 4);
         misc += dm_slots(self.incoming_seed_challenges.capacity(), SOCKV4, 4);
         misc += dm_slots(self.observed_udp_ports.capacity(), IPV4, 2 + INSTANT);
+        misc += dm_slots(self.natt_udp_ports.capacity(), UHASH, 2 + INSTANT);
         misc += dm_slots(self.recent_client_ips.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.verified_servers.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
@@ -2106,6 +2189,17 @@ impl ServerState {
         misc += dm_slots(self.banned_bots.capacity(), IPADDR, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
         misc += dm_slots(self.bot_query_log.capacity(), IPADDR, size_of::<BotTracker>());
+        misc += dm_slots(
+            self.scan_windows.capacity(),
+            IPADDR,
+            size_of::<crate::server::bot_detector::ScanWindow>(),
+        );
+        misc += self.scan_windows.iter().filter(|w| w.has_distinct()).count() as u64 * 64;
+        misc += dm_slots(
+            self.activity.capacity(),
+            IPADDR,
+            size_of::<crate::server::activity::Rec>(),
+        );
         misc += dm_slots(
             self.bot_detections.capacity(),
             IPADDR,

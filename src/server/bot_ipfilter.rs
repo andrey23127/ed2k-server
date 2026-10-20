@@ -127,7 +127,7 @@ pub fn add_async(state: &std::sync::Arc<ServerState>, ip: Ipv4Addr) {
         .await;
         match res {
             Ok(Ok((added, f))) => {
-                *state.ip_filter.write().await = f;
+                state.swap_ip_filter(f).await;
                 *state.block_stats.entry("bot_ipfilter".to_string()).or_insert(0) += 1;
                 tracing::warn!(%ip, added, path = %path.display(),
                     "bot added to the IP filter (kept sending through its ban)");

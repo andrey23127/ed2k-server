@@ -473,7 +473,9 @@ why.
 | `bot_log_path` | Ledger of detected bots, one JSON line per detection and per ban end. Empty = `bot-log.jsonl` next to the config file; `"off"` = none | restart |
 
 ### `[bots]`
-UDP bot detection. Every key optional; restart-only.
+Bot detection, over UDP and, for source requests, TCP. Every key optional.
+The `min_span_secs`/`uniform_action` rate rules are restart-only; the other
+keys are read on every request, so the Settings tab changes them at once.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -481,6 +483,14 @@ UDP bot detection. Every key optional; restart-only.
 | `uniform_action` | `"throttle"` | What a "uniform timing" source (over 200 qpm, regular intervals, not a flood) gets for 24 h: `"throttle"` (still answered, at `throttle_qpm`) or `"ban"` |
 | `throttle_qpm` | 60 | What a throttled source still gets through, per minute |
 | `ipfilter_min_dropped` | 10000 | A banned source that sends this many datagrams into its ban is added to `storage.ipfilter_path` for good (ten times as many for a throttled one); `0` = never |
+| `scan_min_files` | 2000 | **Scanner** rule: a source that asks for sources of this many files within an hour (TCP and UDP, repeats included)… |
+| `scan_min_distinct` | 1000 | …of which at least this many different… |
+| `scan_action` | `"ban"` | …gets this for 24 h: `"ban"`, `"throttle"` or `"log"` (ledger and log only) |
+| `hammer_min_files` | 3000 | **Hammer** rule: this many files asked within an hour… |
+| `hammer_max_distinct` | 100 | …of fewer than this many different ones… |
+| `hammer_action` | `"throttle"` | …gets this for 24 h: `"throttle"`, `"ban"` or `"log"` |
+| `activity_stats` | `true` | Collect search activity per source for `/api/activity` (temporary, see below) |
+| `activity_max_sources` | 100000 | Sources it keeps a record for, about 200 bytes each; requests of further sources only go into the totals |
 
 A line added to the IP filter looks like the rest of the file, marked `bot`:
 
@@ -494,6 +504,56 @@ the filter is reloaded at once. The address is also recorded in
 (an update from the update service, or by hand), the recorded addresses are
 appended again before it is loaded. To take one out for good, delete its line
 in both files.
+
+The scanner and hammer rules come from a day's activity of 91 000 sources
+(`/api/activity`, 2026-10-20). An ordinary eMule asks the server it is
+connected to for sources of 15 files every 5 minutes, about 180 files an
+hour, however long its download list; over UDP, about 25 files every 5
+minutes. The busiest ordinary source asked under 1 000 files an hour. A list
+scanner asked 2 000 to 20 000 an hour, nearly all different. A hammer asks for
+the same file or two up to 10 times a second, mostly one mobile client build
+with a bug, so it is throttled (`throttle_qpm` answers a minute) and not
+banned. Each source is judged over an hour from its first request; different
+files are counted from its 200th file on (a 64-byte estimate, only for
+sources that reach it).
+
+A ban covers TCP as well: the source's sessions are closed, and it can't log
+in for the 24 hours (`bot_kick` and `bot_tcp_refused` in `/api/block_stats`).
+A throttle leaves its session up and answers only `throttle_qpm` source
+requests a minute.
+
+Whenever a new IP filter is put in place (a bot added, the file changed on
+disk, SIGHUP or `/api/reload`), every TCP session from an address it now
+blocks is closed, counted as `ipfilter_kick` in `/api/block_stats`. Before,
+the filter was read only when a connection was accepted, so a client already
+logged in stayed until it reconnected.
+
+#### Search activity (`/api/activity`, temporary)
+
+The rate detector judges a source by queries per minute, and a scanner that
+walks a list of thousands of files at ~150 requests a minute stays under any
+rate an ordinary client can't reach. What sets it apart is how many files it
+asks about, and how often. To choose those criteria from real traffic, the
+server counts per source (IPv4 address, IPv6 /64) since start or the last
+reset:
+
+- searches over TCP and UDP, "more results" pages, and the results each
+  search got (TCP: the whole result set; UDP: answers sent);
+- source requests over TCP and UDP, the files in each (`1`, `2-4`, `5-16`,
+  `17-32`, `33+`), all files asked, and the number of different ones
+  (estimated, ±13%; no hash is kept);
+- the gaps between two requests (`<1 s` … `>1 h`), the busiest minute, and
+  requests per hour over the time the source was seen.
+
+| Endpoint | What |
+|---|---|
+| `GET /api/activity` | Totals, requests by UTC hour, and for each figure its spread over sources: mean, p50, p90, p99, p99.9, max, plus histograms |
+| `GET /api/activity/sources` | One row per source with its country, provider and, for a logged-in IPv4 client, software and nick. `sort=requests` (default), `searches`, `sources`, `files`, `distinct`, `peak`, `per_hour` or `repeats`; `limit=200` (`0` = all); `min=1` (least requests); `format=csv` |
+| `POST /api/activity/reset` | Start a new period |
+
+UDP requests are counted after the admission budgets, i.e. those the server
+went on to handle. With `activity_stats = false` nothing is collected, and
+what was collected stays until a reset.
 
 ### `[admission]`
 Server-wide ceilings on the work remote peers can cause, however the load is
@@ -736,6 +796,13 @@ link) to the server's UDP port (`= server TCP port + 4`), payload = your 16-byte
 userhash, about every 60 s. The server reads the *source* port of this datagram to
 learn your real post-NAT UDP port — the port peers must actually punch.
 
+The port is kept **per client** (by user hash), and only from a keepalive that
+comes from the same IP as your TCP session. So two clients behind one public IP
+each get their own (issue #37). The port the server hands your peers is, in
+order: your last keepalive's source port if it is under 600 s old; else the last
+UDP port seen from your IP, only when no other client is logged in from it;
+else the port you announced (`0xF9`, or the one in your `0x60`).
+
 > **Timing invariant — do not get this wrong.** This server trusts an observed
 > external UDP port for **600 s** (`OBSERVED_UDP_FRESH`). Your keepalive interval
 > must stay well under that — ~60 s gives a 10× margin. If it lapses, the server
@@ -750,7 +817,7 @@ learn your real post-NAT UDP port — the port peers must actually punch.
 | Opcode | Value | Direction | Payload |
 |---|---|---|---|
 | `OP_LOWID_HOLEPUNCH_REQUEST` | `0x60` | client → server (TCP) | `<target_id 4><our_udp_port 2>` |
-| `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1>` |
+| `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4>` |
 | `OP_LOWID_HOLEPUNCH_FAIL` | `0x62` | server → client (TCP) | `<target_id 4><reason 1>` |
 | `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>` |
 | `OP_IDCHANGE` TCP flags bit | `0x20000` | server → client (TCP) | set when the server accepts `0x60` |
@@ -760,6 +827,13 @@ port. The server replies `0x61` to **both** you and B — each gets the other's 
 plus a role byte — or `0x62` if B is HighID, gone, or has a dead session. On `0x61`
 both sides punch and raise the tunnel; on `0x62` retry or fall back. The `role` byte
 is advisory: when both sides initiate, as they should, order does not matter.
+
+`peer_id` is the server ID of the peer described (issue #38): the requester gets
+the `target_id` of its `0x60`, so it can match a `0x61` to one of several
+requests in flight; the target gets the requester's ID. It was added in 0.9.84;
+earlier servers send 25 bytes. **Read it only when the payload is at least 29
+bytes**, and accept longer payloads: fields may be appended later, never
+inserted.
 (`0x60`–`0x62` are unused in the server TCP opcode space, which runs `0x01`–`0x44`,
 and `0x9F` was free in the server UDP namespace — no conflict on the server link.)
 

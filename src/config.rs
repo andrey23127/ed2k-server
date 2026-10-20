@@ -128,6 +128,33 @@ pub struct BotsConfig {
     /// for that long. A throttled source needs ten times as many. 0 = never.
     #[serde(default = "default_bots_ipfilter_min_dropped")]
     pub ipfilter_min_dropped: u64,
+    /// Collect search activity per source for `/api/activity` (temporary,
+    /// to choose bot criteria from data). Read on every request, so the
+    /// admin Settings tab switches it without a restart.
+    #[serde(default = "default_true_bots")]
+    pub activity_stats: bool,
+    /// Sources `/api/activity` keeps a record for (about 200 bytes each);
+    /// requests of further sources are only counted in the totals.
+    #[serde(default = "default_bots_activity_max")]
+    pub activity_max_sources: usize,
+    /// Scanner rule (TCP and UDP source requests, per hour): this many files
+    /// asked, of which `scan_min_distinct` different, gets `scan_action`.
+    #[serde(default = "default_bots_scan_min_files")]
+    pub scan_min_files: u64,
+    #[serde(default = "default_bots_scan_min_distinct")]
+    pub scan_min_distinct: u64,
+    /// "ban" (default), "throttle" or "log".
+    #[serde(default = "default_bots_scan_action")]
+    pub scan_action: String,
+    /// Hammer rule: this many files asked in an hour, fewer than
+    /// `hammer_max_distinct` different, gets `hammer_action`.
+    #[serde(default = "default_bots_hammer_min_files")]
+    pub hammer_min_files: u64,
+    #[serde(default = "default_bots_hammer_max_distinct")]
+    pub hammer_max_distinct: u64,
+    /// "throttle" (default), "ban" or "log".
+    #[serde(default = "default_bots_hammer_action")]
+    pub hammer_action: String,
 }
 
 impl Default for BotsConfig {
@@ -137,6 +164,14 @@ impl Default for BotsConfig {
             uniform_action: default_bots_uniform_action(),
             throttle_qpm: default_bots_throttle_qpm(),
             ipfilter_min_dropped: default_bots_ipfilter_min_dropped(),
+            activity_stats: default_true_bots(),
+            activity_max_sources: default_bots_activity_max(),
+            scan_min_files: default_bots_scan_min_files(),
+            scan_min_distinct: default_bots_scan_min_distinct(),
+            scan_action: default_bots_scan_action(),
+            hammer_min_files: default_bots_hammer_min_files(),
+            hammer_max_distinct: default_bots_hammer_max_distinct(),
+            hammer_action: default_bots_hammer_action(),
         }
     }
 }
@@ -158,6 +193,30 @@ fn default_bots_throttle_qpm() -> u32 {
 }
 fn default_bots_ipfilter_min_dropped() -> u64 {
     10_000
+}
+fn default_true_bots() -> bool {
+    true
+}
+fn default_bots_activity_max() -> usize {
+    100_000
+}
+fn default_bots_scan_min_files() -> u64 {
+    2_000
+}
+fn default_bots_scan_min_distinct() -> u64 {
+    1_000
+}
+fn default_bots_scan_action() -> String {
+    "ban".into()
+}
+fn default_bots_hammer_min_files() -> u64 {
+    3_000
+}
+fn default_bots_hammer_max_distinct() -> u64 {
+    100
+}
+fn default_bots_hammer_action() -> String {
+    "throttle".into()
 }
 
 impl Default for AdmissionConfig {
