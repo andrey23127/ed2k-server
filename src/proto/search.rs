@@ -114,6 +114,59 @@ pub enum SearchNode {
     },
 }
 
+/// A search string that names one file by its hash, as Lugdunum reads it
+/// (`Is_ed2k_search`): `ed2k::HASH`, `ed2k:SIZE:HASH`,
+/// `ed2k://|file|NAME|SIZE|HASH|…`, `magnet:?xt=urn:ed2k:HASH`,
+/// `magnet:?xt=urn:ed2khash:HASH`, or an `<a href= ed2k://|file|…` link.
+/// Returns the hash and the size (0 = not given). Hash search services
+/// (ed2k.shortypower.org) send `ed2k::HASH` as a UDP search and got nothing
+/// from this server, where it was looked up as a word.
+pub fn ed2k_file_ref(s: &str) -> Option<([u8; 16], u64)> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    let starts = |p: &str| b.len() >= p.len() && b[..p.len()].eq_ignore_ascii_case(p.as_bytes());
+    fn digits(t: &str) -> (u64, usize) {
+        let n = t.bytes().take_while(u8::is_ascii_digit).count();
+        (t[..n].parse::<u64>().unwrap_or(0), n)
+    }
+    // `NAME|SIZE|HASH` after the `ed2k://|file|` part.
+    fn link(rest: &str) -> Option<(&str, u64)> {
+        let (_, after_name) = rest.split_once('|')?;
+        let (size, n) = digits(after_name);
+        let (_, hash) = after_name[n..].split_once('|')?;
+        Some((hash, size))
+    }
+    let (hash, size) = if starts("ed2k://|file|") {
+        link(&s[13..])?
+    } else if starts("<a href= ed2k://|file|") {
+        link(&s[22..])?
+    } else if starts("magnet:?xt=urn:ed2khash:") {
+        (&s[24..], 0)
+    } else if starts("magnet:?xt=urn:ed2k:") {
+        (&s[20..], 0)
+    } else if starts("ed2k:") {
+        let rest = &s[5..];
+        let (size, n) = digits(rest);
+        (rest[n..].strip_prefix(':')?, size)
+    } else {
+        return None;
+    };
+    let hex = hash.get(..32)?;
+    let mut h = [0u8; 16];
+    for (i, out) in h.iter_mut().enumerate() {
+        *out = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some((h, size))
+}
+
+/// The file a search names by its hash: the whole tree is one such string.
+pub fn ed2k_file_search(tree: &SearchNode) -> Option<([u8; 16], u64)> {
+    match tree {
+        SearchNode::Term(s) => ed2k_file_ref(s),
+        _ => None,
+    }
+}
+
 pub fn parse(payload: &[u8]) -> Result<SearchNode> {
     let mut slice = payload;
     let node = parse_node(&mut slice, 0)?;
@@ -1716,5 +1769,36 @@ mod markers_are_per_word {
             evaluate(&t("linux"), "linuxmint 22.iso", 0),
             "plain words still use contains"
         );
+    }
+
+    #[test]
+    fn ed2k_file_references_are_read_as_lugdunum_reads_them() {
+        let h = "193C85BB48D1F49B859BA1D744BD4D46";
+        let want: [u8; 16] = [
+            0x19, 0x3C, 0x85, 0xBB, 0x48, 0xD1, 0xF4, 0x9B, 0x85, 0x9B, 0xA1, 0xD7, 0x44, 0xBD,
+            0x4D, 0x46,
+        ];
+        assert_eq!(ed2k_file_ref(&format!("ed2k::{h}")), Some((want, 0)));
+        assert_eq!(ed2k_file_ref(&format!("ED2K::{}", h.to_lowercase())), Some((want, 0)));
+        assert_eq!(ed2k_file_ref(&format!("ed2k:12345:{h}")), Some((want, 12345)));
+        assert_eq!(
+            ed2k_file_ref(&format!("ed2k://|file|Some name.avi|734003200|{h}|/")),
+            Some((want, 734003200))
+        );
+        assert_eq!(ed2k_file_ref(&format!("magnet:?xt=urn:ed2k:{h}&dn=x")), Some((want, 0)));
+        assert_eq!(ed2k_file_ref(&format!("magnet:?xt=urn:ed2khash:{h}")), Some((want, 0)));
+        assert_eq!(ed2k_file_ref("ed2k::nothex"), None);
+        assert_eq!(ed2k_file_ref(&format!("ed2k::{}", &h[..30])), None);
+        assert_eq!(ed2k_file_ref("ed2k donkey"), None);
+        assert_eq!(ed2k_file_ref(h), None, "a bare hash is a word, as in Lugdunum");
+    }
+
+    #[test]
+    fn the_hash_search_service_payload_parses_to_a_file_reference() {
+        // OP_GLOB_SEARCHREQ3 body from ed.shortypower.org, after its tag set.
+        let mut p = vec![0x01, 0x26, 0x00];
+        p.extend_from_slice(b"ed2k::193C85BB48D1F49B859BA1D744BD4D46");
+        let tree = parse(&p).unwrap();
+        assert!(ed2k_file_search(&tree).is_some());
     }
 }

@@ -103,6 +103,11 @@ pub fn reassert(filter: &Path, list: &Path) -> usize {
 /// Add `ip` to the IP filter and reload it, off the caller's thread. A no-op
 /// without `storage.ipfilter_path` or outside a runtime.
 pub fn add_async(state: &std::sync::Arc<ServerState>, ip: Ipv4Addr) {
+    // Never an exempt address (`bots.exempt`), however it came to be banned.
+    if state.live_cfg.load().bots.is_exempt(ip.into()) {
+        tracing::info!(%ip, "bot ipfilter: address is in bots.exempt, not added");
+        return;
+    }
     let filter_path = state.live_cfg.load().storage.ipfilter_path.clone();
     if filter_path.is_empty() {
         tracing::info!(%ip, "bot ipfilter: no storage.ipfilter_path, not added");

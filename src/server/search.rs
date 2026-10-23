@@ -161,6 +161,29 @@ impl SearchRequest {
     }
 }
 
+/// A search that names one file by hash (`ed2k::HASH`, an ed2k link, a
+/// magnet; see `proto::search::ed2k_file_ref`) is answered from the hash
+/// index, as Lugdunum does, and not looked up as words. `None` when the
+/// search is not one. The file is served under the same rules as any search
+/// result: it has a source, its size matches when one was given, and the
+/// content filter does not withhold it. Both the TCP and the UDP path go
+/// through here, before the unknown-word rewrite, which would drop the
+/// hash as a word no file has.
+pub fn search_by_hash(
+    state: &ServerState,
+    tree: &SearchNode,
+) -> Option<Vec<crate::state::file_id::FileRecord>> {
+    let (hash, size) = crate::proto::search::ed2k_file_search(tree)?;
+    state.note_hash_search();
+    let rec = state.file_slab.get_by_hash(&hash).filter(|r| {
+        !r.sources.is_empty()
+            && (size == 0 || r.size == size)
+            && !state.filter.is_withheld(&r.hash, r.name())
+    });
+    debug!(hash = %hex::encode(hash), size, found = rec.is_some(), "search by file hash");
+    Some(rec.into_iter().collect())
+}
+
 /// Process a search request. Returns the SEARCHRESULT frame to send back.
 /// Run a search and return the best matching file entries, at most
 /// `limits.max_search_results` of them, best-sourced first.
@@ -171,6 +194,9 @@ pub fn handle_search(
     req: SearchRequest,
 ) -> Vec<crate::state::file_id::FileRecord> {
     state.note_search();
+    if let Some(found) = search_by_hash(state, &req.tree) {
+        return found;
+    }
 
     // Drop words no indexed file contains, so one typo does not empty the whole
     // search. The rewritten tree replaces `req.tree` for EVERY stage below —
@@ -493,18 +519,18 @@ pub fn build_search_result_page(
         let size_hi = (file.size >> 32) as u32;
         let mut tags = vec![
             Tag::byte(FT_FILENAME, TagValue::String(file.name().to_string())),
-            Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
+            Tag::byte(FT_FILESIZE, TagValue::uint(size_lo)),
         ];
         if size_hi > 0 {
-            tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
+            tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::uint(size_hi)));
         }
         tags.push(Tag::byte(
             FT_SOURCES,
-            TagValue::U32(file.sources.len() as u32),
+            TagValue::uint(file.sources.len() as u32),
         ));
         tags.push(Tag::byte(
             FT_COMPLETE_SOURCES,
-            TagValue::U32(file.complete_source_count()),
+            TagValue::uint(file.complete_source_count()),
         ));
         // FT_FILETYPE as an INTEGER — what the SRV_TCPFLG_TYPETAGINTEGER
         // capability bit (0x0080) promises, and what eserver 17.6+ emits.
@@ -518,7 +544,7 @@ pub fn build_search_result_page(
         // category that matches nothing.
         let ftype = crate::proto::search::ed2k_file_type_id(&file.name().to_lowercase());
         if ftype != crate::proto::search::ed2k_file_type::ANY {
-            tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
+            tags.push(Tag::byte(FT_FILETYPE, TagValue::uint(ftype)));
         }
         push_media_tags(state, &file.hash, &mut tags);
 
@@ -753,13 +779,13 @@ pub(crate) fn prepared_tree(state: &ServerState, tree: &SearchNode) -> SearchNod
 pub(crate) fn push_media_tags(state: &ServerState, hash: &[u8; 16], tags: &mut Vec<Tag>) {
     let Some(m) = state.file_slab.media_of_hash(hash) else { return };
     if m.bitrate() != 0 {
-        tags.push(Tag::byte(0xD4, TagValue::U32(m.bitrate())));
+        tags.push(Tag::byte(0xD4, TagValue::uint(m.bitrate())));
     }
     if let Some(c) = state.file_slab.codecs.name(m.codec()) {
         tags.push(Tag::byte(0xD5, TagValue::String(c.to_string())));
     }
     if m.length() != 0 {
-        tags.push(Tag::byte(0xD3, TagValue::U32(m.length())));
+        tags.push(Tag::byte(0xD3, TagValue::uint(m.length())));
     }
 }
 

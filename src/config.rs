@@ -128,10 +128,13 @@ pub struct BotsConfig {
     /// for that long. A throttled source needs ten times as many. 0 = never.
     #[serde(default = "default_bots_ipfilter_min_dropped")]
     pub ipfilter_min_dropped: u64,
-    /// Collect search activity per source for `/api/activity` (temporary,
-    /// to choose bot criteria from data). Read on every request, so the
-    /// admin Settings tab switches it without a restart.
-    #[serde(default = "default_true_bots")]
+    /// Collect search activity per source for `/api/activity`, to tune the
+    /// bot rules from data. Off by default: on, it updates a record on every
+    /// search and source request (about 20 million a day) and holds up to
+    /// `activity_max_sources` of them, ~25 MB. Read on every request, so the
+    /// admin Settings tab switches it without a restart; switched off, the
+    /// table is cleared within a minute.
+    #[serde(default)]
     pub activity_stats: bool,
     /// Sources `/api/activity` keeps a record for (about 200 bytes each);
     /// requests of further sources are only counted in the totals.
@@ -143,18 +146,31 @@ pub struct BotsConfig {
     pub scan_min_files: u64,
     #[serde(default = "default_bots_scan_min_distinct")]
     pub scan_min_distinct: u64,
+    /// ... judged no sooner than this many minutes into the hour (a client
+    /// that has just added 2 000 downloads asks for all of them at once) ...
+    #[serde(default = "default_bots_scan_min_minutes")]
+    pub scan_min_minutes: u64,
+    /// ... and asking each file at most this many times on average: a list
+    /// walk asks once, a client again every minute or every 20.
+    #[serde(default = "default_bots_scan_max_repeats")]
+    pub scan_max_repeats: f64,
     /// "ban" (default), "throttle" or "log".
     #[serde(default = "default_bots_scan_action")]
     pub scan_action: String,
-    /// Hammer rule: this many files asked in an hour, fewer than
-    /// `hammer_max_distinct` different, gets `hammer_action`.
+    /// Hammer rule: this many files asked in an hour, each of them at least
+    /// `hammer_min_rate` times a minute on average, gets `hammer_action`.
     #[serde(default = "default_bots_hammer_min_files")]
     pub hammer_min_files: u64,
-    #[serde(default = "default_bots_hammer_max_distinct")]
-    pub hammer_max_distinct: u64,
+    #[serde(default = "default_bots_hammer_min_rate")]
+    pub hammer_min_rate: f64,
     /// "throttle" (default), "ban" or "log".
     #[serde(default = "default_bots_hammer_action")]
     pub hammer_action: String,
+    /// Addresses and networks the bot rules never judge: search and
+    /// statistics services that query on behalf of their users. Default:
+    /// ed2k.shortypower.org (178.250.170.0/28).
+    #[serde(default = "default_bots_exempt")]
+    pub exempt: Vec<String>,
 }
 
 impl Default for BotsConfig {
@@ -164,19 +180,55 @@ impl Default for BotsConfig {
             uniform_action: default_bots_uniform_action(),
             throttle_qpm: default_bots_throttle_qpm(),
             ipfilter_min_dropped: default_bots_ipfilter_min_dropped(),
-            activity_stats: default_true_bots(),
+            activity_stats: false,
             activity_max_sources: default_bots_activity_max(),
             scan_min_files: default_bots_scan_min_files(),
             scan_min_distinct: default_bots_scan_min_distinct(),
             scan_action: default_bots_scan_action(),
             hammer_min_files: default_bots_hammer_min_files(),
-            hammer_max_distinct: default_bots_hammer_max_distinct(),
+            hammer_min_rate: default_bots_hammer_min_rate(),
+            exempt: default_bots_exempt(),
+            scan_min_minutes: default_bots_scan_min_minutes(),
+            scan_max_repeats: default_bots_scan_max_repeats(),
             hammer_action: default_bots_hammer_action(),
         }
     }
 }
 
 impl BotsConfig {
+    /// Is `ip` in `exempt`? Entries are an address or address/prefix, IPv4
+    /// or IPv6 (an IPv4-mapped IPv6 address counts as IPv4). An entry that
+    /// does not parse matches nothing.
+    pub fn is_exempt(&self, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        if self.exempt.is_empty() {
+            return false;
+        }
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            v4 => v4,
+        };
+        self.exempt.iter().any(|e| {
+            let (addr, bits) = match e.trim().split_once('/') {
+                Some((a, b)) => (a, b.trim().parse::<u32>().ok()),
+                None => (e.trim(), None),
+            };
+            match (addr.parse::<IpAddr>(), ip) {
+                (Ok(IpAddr::V4(net)), IpAddr::V4(x)) => {
+                    let bits = bits.unwrap_or(32).min(32);
+                    let mask = if bits == 0 { 0 } else { u32::MAX << (32 - bits) };
+                    u32::from(net) & mask == u32::from(x) & mask
+                }
+                (Ok(IpAddr::V6(net)), IpAddr::V6(x)) => {
+                    let bits = bits.unwrap_or(128).min(128);
+                    let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+                    u128::from(net) & mask == u128::from(x) & mask
+                }
+                _ => false,
+            }
+        })
+    }
+
     pub fn throttle_uniform(&self) -> bool {
         !self.uniform_action.trim().eq_ignore_ascii_case("ban")
     }
@@ -194,9 +246,6 @@ fn default_bots_throttle_qpm() -> u32 {
 fn default_bots_ipfilter_min_dropped() -> u64 {
     10_000
 }
-fn default_true_bots() -> bool {
-    true
-}
 fn default_bots_activity_max() -> usize {
     100_000
 }
@@ -212,8 +261,17 @@ fn default_bots_scan_action() -> String {
 fn default_bots_hammer_min_files() -> u64 {
     3_000
 }
-fn default_bots_hammer_max_distinct() -> u64 {
-    100
+fn default_bots_hammer_min_rate() -> f64 {
+    5.0
+}
+fn default_bots_scan_min_minutes() -> u64 {
+    10
+}
+fn default_bots_scan_max_repeats() -> f64 {
+    3.0
+}
+fn default_bots_exempt() -> Vec<String> {
+    vec!["178.250.170.0/28".into()]
 }
 fn default_bots_hammer_action() -> String {
     "throttle".into()
@@ -1428,6 +1486,23 @@ whitelist_hashes = ""
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bot_exemptions_match_addresses_and_networks() {
+        let b = BotsConfig::default();
+        assert!(b.is_exempt("178.250.170.3".parse().unwrap()));
+        assert!(b.is_exempt("178.250.170.13".parse().unwrap()));
+        assert!(b.is_exempt("::ffff:178.250.170.10".parse().unwrap()));
+        assert!(!b.is_exempt("178.250.170.16".parse().unwrap()));
+        let b = BotsConfig {
+            exempt: vec!["10.1.2.3".into(), "2001:db8::/32".into(), "junk".into()],
+            ..Default::default()
+        };
+        assert!(b.is_exempt("10.1.2.3".parse().unwrap()));
+        assert!(!b.is_exempt("10.1.2.4".parse().unwrap()));
+        assert!(b.is_exempt("2001:db8:1::5".parse().unwrap()));
+        assert!(!b.is_exempt("2001:db9::5".parse().unwrap()));
+    }
 
     fn with_network(extra: &str) -> Result<Config> {
         let toml_str = format!(

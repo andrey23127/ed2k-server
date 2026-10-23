@@ -78,6 +78,23 @@ pub struct Tag {
     pub value: TagValue,
 }
 
+impl TagValue {
+    /// An integer in the narrowest type that holds it: UINT8 up to 255,
+    /// UINT16 up to 65 535, else UINT32. What Lugdunum writes in search
+    /// results (`bldNetIntTag1`), and what eMule reads. Some third-party
+    /// parsers only take the narrow forms: ed2k.shortypower.org showed no
+    /// source counts for this server while it read every other tag.
+    pub fn uint(v: u32) -> TagValue {
+        if v <= 0xFF {
+            TagValue::U8(v as u8)
+        } else if v <= 0xFFFF {
+            TagValue::U16(v as u16)
+        } else {
+            TagValue::U32(v)
+        }
+    }
+}
+
 impl Tag {
     pub fn byte(name: u8, value: TagValue) -> Self {
         Self {
@@ -395,6 +412,16 @@ pub fn write_tag_list(out: &mut BytesMut, tags: &[Tag]) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn integers_take_the_narrowest_type() {
+        assert!(matches!(TagValue::uint(13), TagValue::U8(13)));
+        assert!(matches!(TagValue::uint(255), TagValue::U8(255)));
+        assert!(matches!(TagValue::uint(256), TagValue::U16(256)));
+        assert!(matches!(TagValue::uint(65_535), TagValue::U16(65_535)));
+        assert!(matches!(TagValue::uint(65_536), TagValue::U32(65_536)));
+    }
+
     use super::*;
 
     #[test]

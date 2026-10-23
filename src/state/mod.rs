@@ -828,6 +828,8 @@ pub struct ServerState {
     /// counts in the posting lists — so ranking needs no scan at all — starts to
     /// pay for its cost on every publish. If it stays near zero, it does not.
     pub search_rank_capped: std::sync::atomic::AtomicU64,
+    /// Searches that named one file by hash (`ed2k::HASH`, links, magnets).
+    pub search_by_hash: std::sync::atomic::AtomicU64,
     /// Total searches served, as the denominator for the above.
     pub search_total: std::sync::atomic::AtomicU64,
     /// Searches in which at least one word was dropped as unknown to the index
@@ -894,7 +896,9 @@ impl BotHashes {
     /// 16 bytes each plus the set's overhead: about 0.6 MB for a bot that
     /// fills it. Detections are few; the cap is there for the one that walks
     /// the whole index.
-    pub const MAX_DISTINCT: usize = 20_000;
+    /// 2 000: enough to tell a list scan and to look the files up
+    /// (`/api/bots/files`); 20 000 cost up to half a megabyte per scanner.
+    pub const MAX_DISTINCT: usize = 2_000;
 
     pub fn add(&mut self, h: FileHash) {
         self.total += 1;
@@ -1357,6 +1361,12 @@ impl ServerState {
     /// hot path before any parsing, so it must stay a single cheap lookup.
     /// Expired entries are not removed here (the 60s cleanup task sweeps them);
     /// we just treat them as not-banned.
+    /// Is `ip` throttled now? Unlike `bot_throttle_admit` it takes no token.
+    pub fn bot_throttle_admit_peek(&self, ip: std::net::IpAddr) -> bool {
+        self.throttled_bots
+            .get(&self.source_key(ip))
+            .is_some_and(|e| e.0.elapsed() < Self::BOT_BAN_TTL)
+    }
     pub fn is_bot_banned(&self, ip: std::net::IpAddr) -> bool {
         self.banned_bots
             .get(&self.source_key(ip))
@@ -1585,6 +1595,7 @@ impl ServerState {
             block_stats: DashMap::new(),
             conn_per_ip: DashMap::new(),
             search_rank_capped: std::sync::atomic::AtomicU64::new(0),
+            search_by_hash: std::sync::atomic::AtomicU64::new(0),
             search_total: std::sync::atomic::AtomicU64::new(0),
             search_words_dropped: std::sync::atomic::AtomicU64::new(0),
             offer_over_soft_batches: std::sync::atomic::AtomicU64::new(0),
@@ -1645,6 +1656,17 @@ impl ServerState {
 
     pub fn offer_over_hard_count(&self) -> u64 {
         self.offer_over_hard_packets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A search named one file by hash.
+    pub fn note_hash_search(&self) {
+        self.search_by_hash
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn search_by_hash_count(&self) -> u64 {
+        self.search_by_hash
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -2205,6 +2227,12 @@ impl ServerState {
             IPADDR,
             size_of::<BotDetection>(),
         );
+        // Their hash sets live on the heap: slots of a hash and a control byte.
+        misc += self
+            .bot_detections
+            .iter()
+            .map(|d| (d.hashes.distinct.capacity() * 17 + d.hashes.recent.capacity() * 16) as u64)
+            .sum::<u64>();
         misc += dm_slots(
             self.udp_sockets.capacity(),
             2,

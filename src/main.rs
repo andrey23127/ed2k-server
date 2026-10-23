@@ -927,6 +927,16 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 for ip in ended {
                     ed2k_server::server::bot_detector::ban_ended(&state_clean, ip);
                 }
+                // Detections a day past their ban, and the search activity
+                // table once it is switched off.
+                let n = ed2k_server::server::bot_detector::sweep_detections(&state_clean);
+                if n > 0 {
+                    info!(dropped = n, "bot detections past their ban dropped from memory");
+                }
+                if !state_clean.live_cfg.load().bots.activity_stats && !state_clean.activity.is_empty() {
+                    state_clean.activity.reset();
+                    info!("bots.activity_stats is off: search activity table cleared");
+                }
 
                 // Q1: sweep expired CSAM-publisher bans and stale per-user
                 // distinct-file sets. Both use publisher_blacklist_seconds — for

@@ -307,11 +307,14 @@ whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"
 #                                # datagrams sent into a ban; 0 = never
 # scan_min_files = 2000          # scanner: files asked for sources in an hour
 # scan_min_distinct = 1000       #   ... of which this many different
+# scan_min_minutes = 10          #   ... judged no sooner than this
+# scan_max_repeats = 3           #   ... each asked at most this often
 # scan_action = "ban"            #   "ban", "throttle" or "log"
 # hammer_min_files = 3000        # hammer: files asked in an hour
-# hammer_max_distinct = 100      #   ... fewer than this many different
+# hammer_min_rate = 5            #   ... each file this many times a minute
 # hammer_action = "throttle"     #   "throttle", "ban" or "log"
-# activity_stats = true          # search activity per source for /api/activity
+# exempt = ["178.250.170.0/28"]  # never judged: search services
+# activity_stats = false         # search activity per source for /api/activity
 # activity_max_sources = 100000  # records kept (~200 bytes each)
 
 [admission]

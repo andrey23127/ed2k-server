@@ -808,6 +808,7 @@ struct StatsResp {
     /// Searches that had at least one unknown word dropped rather than
     /// returning nothing.
     searches_words_dropped: u64,
+    searches_by_hash: u64,
     /// OFFERFILES batches cut at `limits.soft_limit_files`, and records dropped.
     offer_over_soft_batches: u64,
     offer_over_soft_records: u64,
@@ -912,6 +913,7 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
         searches_served: search_served,
         searches_rank_capped: search_capped,
         searches_words_dropped: s.server.search_words_dropped_count(),
+        searches_by_hash: s.server.search_by_hash_count(),
         offer_over_soft_batches: s.server.offer_over_soft_stats().0,
         offer_over_soft_records: s.server.offer_over_soft_stats().1,
         soft_limit_files: s.server.live_cfg.load().limits.soft_limit_files,
@@ -3726,8 +3728,33 @@ tr:hover td{background:#1e2035}
   <div class="section">
     <h3>Bot Detection</h3>
     <p style="font-size:.78rem;color:#9ca3af;margin-bottom:10px">
-      IPs flagged for abnormal UDP query patterns, judged over at least <code>bots.min_span_secs</code> (10 s) so a short burst is not a flood. <strong>Flood</strong> &gt; 600 qpm: <strong>banned for 24h</strong>, its UDP traffic dropped at the recv loop. <strong>Uniform timing</strong> &gt; 200 qpm with stddev &lt; 50 ms: <strong>throttled for 24h</strong> to <code>bots.throttle_qpm</code> (60), still answered — mostly one client build with broken pacing. A source that keeps sending through its ban (<code>bots.ipfilter_min_dropped</code>, 10 000 dropped; ten times that when throttled) is added to the IP filter file for good, marked <code>bot</code>. TCP sessions are not affected until then.
+      Sources flagged by the bot rules (README, <code>[bots]</code>). <strong>Scanner</strong>: thousands of different files asked for sources in an hour, each about once — <strong>banned 24h</strong>, over TCP and UDP. <strong>Hammer</strong>: the same file or few asked 5+ times a minute — <strong>throttled 24h</strong> to <code>bots.throttle_qpm</code>, still answered. <strong>Flood</strong> (&gt; 600 UDP qpm over 10 s or more) is banned, <strong>uniform timing</strong> throttled. A source that keeps sending through its ban (<code>bots.ipfilter_min_dropped</code>) is added to the IP filter for good, marked <code>bot</code>. Addresses in <code>bots.exempt</code> are never judged. A detection is dropped from this table a day after its ban or throttle ended; the ledger keeps it.
     </p>
+    <div class="filters">
+      <input type="search" id="bf-q" placeholder="IP, country, provider, client, reason…" oninput="renderBots()">
+      <select id="bf-state" onchange="renderBots()">
+        <option value="">all states</option>
+        <option value="ipfilter">in IP filter</option>
+        <option value="banned">banned 24h (not in IP filter)</option>
+        <option value="throttled">throttled 24h</option>
+        <option value="ended">sanction over</option>
+      </select>
+      <select id="bf-rule" onchange="renderBots()">
+        <option value="">all rules</option>
+        <option value="scanner">scanner</option>
+        <option value="hammer">hammer</option>
+        <option value="rate">flood / uniform timing</option>
+      </select>
+      <select id="bf-sort" onchange="renderBots()">
+        <option value="last">sort: last sanctioned</option>
+        <option value="first">sort: first seen</option>
+        <option value="dropped">sort: dropped since sanction</option>
+        <option value="files">sort: files asked</option>
+        <option value="qpm">sort: rate</option>
+        <option value="ip">sort: IP</option>
+      </select>
+      <span class="count" id="bf-count"></span>
+    </div>
     <div id="bots-table"></div>
     <p class="sub" style="margin-top:8px">Keep a record: <a href="/api/bots/export?format=csv" style="color:inherit">export CSV</a> ·
       <a href="/api/bots/export" style="color:inherit">JSON lines</a> ·
@@ -3883,6 +3910,7 @@ async function refreshStatus() {
      <tr><td>Hard file limit reached</td><td>${fmt(sys.offer_over_hard_packets)} packets rejected <span style="color:#6b7280;font-size:.75rem">limits.hard_limit_files = ${sys.hard_limit_files ? fmt(sys.hard_limit_files) : 'off'}; an OFFERFILES declaring this many records or more is rejected and the connection closed</span></td></tr>
      <tr><td>OFFERFILES v1</td><td>${(()=>{const o=sys.offer_v1||{};if(!sys.offerfiles_v1)return `off${o.sessions?` · ${fmt(o.sessions)} sessions advertised before it was turned off`:''}`;if(sys.offerfiles_v1_error)return `<b style="color:#dc2626">not advertised: ${escapeHtml(sys.offerfiles_v1_error)}</b>`;return `${escapeHtml(sys.offerfiles_v1_policy||'')}<br>${fmt(o.requested||0)} logins asked · ${fmt(o.sessions)} advertised · ${fmt(o.batches)} batches, ${fmt(o.records)} records · waited for own pace ${fmt(o.conn_waits)} (${fmt(o.conn_wait_ms)} ms) · for the server-wide ceiling ${fmt(o.global_waits)} (${fmt(o.global_wait_ms)} ms, longest ${fmt(o.global_wait_max_ms)} ms, ${fmt(o.global_waiting_now)} waiting now) · above batch size ${fmt(o.oversized)}`})()} <span style="color:#6b7280;font-size:.75rem">limits.offerfiles_v1 — batch size and pace, advertised in SERVERIDENT only to clients that ask for it at login (issue #19); early batches wait, never dropped; other clients publish exactly as with v1 off</span></td></tr>
      <tr><td>Unknown words dropped</td><td>${fmt(sys.searches_words_dropped)} <span style="color:#6b7280;font-size:.75rem">searches in which a word no indexed file contains was ignored instead of emptying the search</span></td></tr>
+     <tr><td>Searches by file hash</td><td>${fmt(sys.searches_by_hash)} <span style="color:#6b7280;font-size:.75rem">ed2k::HASH, ed2k links and magnets, answered from the hash index (hash lookup services)</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
      <tr><td>NAT-T capable clients</td><td>${fmt(st.natt_capable_clients)} <span style="color:#6b7280;font-size:.75rem">connected clients with the NAT-traversal mod</span></td></tr>
@@ -4109,17 +4137,55 @@ showTab = function(name, btn) {
   if (name === 'settings' && !settingsLoaded) refreshSettings();
 };
 
+let botsRows = [];
 async function refreshBots() {
-  const rows = await fetch('/api/bots').then(r => r.json());
+  botsRows = await fetch('/api/bots').then(r => r.json()) || [];
+  renderBots();
+}
+function botState(b) {
+  if (b.ipfilter_added) return 'ipfilter';
+  if (b.banned) return 'banned';
+  if (b.throttled) return 'throttled';
+  return 'ended';
+}
+function botRule(b) {
+  const r = (b.reason || '').toLowerCase();
+  if (r.startsWith('scanner')) return 'scanner';
+  if (r.startsWith('hammer')) return 'hammer';
+  return 'rate';
+}
+function renderBots() {
   const el = document.getElementById('bots-table');
-  if (!rows || rows.length === 0) {
-    el.innerHTML = '<div class="empty">No bots detected.</div>';
+  const q = (document.getElementById('bf-q').value || '').trim().toLowerCase();
+  const st = document.getElementById('bf-state').value;
+  const rule = document.getElementById('bf-rule').value;
+  const sort = document.getElementById('bf-sort').value;
+  let rows = botsRows.filter(b =>
+    (!st || botState(b) === st)
+    && (!rule || botRule(b) === rule)
+    && (!q || [b.ip, b.country, b.provider, b.tcp_client, b.reason]
+          .some(v => v && String(v).toLowerCase().includes(q))));
+  const key = {
+    last: b => -b.last_seen_secs_ago,
+    first: b => -b.first_seen_secs_ago,
+    dropped: b => b.dropped_after_ban || 0,
+    files: b => b.hashes_total || 0,
+    qpm: b => b.queries_per_minute || 0,
+  }[sort];
+  if (sort === 'ip') rows.sort((a, b) => a.ip.localeCompare(b.ip, undefined, {numeric: true}));
+  else rows.sort((a, b) => key(b) - key(a));
+  const tally = {ipfilter: 0, banned: 0, throttled: 0, ended: 0};
+  botsRows.forEach(b => tally[botState(b)]++);
+  document.getElementById('bf-count').textContent = `${rows.length} of ${botsRows.length} · `
+    + `${tally.ipfilter} IP filter · ${tally.banned} banned · ${tally.throttled} throttled · ${tally.ended} over`;
+  if (rows.length === 0) {
+    el.innerHTML = `<div class="empty">${botsRows.length ? 'No bot matches the filter.' : 'No bots detected.'}</div>`;
     return;
   }
   el.innerHTML = '<table><thead><tr>'
     + '<th>IP</th><th>Country</th><th>QPM</th><th>Stddev (ms)</th>'
     + '<th>Sent</th><th>Files asked</th><th>TCP client on this IP</th>'
-    + '<th>Reason</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>'
+    + '<th>Reason</th><th>First seen</th><th>Last sanctioned</th></tr></thead><tbody>'
     + rows.map(b => {
         // -1 is our sentinel for "not enough samples to compute stddev"
         const stddev = (b.interval_stddev_ms < 0) ? '—' : b.interval_stddev_ms.toFixed(0);
@@ -4146,7 +4212,8 @@ async function refreshBots() {
           + `<td>${b.tcp_client ? escapeHtml(b.tcp_client) : '<span class="sub">none</span>'}</td>`
           + `<td><span class="badge no">${escapeHtml(b.reason)}</span>${b.banned ? ' <span class="badge no" style="background:#7f1d1d;color:#fecaca;border-color:#b91c1c">BANNED 24h</span>' : ''}`
           + `${b.throttled ? ' <span class="badge no" style="background:#78350f;color:#fde68a;border-color:#b45309">THROTTLED 24h</span>' : ''}`
-          + `${b.ipfilter_added ? ' <span class="badge no" style="background:#1e1b4b;color:#c7d2fe;border-color:#4338ca">IP FILTER</span>' : ''}</td>`
+          + `${b.ipfilter_added ? ' <span class="badge no" style="background:#1e1b4b;color:#c7d2fe;border-color:#4338ca">IP FILTER</span>' : ''}`
+          + `${botState(b) === 'ended' ? ' <span class="badge" style="background:#252840;color:#9ca3af">OVER</span>' : ''}</td>`
           + `<td>${fmtDur(b.first_seen_secs_ago)} ago</td>`
           + `<td>${fmtDur(b.last_seen_secs_ago)} ago</td></tr>`;
       }).join('')

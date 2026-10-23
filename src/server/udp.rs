@@ -2024,6 +2024,10 @@ fn udp_search_ranked(
     state: &ServerState,
     tree: crate::proto::search::SearchNode,
 ) -> Vec<crate::state::file_id::FileRecord> {
+    // `ed2k::HASH` and the like: one file by hash, as over TCP.
+    if let Some(found) = crate::server::search::search_by_hash(state, &tree) {
+        return found;
+    }
     // Same unknown-word rewrite as the TCP path, applied before anything
     // else reads the tree. If only one channel dropped unknown words, the
     // same query would return results over TCP and nothing over UDP.
@@ -2188,14 +2192,14 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     let size_hi = (entry.size >> 32) as u32;
     let mut tags = vec![
         Tag::byte(FT_FILENAME, TagValue::String(entry.name().to_string())),
-        Tag::byte(FT_FILESIZE, TagValue::U32(size_lo)),
+        Tag::byte(FT_FILESIZE, TagValue::uint(size_lo)),
     ];
     if size_hi > 0 {
-        tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::U32(size_hi)));
+        tags.push(Tag::byte(FT_FILESIZE_HI, TagValue::uint(size_hi)));
     }
     tags.push(Tag::byte(
         FT_SOURCES,
-        TagValue::U32(entry.sources.len() as u32),
+        TagValue::uint(entry.sources.len() as u32),
     ));
     // FT_COMPLETE_SOURCES (0x30) MUST be sent or eMule's "Complete"
     // column stays at "0% (0)" forever — the UDP search response path
@@ -2203,14 +2207,14 @@ fn udp_search_datagram(state: &ServerState, entry: &crate::state::file_id::FileR
     // as complete (issue #28; see FileRecord::complete_source_count).
     tags.push(Tag::byte(
         FT_COMPLETE_SOURCES,
-        TagValue::U32(entry.complete_source_count()),
+        TagValue::uint(entry.complete_source_count()),
     ));
     // FT_FILETYPE as an integer — see the note in server/search.rs. The
     // UDP and TCP result paths must carry the same tags, or a client
     // gets different metadata depending on which one answered it.
     let ftype = crate::proto::search::ed2k_file_type_id(&entry.name().to_lowercase());
     if ftype != crate::proto::search::ed2k_file_type::ANY {
-        tags.push(Tag::byte(FT_FILETYPE, TagValue::U32(ftype)));
+        tags.push(Tag::byte(FT_FILETYPE, TagValue::uint(ftype)));
     }
     crate::server::search::push_media_tags(state, &hash, &mut tags);
     write_tag_list(&mut out, &tags);

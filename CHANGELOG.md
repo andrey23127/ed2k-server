@@ -4,11 +4,12 @@ Earlier releases are described in their release commit messages.
 
 ## 0.9.84
 
-Bot detection that stops banning ordinary users, scanners into the IP filter
-for good (and off their TCP sessions), search activity per source to find
-better criteria, and LowID hole punching: the support flag (issue #35), the
-right UDP port for two clients behind one IP (#37), the peer ID in 0x61
-(#38). One new optional
+Bot rules built from a day of live traffic: list scanners and hammering
+clients caught over TCP and UDP, ordinary users (jdonkey included) left
+alone, search services exempt, scanners into the IP filter for good and off
+their TCP sessions. Search by file hash (`ed2k::HASH`) as Lugdunum does. LowID
+hole punching: the support flag (issue #35), the right UDP port for two
+clients behind one IP (#37), the peer ID in 0x61 (#38). One new optional
 section, `[bots]`.
 
 ### Bots
@@ -41,7 +42,17 @@ section, `[bots]`.
   logged in until it reconnected (seen: 3 hours). Every filter swap (a bot
   added, the file changed, SIGHUP, `/api/reload`) now wakes each session to
   check its own address. Counted as `ipfilter_kick`.
-- The Bots tab shows THROTTLED and IP FILTER next to BANNED.
+- The Bots tab shows THROTTLED and IP FILTER next to BANNED, and can be
+  filtered by state (in the IP filter, banned 24 h, throttled 24 h, sanction
+  over) and by rule (scanner, hammer, flood/uniform timing), searched by
+  IP, country, provider, client or reason, and sorted by last sanction
+  (the default), first seen, datagrams dropped since, files asked, rate or
+  IP. A tally of each state sits next to the filters.
+- **Detections no longer pile up in memory.** A detection, with up to its
+  hashes, stayed until restart. It is now dropped a day after its ban or
+  throttle ended and it went quiet; the ledger on disk keeps it. The hashes
+  kept per bot are capped at 2 000 instead of 20 000 (up to ~0.5 MB per
+  scanner before), and `/api/memsize` now counts them.
 
 ### Scanners and hammers, over TCP too
 
@@ -52,15 +63,27 @@ ordinary source stayed under 1 000. Two kinds of source did not, and nearly
 all of them over TCP, where nothing was judged before:
 
 - **Scanners**, walking a list: 2 000 to 20 000 files an hour, nearly all
-  different (one asked 3 900 files in 6 minutes). New rule: at least
-  `bots.scan_min_files` (2 000) files in an hour, at least
-  `bots.scan_min_distinct` (1 000) different → `scan_action` ("ban").
-  Over the 7 hours it matches 4 to 7 sources.
-- **Hammers**, the same file or two up to 10 times a second, mostly one
-  mobile client build: at least `bots.hammer_min_files` (3 000) in an hour,
-  fewer than `bots.hammer_max_distinct` (100) different → `hammer_action`
-  ("throttle": `throttle_qpm` answers a minute, the session stays). About
-  20 sources.
+  different, each about once. Rule: at least `bots.scan_min_files` (2 000)
+  files in an hour, at least `scan_min_distinct` (1 000) different, each
+  asked at most `scan_max_repeats` (3) times on average, judged no sooner
+  than `scan_min_minutes` (10) into the hour → `scan_action` ("ban").
+- **Hammers**: the same file or two 5 to 600 times a minute, mostly a
+  program built on jed2k with its default nick. Rule: at least
+  `hammer_min_files` (3 000) in an hour, each file at least
+  `hammer_min_rate` (5) times a minute on average → `hammer_action`
+  ("throttle": `throttle_qpm` answers a minute, the session stays).
+- **Not bots: jdonkey users.** The Android client asks for every download
+  without a peer once a minute. A first version of these rules, run for a
+  day on the live server, flagged 80 sources. It banned as scanners 5
+  sources in their first 1 to 6 minutes (2 000 new downloads look like a
+  list then) and 2 that asked each of ~1 000 files 4 to 9 times, and
+  throttled as hammers 12 jdonkey users with 50 to 90 stalled downloads,
+  each asked about once a minute. Under the rules above the 2 and the 12
+  are left alone and the 5 are judged at minute 10; the 6 scanners that
+  asked each file about once and 55 hammers remain.
+- **`bots.exempt`**: addresses never judged, banned or written to the IP
+  filter. Default `178.250.170.0/28`, ed2k.shortypower.org, which sends
+  about 2 600 UDP searches a day from each of 11 addresses.
 - Both count TCP `OP_GETSOURCES` and UDP source requests by file, per
   source, over an hour from its first request. Different files are
   estimated from the 200th file on, so most sources cost a counter only.
@@ -69,7 +92,7 @@ all of them over TCP, where nothing was judged before:
   source requests beyond its allowance go unanswered.
 - `"log"` as an action only writes the match to the log and the ledger.
 
-### Search activity (temporary)
+### Search activity
 
 The rate detector misses a list scanner: one walked 4 400 files at about 150
 requests a minute, below the 200 qpm a source needs to be looked at, and was
@@ -88,9 +111,12 @@ threshold, and others, from real traffic:
 - The distinct-files estimate mixes each hash first: sources asking 700
   files were estimated at 6 000, from hashes with long runs of zero bytes.
   It is also never above the files asked.
-- `bots.activity_stats` (on) and `bots.activity_max_sources` (100 000
-  records, about 200 bytes each; further sources only in the totals). Both
-  apply from the Settings tab without a restart.
+- `bots.activity_stats` (off by default) and `bots.activity_max_sources`
+  (100 000 records, about 200 bytes each; further sources only in the
+  totals). Both apply from the Settings tab without a restart. On for a day
+  on the live server it took ~25 MB and a record update on each of 21
+  million requests, so it is meant for tuning, not to stay on; switched
+  off, the table is cleared within a minute.
 
 ### LowID hole punch flag (issue #35)
 
@@ -102,6 +128,26 @@ threshold, and others, from real traffic:
 - The IPv6 contract in the README no longer lists `CT_SERVER_FLAGS` `0x1000`.
   On Lugdunum that bit is `SRVCAP_NATTRAVERSAL`; eMuleQt withdrew it and aMule
   stops sending it. This server only ever keyed on the `CT_MOD_IP_V6` tag.
+
+### Search by file hash
+
+- A search string that names a file by hash is answered from the hash
+  index, as Lugdunum's `Is_ed2k_search` does: `ed2k::HASH`,
+  `ed2k:SIZE:HASH`, `ed2k://|file|NAME|SIZE|HASH|…`,
+  `magnet:?xt=urn:ed2k:HASH`, `magnet:?xt=urn:ed2khash:HASH`. With a size,
+  the size must match. TCP and UDP alike; the result obeys the content
+  filter like any other.
+- ed2k.shortypower.org looks files up with `ed2k::HASH` in a UDP search
+  (0x90) from 11 addresses, about 8 000 a day. Every one returned nothing
+  here, because the string was searched as a word (and then dropped as one
+  no file has), so the service found no file on servers running this
+  software while Lugdunum servers answered.
+- Counted in the Health tab ("Searches by file hash").
+- Integers in search results (size, sources, complete sources, type,
+  length, bitrate) are written in the narrowest type, UINT8 up to 255 and
+  UINT16 up to 65 535, as Lugdunum writes them. ed2k.shortypower.org read
+  every tag of this server's answer except the source counts, which it
+  takes only in the narrow forms; eMule and aMule read every width.
 
 ### Hole punch: per-client UDP port (issue #37)
 

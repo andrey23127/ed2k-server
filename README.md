@@ -13,6 +13,10 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
 - Inverted keyword index with boolean search trees and numeric size filters.
   Results are ranked by source count, the result cap is configurable, and a
   query word no indexed file contains no longer empties the search.
+- **Search by file hash**, as Lugdunum: a search string `ed2k::HASH`,
+  `ed2k:SIZE:HASH`, an `ed2k://|file|…|` link or a `magnet:?xt=urn:ed2k:`
+  link returns that one file, over TCP and UDP. Hash lookup services such as
+  ed2k.shortypower.org use it.
 - Memory-optimized in-memory index (sharded slab, intrusive hash index, name
   interning, jemalloc tuning) — roughly **half the RAM** of the Lugdunum
   reference at the same scale.
@@ -485,11 +489,14 @@ keys are read on every request, so the Settings tab changes them at once.
 | `ipfilter_min_dropped` | 10000 | A banned source that sends this many datagrams into its ban is added to `storage.ipfilter_path` for good (ten times as many for a throttled one); `0` = never |
 | `scan_min_files` | 2000 | **Scanner** rule: a source that asks for sources of this many files within an hour (TCP and UDP, repeats included)… |
 | `scan_min_distinct` | 1000 | …of which at least this many different… |
+| `scan_min_minutes` | 10 | …judged no sooner than this far into the hour… |
+| `scan_max_repeats` | 3 | …each file asked at most this many times on average… |
 | `scan_action` | `"ban"` | …gets this for 24 h: `"ban"`, `"throttle"` or `"log"` (ledger and log only) |
 | `hammer_min_files` | 3000 | **Hammer** rule: this many files asked within an hour… |
-| `hammer_max_distinct` | 100 | …of fewer than this many different ones… |
+| `hammer_min_rate` | 5 | …each file asked at least this many times a minute on average… |
 | `hammer_action` | `"throttle"` | …gets this for 24 h: `"throttle"`, `"ban"` or `"log"` |
-| `activity_stats` | `true` | Collect search activity per source for `/api/activity` (temporary, see below) |
+| `exempt` | `["178.250.170.0/28"]` | Addresses and networks (`a.b.c.d`, `a.b.c.d/nn`, IPv6 too) the bot rules never judge, ban or add to the IP filter: search services that query for their users (default: ed2k.shortypower.org) |
+| `activity_stats` | `false` | Collect search activity per source for `/api/activity`, to tune these rules (see below). About 25 MB and a record update per request while on |
 | `activity_max_sources` | 100000 | Sources it keeps a record for, about 200 bytes each; requests of further sources only go into the totals |
 
 A line added to the IP filter looks like the rest of the file, marked `bot`:
@@ -509,10 +516,14 @@ The scanner and hammer rules come from a day's activity of 91 000 sources
 (`/api/activity`, 2026-10-20). An ordinary eMule asks the server it is
 connected to for sources of 15 files every 5 minutes, about 180 files an
 hour, however long its download list; over UDP, about 25 files every 5
-minutes. The busiest ordinary source asked under 1 000 files an hour. A list
-scanner asked 2 000 to 20 000 an hour, nearly all different. A hammer asks for
-the same file or two up to 10 times a second, mostly one mobile client build
-with a bug, so it is throttled (`throttle_qpm` answers a minute) and not
+minutes. jdonkey (the Android client built on jed2k) asks for every
+download that has no peer once a minute, so a user with 80 stalled
+downloads sends 4 800 requests an hour, and one who adds 2 000 downloads
+sends 2 000 different files in the first minute. Neither is a scan: a list
+scanner asks thousands of different files an hour, each about once, which is
+what `scan_min_minutes` and `scan_max_repeats` test. A hammer asks the same
+file or two 5 to 600 times a minute, mostly a program built on jed2k that
+kept its default nick; it is throttled (`throttle_qpm` answers a minute), not
 banned. Each source is judged over an hour from its first request; different
 files are counted from its 200th file on (a 64-byte estimate, only for
 sources that reach it).
@@ -528,7 +539,7 @@ blocks is closed, counted as `ipfilter_kick` in `/api/block_stats`. Before,
 the filter was read only when a connection was accepted, so a client already
 logged in stayed until it reconnected.
 
-#### Search activity (`/api/activity`, temporary)
+#### Search activity (`/api/activity`)
 
 The rate detector judges a source by queries per minute, and a scanner that
 walks a list of thousands of files at ~150 requests a minute stays under any
@@ -552,8 +563,8 @@ reset:
 | `POST /api/activity/reset` | Start a new period |
 
 UDP requests are counted after the admission budgets, i.e. those the server
-went on to handle. With `activity_stats = false` nothing is collected, and
-what was collected stays until a reset.
+went on to handle. Off by default; turn it on for a day when the rules need
+tuning, then off again. Switched off, the table is cleared within a minute.
 
 ### `[admission]`
 Server-wide ceilings on the work remote peers can cause, however the load is
