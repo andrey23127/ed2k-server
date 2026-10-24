@@ -897,6 +897,20 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 state_clean
                     .natt_udp_ports
                     .retain(|_, (_, ts)| ts.elapsed() < OBSERVED_PORT_TTL);
+                // Entries of sessions that ended without the normal logout
+                // path, and waiters whose coordination timed out.
+                state_clean
+                    .natt_keepalive_seen
+                    .retain(|h, _| state_clean.clients.contains_key(h));
+                state_clean
+                    .natt_keepalive_waiters
+                    .retain(|_, v| {
+                        v.retain(|s| !s.is_closed());
+                        !v.is_empty()
+                    });
+                state_clean
+                    .lugdunum_natt_seen
+                    .retain(|_, s| s.at.elapsed() < ed2k_server::server::lugdunum_natt::SEEN_TTL);
                 // Bot detector keeps per-IP sliding windows. IPs that haven't
                 // queried in 5 minutes can be dropped — their window is empty
                 // and re-creating it on next query is cheap. Without this

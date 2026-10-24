@@ -100,9 +100,20 @@ hairpin_lan_clients = false
 #
 # No answer (silent close, reset, timeout — often just the peer's IP filter)
 # NEVER costs HighID. The hairpin path above is separate and unaffected.
-highid_verify_observe = true
+highid_verify_observe = false          # counting only; the verdict below feeds the same counters
 highid_downgrade_on_wrong_hash = true
 highid_wrong_hash_ttl_secs = 86400      # 24 h
+
+# Lugdunum's NAT callback (README, NAT traversal): clients that set 0x1000 at
+# login get an odd LowID and a 24-byte OP_IDCHANGE, and their UDP 0xA6
+# requests are forwarded to the target as TCP 0x37 / UDP 0xA7. Runs beside the
+# 0x60-0x62 hole punch.
+# lugdunum_natt = true
+# The hole-punch extension (issue #39): flag 0x100000. Only for two clients that
+# both announced 0x100000 and 0x1000 at login: a 0x60 wakes the target with 0x37
+# and waits up to 3 s for its fresh 0x9F before sending 0x61. Everyone else sees
+# no change. Needs lugdunum_natt.
+# holepunch_extension = true
 
 # ── IPv6 ────────────────────────────────────────────────────────────────────
 # Accept clients over IPv6: separate IPv6-only sockets, TCP on tcp_port and UDP

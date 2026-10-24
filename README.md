@@ -335,6 +335,8 @@ a watched file) or needs a **restart**.
 | `highid_verify_observe` | **Observe only.** After a client gets HighID from the plain TCP probe, also send OP_HELLO in the background and count whether it answers with the user hash that logged in. Nothing changes for the client. Counters on the Status tab, cases in `/api/highid_mismatches`. Default off | live |
 | `highid_downgrade_on_wrong_hash` | **Verdict.** The same background check, acted on: a port that answers with a *different* client's user hash marks (IP, port, login hash), and that client's next logins get LowID while the mark lasts (see below). Default off | live |
 | `highid_wrong_hash_ttl_secs` | How long a wrong-hash mark lasts. Default 86400 (a day) | live |
+| `lugdunum_natt` | Lugdunum's NAT callback (see *NAT traversal*): flag `0x1000` in `OP_IDCHANGE`, odd LowIDs and a 24-byte `OP_IDCHANGE` for clients that set `0x1000`, UDP `0xA6` forwarded as TCP `0x37` / UDP `0xA7`. Default on | live |
+| `holepunch_extension` | The hole-punch extension (see *NAT traversal*): flag `0x100000` in `OP_IDCHANGE`. Only for two clients that both announced `0x100000` with `0x1000`: a `0x60` wakes the target with `0x37`, waits up to 3 s for its fresh `0x9F`, then sends a 30-byte `0x61` with the peer's crypt setting. Also: plain `0x9F` ignored from a session that sent an obfuscated one. Needs `lugdunum_natt`. Default on | live |
 | `ipv6_enabled` | Accept clients over IPv6 on the same TCP port, plus an IPv6 UDP socket on `tcp_port + 4`. Separate IPv6-only sockets, so the IPv4 path is unchanged; a host without IPv6 logs a warning and serves IPv4 only. Default off | restart |
 | `listen_ip6` | Bind address for the IPv6 sockets. Default `::` | restart |
 | `this_ip6` | The server's public IPv6, announced in `OP_SERVERIDENT` when `ipv6_publish_sources` is on. Empty = not announced | live |
@@ -799,7 +801,8 @@ parse `0xF9`, so sending it is safe against any server.
 **Is this server doing it?** A server that coordinates the punch sets bit
 `0x20000` in the `OP_IDCHANGE` TCP flags (issue #35). Send `0x60` only to a
 server that set it: some servers drop the connection on an unknown opcode.
-Lugdunum's own NAT callback is a different scheme, announced with `0x1000`.
+Lugdunum's NAT callback is a different scheme, announced with `0x1000`; this
+server speaks it too (below), and a client may use either.
 
 **2. Refresh your external UDP port — the keepalive (critical).** While connected,
 send `OP_SERVER_NATT_KEEPALIVE` (`0x9F`) **from your client UDP socket** (not the TCP
@@ -844,7 +847,8 @@ the `target_id` of its `0x60`, so it can match a `0x61` to one of several
 requests in flight; the target gets the requester's ID. It was added in 0.9.84;
 earlier servers send 25 bytes. **Read it only when the payload is at least 29
 bytes**, and accept longer payloads: fields may be appended later, never
-inserted.
+inserted. Between two clients using the extension (below) it is 30 bytes:
+`peer_crypt(1)` is appended.
 (`0x60`–`0x62` are unused in the server TCP opcode space, which runs `0x01`–`0x44`,
 and `0x9F` was free in the server UDP namespace — no conflict on the server link.)
 
@@ -879,6 +883,74 @@ Pick anything else, and open an issue or a PR here to add your row. The server
 never sends or reads `0xB2`; the table is kept here only because the NAT-T clients
 already meet in this README.
 
+### Lugdunum's NAT callback (compatibility, issue #39)
+
+This server also runs the NAT callback of the original eserver (Lugdunum
+17.x), so a client written for it works here unchanged. It is read from
+Lugdunum's code and checked against aMule's implementation; the two schemes
+share no opcode and run side by side. Off with `network.lugdunum_natt = false`.
+
+| Step | Wire |
+|---|---|
+| Login | the client sets `0x1000` in `CT_SERVER_FLAGS` |
+| Login answer | `0x1000` in the `OP_IDCHANGE` TCP flags (for every client, as Lugdunum); for a client that set `0x1000`, 4 more bytes: `[20-23]` its TCP port as the server sees it (the source port of its connection for a LowID, its own port for a HighID). Its LowID is odd; other clients get even LowIDs |
+| Request, client → server, UDP | `0xA6` `<target_id 4><requester_id 4>`, server-key obfuscated (sent from the client UDP socket to the server's obfuscation UDP port, so the source port is the one peers must punch) |
+| Forward, server → target | `<requester_ip 4><requester_udp_port 2><requester_id 4><crypt 1>`, plus the requester's user hash (16) with `0x80` set in `crypt` when both sides support the crypt layer and one requests it. `crypt` is the requester's `(CT_SERVER_FLAGS >> 9) & 7`. By UDP `0xA7` to the target's own endpoint when the target sent `0xA6` itself less than 20 s ago, else by TCP `0x37` |
+
+The requester gets no answer, as on Lugdunum: the target punches towards it.
+aMule then sends the reverse `0xA6`, which brings the target's endpoint to the
+requester the same way. Both must be logged-in LowIDs, the request must come
+from the requester's TCP address, and nothing is sent when one side requires
+the crypt layer and the other can't use it. Two rules are stricter than
+Lugdunum: the target must have set `0x1000` (Lugdunum also forwards to stock
+clients, which don't know `0x37`), and a requester gets a burst of 10 requests,
+then one a second. Refusals are counted in the Blocks tab as `natcb_*`; the
+Status tab shows forwards, refusals and capable clients.
+
+How the two schemes compare: Lugdunum's needs no keepalive (the request
+itself carries a fresh endpoint), but only the target learns the other side's
+address. If the requester's NAT drops packets from addresses it has not sent
+to (address- or port-restricted, most home routers), the target's punch does
+not get through until the reverse request. `0x60` answers both sides at once,
+with endpoint, user hash and role, and has an explicit failure (`0x62`).
+
+**Bridge to Lugdunum-only targets.** Some clients implement Lugdunum's
+callback and not `0x61` (NeoMule's "CanLow2Low"). A `0x60` whose target set
+`0x1000`, did not announce the extension below and has sent no `0x9F` in its
+session also sends that target the usual `0x37`, so it dials the requester.
+Having sent a `0x9F` shows a client reads `0x61`. The requester's side is
+unchanged. Counted on the Status tab as "bridged".
+
+### Hole-punch extension (issue #39)
+
+`0x60` with fresh ports and no standing keepalive, agreed with aMule and
+emule-qt. It applies only when the server sets `0x100000` in the `OP_IDCHANGE`
+flags and **both** clients set `0x100000` together with `0x1000` in
+`CT_SERVER_FLAGS` at login. Every other pair gets exactly the punch above:
+`0x61` at once, 29 bytes, no `0x37`. Off with
+`network.holepunch_extension = false` (it needs `lugdunum_natt`).
+
+1. The requester sends a `0x9F` (server-key obfuscated when it has the key)
+   and the `0x60`, in either order.
+2. The server wakes the target with Lugdunum's `0x37`, byte-identical,
+   carrying the requester's best port so far.
+3. The target sends `0x9F` at 0, 0.5 and 1 s and starts punching towards that
+   endpoint. It dials only as the role in `0x61` says.
+4. On the target's first `0x9F` the server sends `0x61` to both, 30 bytes,
+   with `peer_crypt` = the peer's `(CT_SERVER_FLAGS >> 9) & 7` (support,
+   request, require). Resends follow at +1.2 s and +3 s as usual.
+5. With no `0x9F` from the target within 3 s, the server sends the same
+   `0x61` with the ports it would have used anyway (the order under step 2 of
+   the contract), or `0x62` reason 4 where it always would. A lost `0x9F`
+   costs the wait, never the punch.
+
+A `0x60` repeated while one is waiting adds nothing. On a server with
+`0x100000`, once a session has sent an obfuscated `0x9F`, its plain ones are
+ignored: only the server's key makes one, so a forged datagram can't move
+that client's port. Clients without the extension keep working as before.
+The Status tab shows coordinations started, released by a fresh `0x9F`, and
+timed out.
+
 **5. Keep your LowID source alive.** A share-only client is TCP-silent for hours.
 This server keeps such a source by **(a)** counting your `0x9F` UDP keepalive as
 activity against the session idle timer (idle backstop is 900 s, refreshed by any
@@ -892,6 +964,45 @@ kernel retransmission. Your only obligation is to keep
 sending the `0x9F` keepalive; the rest is the server's bookkeeping. Get the cadence
 wrong and a live share-only source is silently evicted after a few minutes — the
 symptom is identical to a successful connection, which makes it easy to misdiagnose.
+
+
+### `OP_IDCHANGE` TCP flag bits in use
+
+The second word of `OP_IDCHANGE` (server → client) is shared by every server
+family, and each has added bits to it. To keep them apart, the ones known to
+be taken (corrections and new rows welcome, as for the `0xB2` table):
+
+| Bit | Meaning | Defined by | This server |
+|---|---|---|---|
+| `0x0001` | zlib compression | eMule | set |
+| `0x0008` | new tags | eMule | set |
+| `0x0010` | Unicode | eMule | set |
+| `0x0040` | related search | eMule | set |
+| `0x0080` | integer file-type tag | eMule | set |
+| `0x0100` | large files | eMule | set |
+| `0x0400` | TCP obfuscation | eMule | set |
+| `0x1000` | NAT callback (`0xA6` / `0x37` / `0xA7`) | Lugdunum | set (since 0.9.85) |
+| `0x2000` | IPv6 (read by NeoLoader); ed2kNET uses `0x1000`/`0x2000` unofficially | NeoLoader, ed2kNET | no |
+| `0x4000` | inline IPv6 sources | IPv6 extension | with `ipv6_publish_sources` |
+| `0x8000` | `OP_IPV6_UPDATE` accepted (issue #34) | this server | with `ipv6_publish_sources` |
+| `0x10000` | meta search | eNode-go | no |
+| `0x20000` | LowID hole punch, `0x60`-`0x62` (issue #35) | this server | set |
+| `0x40000` | NAT rendezvous (`FlagNatRendezvous`, since 2026-10-20) | eNode-go | no |
+| `0x80000` | server search (`FlagServerSearch`, reserved, not sent) | eNode-go | no |
+| `0x100000` | hole-punch extension (issue #39) | this server | with `holepunch_extension` |
+
+The first bit free everywhere is `0x200000`.
+
+The client's `CT_SERVER_FLAGS` at login (client → server) is a different word
+with its own bits:
+
+| Bit | Meaning | Defined by |
+|---|---|---|
+| `0x0001`–`0x0010`, `0x0100` | zlib, IP in login, aux port, new tags, Unicode, large files | eMule |
+| `0x0200` / `0x0400` / `0x0800` | crypt layer supported / requested / required | eMule |
+| `0x1000` | NAT callback; odd LowID, 24-byte `OP_IDCHANGE` | Lugdunum |
+| `0x10000` | asks for meta-search rows | eNode-go |
+| `0x100000` | hole-punch extension, always with `0x1000` | this server |
 
 ---
 
@@ -927,9 +1038,10 @@ Every element is ignored by a client that does not know it.
 
 The client announces the extension with the `CT_MOD_IP_V6` tag alone. An
 earlier version of this table also listed `CT_SERVER_FLAGS` bit `0x1000`; do
-not send it: on Lugdunum that bit is `SRVCAP_NATTRAVERSAL`, and a client that
-sets it gets an odd LowID, a longer `OP_IDCHANGE` and NAT callback notices
-(issue #35). This server never read it.
+not send it: that bit is Lugdunum's `SRVCAP_NATTRAVERSAL`, and a client that
+sets it gets an odd LowID, a longer `OP_IDCHANGE` and NAT callback notices,
+on Lugdunum (issue #35) and, since 0.9.85, here too (issue #39). It never
+meant IPv6 to this server.
 
 Rules the server applies:
 

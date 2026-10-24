@@ -2,6 +2,80 @@
 
 Earlier releases are described in their release commit messages.
 
+## 0.9.85
+
+Lugdunum's NAT callback (issue #39), so a client written for the original
+eserver's NAT traversal works here unchanged, beside this server's own hole
+punch; the hole-punch extension built on it with aMule and emule-qt; and a
+bridge from `0x60` to clients that speak only Lugdunum's scheme. Two new
+keys, `network.lugdunum_natt` and `network.holepunch_extension` (both on).
+
+### Lugdunum's NAT callback
+
+Read from Lugdunum's code and checked against aMule's implementation:
+
+- **Login.** `0x1000` in the `OP_IDCHANGE` TCP flags, for every client, as
+  Lugdunum sends it. A client that set `0x1000` in `CT_SERVER_FLAGS` gets an
+  odd LowID and four more `OP_IDCHANGE` bytes: its TCP port as the server
+  sees it (the source port of its connection for a LowID, its own port for a
+  HighID). aMule turns the callback on only with both. Other clients get
+  even LowIDs, so an odd LowID always means a capable client.
+- **Request.** UDP `0xA6` `<target_id><requester_id>`, server-key
+  obfuscated, from a logged-in LowID at the address of its TCP session. The
+  datagram's source port is the requester's endpoint as the server sees it.
+- **Forward.** `<ip><udp_port><requester_id><crypt>`, plus the requester's
+  user hash and bit `0x80` when both support the crypt layer and one asks for
+  it; nothing when one side requires it and the other can't. By UDP `0xA7`
+  to the target's own endpoint when the target sent `0xA6` itself less than
+  20 s ago, else by TCP `0x37`. The requester gets no answer, as on Lugdunum.
+- **Stricter than Lugdunum**: the target must have set `0x1000` (Lugdunum
+  also forwards to stock clients, which don't know `0x37`), and each
+  requester gets a burst of 10 requests, then one a second.
+- **No conflict.** The two schemes share no opcode or state: `0x60`-`0x62`,
+  `0x9F` and `0x20000` are unchanged, and a client may use either. `0xA6` is
+  server-to-client only in eNode-go's dialect, and `0xA7` goes only to a
+  client that itself sent `0xA6`. Stock eMule ignores the `0x1000` server bit
+  and reads `OP_IDCHANGE` only up to byte 20, as with Lugdunum.
+- Status tab: forwards (TCP, UDP), refusals and capable clients; reasons in
+  the Blocks tab as `natcb_*`.
+- The config template sets `highid_verify_observe = false`: the verdict
+  mode feeds the same counters.
+
+### Hole-punch extension (flag `0x100000`)
+
+`0x60` with fresh ports and no standing keepalive. Only between two clients
+that both set `0x100000` with `0x1000` in `CT_SERVER_FLAGS`; the server sets
+`0x100000` in `OP_IDCHANGE`. Every other pair gets today's punch byte for
+byte.
+
+- The target is woken with Lugdunum's `0x37`, carrying the requester's port.
+  The server waits up to 3 s for the target's `0x9F`, then sends `0x61` to
+  both with that fresh port, 30 bytes: `peer_crypt` (the peer's
+  `(CT_SERVER_FLAGS >> 9) & 7`) appended. Resends at +1.2 s and +3 s.
+- No `0x9F` within 3 s: the same `0x61` with the ports used today. A lost
+  `0x9F` costs the wait, not the punch. No new failure reason.
+- A repeated `0x60` while one waits adds nothing.
+- On a server with the extension, a session that sent an obfuscated `0x9F`
+  has its plain ones ignored (counted as `natt_keepalive_plain_ignored`).
+- Status tab: coordinations started, released by a fresh `0x9F`, timed out;
+  clients with the extension.
+
+### Bridge to Lugdunum-only targets
+
+A client that implements Lugdunum's callback but not `0x61` (NeoMule's
+"CanLow2Low") could not be reached by `0x60`. A `0x60` whose target set
+`0x1000`, did not announce the extension and has sent no `0x9F` in its
+session now also sends that target Lugdunum's `0x37` (same crypt rule as on
+the `0xA6` path), so it dials the requester. The requester's side is
+unchanged. Status tab: "bridged".
+
+### README
+
+- A table of the `OP_IDCHANGE` TCP flag bits taken by eMule, Lugdunum,
+  NeoLoader/ed2kNET, the IPv6 extension, eNode-go and this server (first free
+  bit now `0x200000`), and one of the client's `CT_SERVER_FLAGS` bits.
+- The extension and the bridge described next to the `0x60` contract.
+
 ## 0.9.84
 
 Bot rules built from a day of live traffic: list scanners and hammering

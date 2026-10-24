@@ -200,7 +200,7 @@ pub(crate) fn reported_client_ip(
 /// IDCHANGE, SERVERSTATUS, SERVERMESSAGE, SERVERIDENT (only for some clients,
 /// see `ident_at_login`), plus optional extra welcome lines.
 pub fn build_welcome_batch(cfg: &Config, state: &ServerState, client: &ClientHandle) -> Vec<Frame> {
-    build_welcome_batch_with(cfg, state, client, ident_at_login(client))
+    build_welcome_batch_with(cfg, state, client, ident_at_login(client), 0)
 }
 
 /// `build_welcome_batch` with the SERVERIDENT decision made by the caller,
@@ -210,6 +210,9 @@ pub fn build_welcome_batch_with(
     state: &ServerState,
     client: &ClientHandle,
     send_ident: bool,
+    // The source port of the client's TCP connection, 0 when unknown: the
+    // last field of a Lugdunum NAT-T client's OP_IDCHANGE.
+    tcp_src_port: u16,
 ) -> Vec<Frame> {
     // Hot-reloadable view of the configuration. /api/config swaps `live_cfg`
     // atomically, so everything read through `live` below takes effect for the
@@ -256,6 +259,15 @@ pub fn build_welcome_batch_with(
         let mut tcp_flags: u32 = 0x0000_05DD;
         // LowID hole punch is always on: say so (issue #35).
         tcp_flags |= crate::proto::opcodes::SRVFLG_LOWID_HOLEPUNCH;
+        // Lugdunum's NAT callback, beside it (issue #39). Lugdunum sets the
+        // same bit (its flags read 0x17F9).
+        if live.network.lugdunum_natt {
+            tcp_flags |= crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL;
+        }
+        // The hole-punch extension (issue #39), which builds on both.
+        if crate::server::holepunch::extension_enabled(&live) {
+            tcp_flags |= crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT;
+        }
         if live.network.ipv6_publish_sources {
             // ⚠ 0x4000 server→client. The client→server capability bit is
             //   0x1000 in CT_SERVER_FLAGS — a different word in a different
@@ -290,6 +302,18 @@ pub fn build_welcome_batch_with(
         payload.put_u32_le(cfg.network.tcp_port as u32); // [8-11]  aux/standard port
         payload.put_u32_le(reported_ip); // [12-15] the client's own address
         payload.put_u32_le(cfg.network.tcp_port as u32); // [16-19] obfuscation_tcp_port
+        // [20-23] Lugdunum's NAT callback (issue #39), only for a client that
+        // set 0x1000 at login, as Lugdunum sends it: the client's TCP port as
+        // we see it — the source port of its connection for a LowID, its own
+        // listening port for a HighID. eMule and aMule read IDCHANGE up to
+        // byte 20 and ignore the rest, so a client that set the bit for
+        // something else (an early IPv6 extension did) is not disturbed.
+        if live.network.lugdunum_natt
+            && client.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0
+        {
+            let port = if client.is_high_id || tcp_src_port == 0 { client.port } else { tcp_src_port };
+            payload.put_u32_le(port as u32);
+        }
         frames.push(Frame::new(OP_IDCHANGE, payload.to_vec()));
     }
     // 2. SERVERSTATUS — current users, files
@@ -592,10 +616,10 @@ pub(crate) use crate::proto::opcodes::CAPABLE_SUPPORTCRYPT as SRVCAP_SUPPORTCRYP
 /// The HighID for a verified address, or — if the address has none (IPv6,
 /// or an IPv4 ending in .0, issue #26) — a fresh LowID flagged as LowID. Never
 /// a LowID-range id flagged as HighID.
-fn high_or_low_id(state: &ServerState, ip: IpAddr) -> (u32, bool) {
+fn high_or_low_id(state: &ServerState, ip: IpAddr, client_flags: u32) -> (u32, bool) {
     match crate::server::highid_probe::high_id_from_ip(ip) {
         Some(id) => (id, true),
-        None => (state.allocate_low_id(), false),
+        None => (state.allocate_low_id_for(client_flags), false),
     }
 }
 
@@ -619,7 +643,7 @@ pub async fn assign_client_id_for(
     // and this peer has none we know of. No probe, no HighID — its reachability
     // is published through the inline v6 source record instead.
     if peer_ip.is_ipv6() {
-        return (state.allocate_low_id(), false, peer_ip);
+        return (state.allocate_low_id_for(client_flags), false, peer_ip);
     }
 
     // A public address ending in .0 has no HighID: its id would fall in the
@@ -628,7 +652,7 @@ pub async fn assign_client_id_for(
         && high_id_from_ip(peer_ip).is_none()
     {
         debug!(ip = %peer_ip, "highid: address has no HighID (ends in .0) → LowID");
-        return (state.allocate_low_id(), false, peer_ip);
+        return (state.allocate_low_id_for(client_flags), false, peer_ip);
     }
 
     // admission.max_probe_jobs (issue #25): every outbound probe — this one,
@@ -639,7 +663,7 @@ pub async fn assign_client_id_for(
     let Some(_probe_permit) = state.admission.probes.try_take() else {
         state.admission.note_probe_shed();
         debug!(ip = %peer_ip, "highid: probe ceiling full → LowID");
-        return (state.allocate_low_id(), false, peer_ip);
+        return (state.allocate_low_id_for(client_flags), false, peer_ip);
     };
 
     if probe(peer_ip, client_port, probe_timeout).await {
@@ -673,13 +697,13 @@ pub async fn assign_client_id_for(
                         ip = %peer_ip, port = client_port,
                         "highid: wrong-hash mark active → LowID"
                     );
-                    return (state.allocate_low_id(), false, peer_ip);
+                    return (state.allocate_low_id_for(client_flags), false, peer_ip);
                 }
             }
-            let (id, high) = high_or_low_id(state, peer_ip);
+            let (id, high) = high_or_low_id(state, peer_ip, client_flags);
             return (id, high, peer_ip);
         }
-        let (id, high) = high_or_low_id(state, peer_ip);
+        let (id, high) = high_or_low_id(state, peer_ip, client_flags);
         // OBSERVE ONLY. The verdict above is already final and is returned
         // unchanged on the next line; this merely counts what the stricter,
         // Lugdunum-style check would have said. Detached, so the login does not
@@ -790,7 +814,7 @@ pub async fn assign_client_id_for(
                             lan_ip = %peer_ip, public_ip = %this_ip, port = client_port,
                             "hairpin: client verified behind our own NAT → HighID"
                         );
-                        let (id, high) = high_or_low_id(state, IpAddr::V4(this_ip));
+                        let (id, high) = high_or_low_id(state, IpAddr::V4(this_ip), client_flags);
                         return (id, high, IpAddr::V4(this_ip));
                     }
                     Ok(false) => {
@@ -813,7 +837,7 @@ pub async fn assign_client_id_for(
         }
     }
 
-    (state.allocate_low_id(), false, peer_ip)
+    (state.allocate_low_id_for(client_flags), false, peer_ip)
 }
 
 /// The identity probe as the HighID check runs it: obfuscated first when the
@@ -1655,6 +1679,74 @@ mod tests {
         assert_eq!(&idc.payload[12..16], &[93, 184, 216, 34]);
         let ident = build_server_ident(&cfg, &state, &client);
         assert_eq!(&ident.payload[16..20], &[85, 17, 116, 222]);
+    }
+
+    /// Issue #39: Lugdunum's NAT callback at login. The server flag 0x1000 for
+    /// everyone; four more IDCHANGE bytes (the TCP port as seen) only for a
+    /// client that set 0x1000; odd LowIDs for those clients, even for others.
+    #[test]
+    fn lugdunum_natt_at_login() {
+        let mut cfg = crate::config::Config::minimal_test_config();
+        cfg.server.this_ip = OUR_IP.to_string();
+        let cfg = std::sync::Arc::new(cfg);
+        let state = ServerState::new(
+            std::sync::Arc::new(crate::filter::ContentFilter::new()),
+            std::sync::Arc::clone(&cfg),
+        );
+        let mk = |flags: u32, high: bool| ClientHandle {
+            user_hash: [7; 16],
+            assigned_id: 43,
+            ip: IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            port: 4662,
+            udp_port: 0,
+            natt_capable: false,
+            nick: "t".into(),
+            server_flags: flags,
+            ipv6_capable: false,
+            ipv6: None,
+            is_high_id: high,
+            connected_at: Instant::now(),
+            country: "??".into(),
+            software: "test".into(),
+            software_detail: "test".into(),
+            login_fp: String::new(),
+            csam_attempts: 0,
+            soft_limit_warned: false,
+            offer_policy: None,
+            slot: Default::default(),
+            tx: None,
+            last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        let idc = |c: &ClientHandle, src: u16| {
+            build_welcome_batch_with(&cfg, &state, c, false, src)
+                .into_iter()
+                .find(|f| f.opcode == OP_IDCHANGE)
+                .unwrap()
+                .payload
+        };
+        // A stock client: 20 bytes, and the flag (harmless to it).
+        let p = idc(&mk(0x0319, false), 51000);
+        assert_eq!(p.len(), 20);
+        assert_ne!(u32::from_le_bytes(p[4..8].try_into().unwrap()) & 0x1000, 0);
+        // A Lugdunum NAT-T LowID: 24 bytes, the seen TCP source port last.
+        let p = idc(&mk(0x1319, false), 51000);
+        assert_eq!(p.len(), 24);
+        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 51000);
+        // A HighID: its own port.
+        let p = idc(&mk(0x1319, true), 51000);
+        assert_eq!(u32::from_le_bytes(p[20..24].try_into().unwrap()), 4662);
+        // Parity of LowIDs.
+        for _ in 0..5 {
+            assert_eq!(state.allocate_low_id_for(0x1000) & 1, 1);
+            assert_eq!(state.allocate_low_id_for(0x0319) & 1, 0);
+        }
+        // Switched off: no flag, no extra bytes, ids as they come.
+        let mut off = (*cfg).clone();
+        off.network.lugdunum_natt = false;
+        state.live_cfg.store(std::sync::Arc::new(off));
+        let p = idc(&mk(0x1319, false), 51000);
+        assert_eq!(p.len(), 20);
+        assert_eq!(u32::from_le_bytes(p[4..8].try_into().unwrap()) & 0x1000, 0);
     }
 
     #[test]

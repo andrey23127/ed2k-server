@@ -629,6 +629,19 @@ pub struct ServerState {
     /// written only by 0x9F sent from the session's own IP, and preferred by
     /// the hole-punch coordinator. Swept with `observed_udp_ports`.
     pub natt_udp_ports: DashMap<UserHash, (u16, Instant)>,
+    /// Each client's last Lugdunum NAT callback request (UDP 0xA6): its
+    /// endpoint, the key to answer it with, and its request allowance
+    /// (`server::lugdunum_natt`). Swept after `lugdunum_natt::SEEN_TTL`.
+    pub lugdunum_natt_seen: DashMap<UserHash, crate::server::lugdunum_natt::Seen>,
+    /// Clients that have sent a 0x9F from their session's address in this
+    /// session; the value says whether one of them came obfuscated (issue
+    /// #39). Having sent any 0x9F shows a client understands 0x61, so a
+    /// Lugdunum-only target is one without an entry. Cleared at login and
+    /// logout.
+    pub natt_keepalive_seen: DashMap<UserHash, bool>,
+    /// Hole-punch extension coordinations waiting for this target's next
+    /// 0x9F (`server::holepunch`). The 0x9F handler fires and removes them.
+    pub natt_keepalive_waiters: DashMap<UserHash, Vec<tokio::sync::oneshot::Sender<()>>>,
     /// Map of local UDP port → bound UdpSocket. Lets any handler send from a
     /// specific port (e.g. send an obfuscated reply from our :4675 even when
     /// the request came in on our :4665). Lugdunum's FUN_0042c480 looks up
@@ -1558,6 +1571,9 @@ impl ServerState {
             incoming_seed_challenges: DashMap::new(),
             observed_udp_ports: DashMap::new(),
             natt_udp_ports: DashMap::new(),
+            lugdunum_natt_seen: DashMap::new(),
+            natt_keepalive_seen: DashMap::new(),
+            natt_keepalive_waiters: DashMap::new(),
             our_sent_random_parts: DashMap::new(),
             udp_sockets: DashMap::new(),
             ip_filter: tokio::sync::RwLock::new(crate::filter::ipfilter::IpFilter::default()),
@@ -1682,6 +1698,22 @@ impl ServerState {
             self.search_rank_capped.load(Relaxed),
             self.search_total.load(Relaxed),
         )
+    }
+
+    /// A LowID for a client that sent `server_flags` at login: odd when it
+    /// set Lugdunum's NAT callback bit (0x1000), even otherwise, while
+    /// `network.lugdunum_natt` is on (see `server::lugdunum_natt`).
+    pub fn allocate_low_id_for(&self, server_flags: u32) -> u32 {
+        if !self.live_cfg.load().network.lugdunum_natt {
+            return self.allocate_low_id();
+        }
+        let odd = crate::server::lugdunum_natt::wants_odd_low_id(self, server_flags);
+        loop {
+            let id = self.allocate_low_id();
+            if (id & 1 == 1) == odd {
+                return id;
+            }
+        }
     }
 
     pub fn allocate_low_id(&self) -> u32 {

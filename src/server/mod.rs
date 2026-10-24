@@ -9,6 +9,7 @@ pub mod highid_probe;
 pub mod holepunch;
 pub mod keepalive;
 pub mod login;
+pub mod lugdunum_natt;
 pub mod obf_ping;
 pub mod obfuscated_conn;
 pub mod offer_pacing;

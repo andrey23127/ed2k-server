@@ -466,6 +466,7 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         // Its keepalive port goes too: a reconnect from another address
         // must not be handed out with the old mapping (issue #37).
         state.natt_udp_ports.remove(&c.user_hash);
+        state.natt_keepalive_seen.remove(&c.user_hash);
         // Retract the id→user mapping. Guarded inside by user hash.
         state.unindex_client_id(c.assigned_id, &c.user_hash);
         state.remove_sources_of(&c.user_hash);
@@ -680,6 +681,8 @@ async fn dispatch(
                     state.client_ipv6.remove(&new_client.user_hash);
                 }
             }
+            // A new session proves its 0x9F handling afresh (issue #39).
+            state.natt_keepalive_seen.remove(&new_client.user_hash);
             let prev = state
                 .clients
                 .insert(new_client.user_hash, new_client.clone());
@@ -723,7 +726,7 @@ async fn dispatch(
             *client = Some(new_client.clone());
             let ident = wants_v1 || crate::server::login::ident_at_login(&new_client);
             sess.ident_sent = ident;
-            for f in crate::server::login::build_welcome_batch_with(cfg, state, &new_client, ident) {
+            for f in crate::server::login::build_welcome_batch_with(cfg, state, &new_client, ident, peer.port()) {
                 framed.send(f).await?;
             }
         }
@@ -1010,21 +1013,10 @@ async fn dispatch(
                     state.admission.note_relay_rejected();
                     return Ok(());
                 }
-                crate::server::holepunch::handle_holepunch_request(
-                    state,
-                    &c.user_hash,
-                    c.assigned_id,
-                    c.ip,
-                    c.port,
-                    requester_udp_port,
-                    target_id,
-                );
-                // Best-effort: re-coordinate a couple of times over the next few
-                // seconds so a lost/late INFO on the server TCP link doesn't
-                // leave the two peers punching at non-overlapping times. Detached
-                // task; reuses the same handler, sends nothing new on success.
-                crate::server::holepunch::schedule_info_retries(
-                    std::sync::Arc::clone(state_arc),
+                // Today's punch, or the extension when both peers use it,
+                // with the resends and the bridge (issue #39).
+                crate::server::holepunch::request(
+                    state_arc,
                     c.user_hash,
                     c.assigned_id,
                     c.ip,

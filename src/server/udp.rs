@@ -742,6 +742,43 @@ impl UdpServer {
         send_reply(&self.socket, bytes, peer, obf).await
     }
 
+    /// Lugdunum's NAT callback (`server::lugdunum_natt`): forward a 0xA6 to
+    /// its target, by TCP 0x37 or UDP 0xA7. The requester is never answered,
+    /// as on Lugdunum; refusals are only counted.
+    async fn handle_nat_callback(&self, payload: &[u8], peer: SocketAddr, obf: Option<(u32, u8)>) {
+        use crate::server::lugdunum_natt::{handle_request, Forward};
+        let local_port = self.socket.local_addr().map_or(0, |a| a.port());
+        let key = match handle_request(&self.state, payload, peer, obf, local_port) {
+            Ok(Forward::Tcp { target, frame }) => {
+                if let Some(t) = self.state.clients.get(&target) {
+                    let outcome = t.send_frame(frame);
+                    self.state
+                        .admission
+                        .push
+                        .note(crate::admission::PushKind::Holepunch, outcome);
+                }
+                "natcb_forwarded_tcp"
+            }
+            Ok(Forward::Udp { addr, obf, local_port, packet }) => {
+                // From the port the target sent its own request to: a client
+                // takes a server-way datagram only from the server's ports.
+                let sock = self
+                    .state
+                    .udp_sockets
+                    .get(&local_port)
+                    .map(|s| Arc::clone(&s))
+                    .unwrap_or_else(|| Arc::clone(&self.socket));
+                let _ = send_reply(&sock, &packet, addr, Some(obf)).await;
+                "natcb_forwarded_udp"
+            }
+            Err(r) => {
+                debug!(ip = %peer.ip(), reason = r.stat_key(), "Lugdunum NAT callback not forwarded");
+                r.stat_key()
+            }
+        };
+        *self.state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+    }
+
     /// `obf`: how the request was obfuscated, or None if it arrived in the clear.
     /// Replies must mirror it — see `reply()`.
     async fn dispatch(
@@ -854,7 +891,26 @@ impl UdpServer {
                         // address: a user hash is no secret, and a keepalive
                         // from elsewhere would send the client's peers there.
                         let same_ip = canon_ip(h.ip) == canon_ip(peer.ip());
-                        if same_ip {
+                        // Issue #39: on a server offering the extension, once
+                        // a session has sent an obfuscated 0x9F its plain
+                        // ones are ignored. Only the server key makes one,
+                        // so a forged plain datagram cannot move its port.
+                        let sent_obfuscated = self
+                            .state
+                            .natt_keepalive_seen
+                            .get(&uh)
+                            .is_some_and(|o| *o);
+                        let plain_refused = obf.is_none()
+                            && sent_obfuscated
+                            && crate::server::holepunch::extension_enabled(&self.state.live_cfg.load());
+                        if plain_refused {
+                            *self
+                                .state
+                                .block_stats
+                                .entry("natt_keepalive_plain_ignored".to_string())
+                                .or_insert(0) += 1;
+                        }
+                        if same_ip && !plain_refused {
                             // Issue #37: kept per client. The login port
                             // (`udp_port`, 0xF9) stays as announced; it is
                             // filled from here only if the client sent none,
@@ -865,16 +921,24 @@ impl UdpServer {
                             self.state
                                 .natt_udp_ports
                                 .insert(uh, (peer.port(), std::time::Instant::now()));
+                            self.state
+                                .natt_keepalive_seen
+                                .insert(uh, sent_obfuscated || obf.is_some());
                         }
                         // Count this UDP keepalive as client activity so the TCP
                         // connection task's idle timer is reset. A NAT-T LowID
                         // source is otherwise silent on TCP and would be wrongly
                         // evicted after the idle timeout despite a live link.
                         h.touch_activity();
-                        same_ip
+                        same_ip && !plain_refused
                     } else {
                         false
                     };
+                    // An extension coordination waiting for this client's
+                    // fresh port can go ahead (issue #39).
+                    if matched {
+                        crate::server::holepunch::keepalive_arrived(&self.state, &uh);
+                    }
                     // DIAGNOSTIC: shows in the server log whether NAT-T keepalives
                     // actually arrive and whether the userhash matches a connected
                     // client. "matched=false" also when the keepalive came from
@@ -898,6 +962,13 @@ impl UdpServer {
                             .insert(v4, (peer.port(), std::time::Instant::now()));
                     }
                 }
+                Ok(())
+            }
+            // Lugdunum's NAT callback request (issue #39). In eNode-go's
+            // dialect 0xA6 is server->client only, so nothing else arrives
+            // here with it.
+            crate::server::lugdunum_natt::OP_NAT_CALLBACK_REQUEST => {
+                self.handle_nat_callback(payload, peer, obf).await;
                 Ok(())
             }
             OP_GLOB_SERVSTATREQ => self.handle_servstat(payload, peer, obf).await,

@@ -935,6 +935,23 @@ pub struct NetworkConfig {
     #[serde(default = "default_highid_wrong_hash_ttl_secs")]
     pub highid_wrong_hash_ttl_secs: u64,
 
+    /// Lugdunum's NAT callback (issue #39): flag 0x1000 in `OP_IDCHANGE`,
+    /// odd LowIDs and a 24-byte `OP_IDCHANGE` for clients that set 0x1000 at
+    /// login, UDP 0xA6 requests forwarded as TCP 0x37 / UDP 0xA7. Runs
+    /// beside this server's own hole punch (0x60-0x62). Default on.
+    #[serde(default = "default_true")]
+    pub lugdunum_natt: bool,
+
+    /// The hole-punch extension (issue #39): flag 0x100000 in `OP_IDCHANGE`.
+    /// Only for a pair of clients that both announced 0x100000 and 0x1000 at
+    /// login: a 0x60 wakes the target with 0x37, the server waits up to 3 s
+    /// for the target's fresh 0x9F before sending 0x61 (30 bytes, with the
+    /// peer's crypt setting), and a session that sent an obfuscated 0x9F has
+    /// its plain ones ignored. Every other client sees no change. Needs
+    /// `lugdunum_natt`. Default on.
+    #[serde(default = "default_true")]
+    pub holepunch_extension: bool,
+
     /// Accept client connections over IPv6, on the same TCP port.
     ///
     /// A separate listener rather than a dual-stack socket: the IPv4 path stays

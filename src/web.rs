@@ -727,6 +727,20 @@ struct StatusResp {
     ipv6_sources: u64,
     /// How many LowID↔LowID hole punches the server has coordinated since start.
     natt_coordinated: u64,
+    /// Connected clients that set Lugdunum's NAT callback bit (0x1000).
+    natcb_capable_clients: u64,
+    /// Lugdunum NAT callbacks forwarded (TCP 0x37, UDP 0xA7) and refused.
+    natcb_forwarded_tcp: u64,
+    natcb_forwarded_udp: u64,
+    natcb_refused: u64,
+    /// The hole-punch extension (issue #39): clients that announced it, and
+    /// coordinations started, released by the target's 0x9F, or timed out;
+    /// 0x37 bridges to Lugdunum-only targets.
+    hpext_clients: u64,
+    hpext_started: u64,
+    hpext_fresh: u64,
+    hpext_timeout: u64,
+    hp_bridged: u64,
 }
 
 async fn api_status(
@@ -778,6 +792,34 @@ async fn api_status(
             .get("holepunch_coordinated")
             .map(|v| *v)
             .unwrap_or(0),
+        natcb_capable_clients: s
+            .server
+            .clients
+            .iter()
+            .filter(|c| c.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0)
+            .count() as u64,
+        natcb_forwarded_tcp: s.server.block_stats.get("natcb_forwarded_tcp").map_or(0, |v| *v),
+        natcb_forwarded_udp: s.server.block_stats.get("natcb_forwarded_udp").map_or(0, |v| *v),
+        natcb_refused: s
+            .server
+            .block_stats
+            .iter()
+            .filter(|e| e.key().starts_with("natcb_") && !e.key().starts_with("natcb_forwarded"))
+            .map(|e| *e.value())
+            .sum(),
+        hpext_clients: {
+            const BOTH: u32 = crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT
+                | crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL;
+            s.server
+                .clients
+                .iter()
+                .filter(|c| c.server_flags & BOTH == BOTH)
+                .count() as u64
+        },
+        hpext_started: s.server.block_stats.get("holepunch_ext_started").map_or(0, |v| *v),
+        hpext_fresh: s.server.block_stats.get("holepunch_ext_fresh").map_or(0, |v| *v),
+        hpext_timeout: s.server.block_stats.get("holepunch_ext_timeout").map_or(0, |v| *v),
+        hp_bridged: s.server.block_stats.get("holepunch_bridged").map_or(0, |v| *v),
     })
 }
 
@@ -3916,7 +3958,9 @@ async function refreshStatus() {
      <tr><td>NAT-T capable clients</td><td>${fmt(st.natt_capable_clients)} <span style="color:#6b7280;font-size:.75rem">connected clients with the NAT-traversal mod</span></td></tr>
      <tr><td>IPv6-capable clients</td><td>${fmt(st.ipv6_clients)} <span style="color:#6b7280;font-size:.75rem">sessions that can parse an inline IPv6 source record</span></td></tr>
      <tr><td>IPv6 publishers</td><td>${fmt(st.ipv6_sources)} <span style="color:#6b7280;font-size:.75rem">connected clients with a usable IPv6 address</span></td></tr>
-     <tr><td>NAT-T punches coordinated</td><td>${fmt(st.natt_coordinated)} <span style="color:#6b7280;font-size:.75rem">LowID↔LowID since start</span></td></tr>
+     <tr><td>NAT-T punches coordinated</td><td>${fmt(st.natt_coordinated)} <span style="color:#6b7280;font-size:.75rem">LowID↔LowID since start (0x60 → 0x61 to both)</span></td></tr>
+     <tr><td>Lugdunum NAT callbacks</td><td>${fmt(st.natcb_forwarded_tcp + st.natcb_forwarded_udp)} forwarded (TCP 0x37 ${fmt(st.natcb_forwarded_tcp)} · UDP 0xA7 ${fmt(st.natcb_forwarded_udp)}) · ${fmt(st.natcb_refused)} refused · ${fmt(st.natcb_capable_clients)} capable clients <span style="color:#6b7280;font-size:.75rem">0xA6 requests from clients that set 0x1000 at login; reasons in the Blocks tab (natcb_*)</span></td></tr>
+     <tr><td>Hole punch extension</td><td>${fmt(st.hpext_started)} started · ${fmt(st.hpext_fresh)} with a fresh 0x9F · ${fmt(st.hpext_timeout)} after the 3 s wait · ${fmt(st.hpext_clients)} clients · ${fmt(st.hp_bridged)} bridged <span style="color:#6b7280;font-size:.75rem">0x60 between two clients with 0x100000; bridged = 0x37 to a Lugdunum-only target</span></td></tr>
      <tr><td>obf_decode_cache</td><td>${fmt(st.obf_decode_cache_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 8192)</span></td></tr>
      <tr><td>seed_challenges</td><td>${fmt(st.incoming_seed_challenges_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 2048)</span></td></tr>
      </table>`;
