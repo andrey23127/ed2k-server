@@ -497,6 +497,22 @@ impl ContentFilter {
     }
 
     pub fn check(&self, file_hash: &[u8; 16], filename: &str) -> FilterResult {
+        self.check_inner(file_hash, filename, true)
+    }
+
+    /// Is this hash on the false-positive whitelist?
+    pub fn is_whitelisted(&self, file_hash: &[u8; 16]) -> bool {
+        self.hash_whitelist.load().contains(file_hash)
+    }
+
+    /// What every layer except the whitelist says. For reports that must show
+    /// a whitelisted file next to the layer it would otherwise trip
+    /// (`/api/indexcheck`); never for a publish decision.
+    pub fn check_ignoring_whitelist(&self, file_hash: &[u8; 16], filename: &str) -> FilterResult {
+        self.check_inner(file_hash, filename, false)
+    }
+
+    fn check_inner(&self, file_hash: &[u8; 16], filename: &str, whitelist: bool) -> FilterResult {
         // Whitelist first, and it now overrides EVERY layer rather than only the
         // hash lists.
         //
@@ -512,7 +528,7 @@ impl ContentFilter {
         //
         // An operator putting a hash here has looked at the file and ruled it
         // legal. That ruling now stands against every layer.
-        if self.hash_whitelist.load().contains(file_hash) {
+        if whitelist && self.hash_whitelist.load().contains(file_hash) {
             return FilterResult::Allow;
         }
 

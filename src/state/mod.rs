@@ -533,6 +533,9 @@ impl Default for HighIdObserve {
     }
 }
 
+/// Size disagreements kept for `/api/sizemismatch`.
+pub const SIZE_MISMATCH_RECENT_MAX: usize = 1000;
+
 pub struct ServerState {
     pub clients: DashMap<UserHash, ClientHandle>,
     /// FileId slab (Stage 3): the single authoritative file store. Holds every
@@ -570,6 +573,12 @@ pub struct ServerState {
     /// Keyed by user hash rather than by FileId for the same reason: one entry
     /// per client, not per published file.
     pub client_ipv6: DashMap<UserHash, std::net::Ipv6Addr>,
+    /// The dial-back of each client's IPv6 (issue #43): the address it is
+    /// about and its verdict. Removed with the session.
+    pub ipv6_probe: DashMap<UserHash, crate::server::ipv6_probe::Probe>,
+    /// This host has a route to the IPv6 internet; checked at start and in
+    /// the sweep. Without it the dial-back is off.
+    pub ipv6_route: std::sync::atomic::AtomicBool,
     pub filter: Arc<ContentFilter>,
     next_low_id: AtomicU32,
     pub total_sessions: AtomicU32,
@@ -642,6 +651,44 @@ pub struct ServerState {
     /// Hole-punch extension coordinations waiting for this target's next
     /// 0x9F (`server::holepunch`). The 0x9F handler fires and removes them.
     pub natt_keepalive_waiters: DashMap<UserHash, Vec<tokio::sync::oneshot::Sender<()>>>,
+    /// Cross-server NAT callback (issue #40): each foreign requester's
+    /// allowance and the targets it named, by source IP. Swept when idle.
+    pub natcb_foreign_sources: DashMap<IpAddr, crate::server::lugdunum_natt::ForeignSource>,
+    /// Foreign wake-ups each target got in the last minute.
+    pub natcb_foreign_wakes: DashMap<UserHash, std::collections::VecDeque<Instant>>,
+    /// When each user hash last had its live session probed because a login
+    /// with the same hash came from elsewhere (issue #41). Swept after a
+    /// minute.
+    pub takeover_probes: DashMap<UserHash, Option<Instant>>,
+    /// Last 0x60 per (requester, target), to count repeats (NAT-T analysis).
+    /// Swept after ten minutes.
+    pub holepunch_recent: DashMap<(UserHash, u32), Instant>,
+    /// Contested logins refused (issue #41), by (user hash, contender source):
+    /// when the contender was last probed against the owner, and how many
+    /// times it was refused. Read by /api/takeover; swept after an hour idle.
+    pub takeover_lost: DashMap<(UserHash, IpAddr), (Instant, u32)>,
+    /// Last 0x9F from another address than the session's, per client, so the
+    /// detail log gets one entry a minute at most. Swept after an hour.
+    pub wrong_ip_9f_seen: DashMap<UserHash, Instant>,
+    /// Undecodable obfuscated UDP from an address with a logged-in session:
+    /// when each address was last looked into (at most once a minute).
+    pub undecodable_from_session_seen: DashMap<IpAddr, Instant>,
+    /// The last NAT-T requests in detail (who asked, for whom, what came of
+    /// it), for /api/natt. Bounded at `NATT_RECENT_MAX`.
+    pub natt_recent: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    /// The last size disagreements (issue #45), for `/api/sizemismatch`.
+    pub size_mismatch_recent: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+    /// Targets whose extension wait just timed out, to count a 0x9F that
+    /// arrives late. Swept after a minute.
+    pub ext_timed_out: DashMap<UserHash, Instant>,
+    /// Obfuscated-UDP decode: answered by the cached key, decoded on the cold
+    /// path (up to nine attempts), not decoded at all.
+    pub obf_decode_hits: std::sync::atomic::AtomicU64,
+    pub obf_decode_cold: std::sync::atomic::AtomicU64,
+    pub obf_decode_failed: std::sync::atomic::AtomicU64,
+    /// Crypt pings (eMule's obfuscated status ping to TCP+12): not obfuscated
+    /// eD2k, answered with an obfuscated 0x97. Counted apart from failures.
+    pub obf_crypt_pings: std::sync::atomic::AtomicU64,
     /// Map of local UDP port → bound UdpSocket. Lets any handler send from a
     /// specific port (e.g. send an obfuscated reply from our :4675 even when
     /// the request came in on our :4665). Lugdunum's FUN_0042c480 looks up
@@ -737,7 +784,11 @@ pub struct ServerState {
     /// UDP datagram from a given sender. formula_id: 0=Plain, 1=ObfA5, 2=Obf6B.
     /// Massively reduces CPU on the hot path: a busy peer that sends many obf
     /// packets only triggers ONE decode attempt per packet instead of 9.
-    pub obf_decode_cache: DashMap<SocketAddrV4, (u32, u8)>,
+    /// The third field is when the entry was made (`file_slab.now_secs()`):
+    /// entries are aged out after `OBF_CACHE_TTL_SECS` rather than the whole
+    /// map being cleared at a fixed size, which at 17k clients emptied it
+    /// every minute and sent every obfuscated sender back to the cold path.
+    pub obf_decode_cache: DashMap<SocketAddrV4, (u32, u8, u32)>,
     /// Hot-reloadable config snapshot. Updated by `POST /api/config`. Handlers
     /// that need live values (limits, server name/desc, version, this_ip, log)
     /// read `state.live_cfg.load()` instead of using a fixed Arc<Config>.
@@ -1560,6 +1611,8 @@ impl ServerState {
             // Fixed for the life of the index — see LimitsConfig::index_subtokens.
             keyword_index: KeywordIndex::with_subtokens(cfg.limits.index_subtokens),
             client_ipv6: DashMap::new(),
+            ipv6_probe: DashMap::new(),
+            ipv6_route: std::sync::atomic::AtomicBool::new(false),
             smart_sources: SmartSourcesCache::new(),
             offer_lane: Arc::new(tokio::sync::Semaphore::new(OFFER_JOBS)),
             filter,
@@ -1574,6 +1627,20 @@ impl ServerState {
             lugdunum_natt_seen: DashMap::new(),
             natt_keepalive_seen: DashMap::new(),
             natt_keepalive_waiters: DashMap::new(),
+            natcb_foreign_sources: DashMap::new(),
+            natcb_foreign_wakes: DashMap::new(),
+            takeover_probes: DashMap::new(),
+            holepunch_recent: DashMap::new(),
+            takeover_lost: DashMap::new(),
+            wrong_ip_9f_seen: DashMap::new(),
+            undecodable_from_session_seen: DashMap::new(),
+            natt_recent: Default::default(),
+            size_mismatch_recent: Default::default(),
+            ext_timed_out: DashMap::new(),
+            obf_decode_hits: Default::default(),
+            obf_decode_cold: Default::default(),
+            obf_decode_failed: Default::default(),
+            obf_crypt_pings: Default::default(),
             our_sent_random_parts: DashMap::new(),
             udp_sockets: DashMap::new(),
             ip_filter: tokio::sync::RwLock::new(crate::filter::ipfilter::IpFilter::default()),
@@ -1845,6 +1912,81 @@ impl ServerState {
         }
     }
 
+    /// A sized source request for a file whose record holds another size
+    /// (issue #45). Answered with no sources: they belong to a different
+    /// file. 0 on either side is unknown.
+    /// Keep one size disagreement for `/api/sizemismatch` (issue #45): which
+    /// file, the stored and the other size, and who: the publisher, or the
+    /// requester of a sized source request. Hashes and addresses only, never
+    /// a name. The last `SIZE_MISMATCH_RECENT_MAX`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn note_size_mismatch(
+        &self,
+        kind: &str,
+        hash: &FileHash,
+        stored: u64,
+        other: u64,
+        ip: IpAddr,
+        user_hash: Option<&UserHash>,
+        complete: Option<bool>,
+    ) {
+        let software = user_hash
+            .and_then(|h| self.clients.get(h).map(|c| c.software_detail.clone()));
+        let ev = serde_json::json!({
+            "at": self.file_slab.now_secs(),
+            "kind": kind,
+            "hash": hex::encode(hash),
+            "stored_size": stored,
+            "other_size": other,
+            "ip": ip.to_string(),
+            "user_hash": user_hash.map(hex::encode),
+            "software": software,
+            "complete": complete,
+        });
+        if let Ok(mut q) = self.size_mismatch_recent.lock() {
+            if q.len() >= SIZE_MISMATCH_RECENT_MAX {
+                q.pop_front();
+            }
+            q.push_back(ev);
+        }
+    }
+
+    pub fn size_mismatch(
+        &self,
+        hash: &FileHash,
+        size: Option<u64>,
+        udp: bool,
+        requester: IpAddr,
+    ) -> bool {
+        let Some(want) = size.filter(|s| *s != 0) else { return false };
+        let stored = self
+            .file_slab
+            .with_record_by_hash(hash, |_id, r| r.size)
+            .unwrap_or(0);
+        let differs = !crate::state::file_id::sizes_agree(stored, want);
+        if differs {
+            // Which side is larger tells a wrong link (asked bigger or
+            // smaller than every publisher) from anything systematic.
+            let key = match (udp, want > stored) {
+                (false, true) => "getsources_size_mismatch_tcp_larger",
+                (false, false) => "getsources_size_mismatch_tcp_smaller",
+                (true, true) => "getsources_size_mismatch_udp_larger",
+                (true, false) => "getsources_size_mismatch_udp_smaller",
+            };
+            *self.block_stats.entry(key.to_string()).or_insert(0) += 1;
+            self.note_size_mismatch(
+                if udp { "request_udp" } else { "request_tcp" },
+                hash,
+                stored,
+                want,
+                requester,
+                None,
+                None,
+            );
+        }
+        differs
+    }
+
     pub fn add_file_with_source(
         &self,
         hash: FileHash,
@@ -1862,13 +2004,37 @@ impl ServerState {
         let (file_id, newly_added) = self.file_slab.get_or_insert(hash, size, &name, src);
         if !newly_added {
             // Records the source and, in the same shard lock, tells us whether
-            // this publisher used a different name than the one already stored.
-            if let Some(stored) = self
+            // this publisher used a different name than the one already stored,
+            // or another size (issue #45: then it is not merged at all).
+            use crate::state::file_id::SizedMerge;
+            match self
                 .file_slab
-                .add_or_refresh_source_named(&hash, src, &name)
+                .add_or_refresh_source_sized(&hash, size, src, &name)
             {
-                let published: Arc<str> = Arc::from(name.as_str());
-                self.note_alias(hash, size, &stored, &published);
+                SizedMerge::Merged(Some(stored)) => {
+                    let published: Arc<str> = Arc::from(name.as_str());
+                    self.note_alias(hash, size, &stored, &published);
+                }
+                SizedMerge::Merged(None) => {}
+                SizedMerge::SizeMismatch(stored) => {
+                    *self
+                        .block_stats
+                        .entry("offer_size_mismatch".to_string())
+                        .or_insert(0) += 1;
+                    self.note_size_mismatch(
+                        "offer",
+                        &hash,
+                        stored,
+                        size,
+                        source.1,
+                        Some(&publisher_hash),
+                        Some(source.3),
+                    );
+                    return;
+                }
+                // Evicted between the two calls: rare, and the next publish
+                // creates it again.
+                SizedMerge::Unknown => return,
             }
         } else {
             self.keyword_index.add_file(file_id, &name);
@@ -2239,7 +2405,7 @@ impl ServerState {
         misc += dm_slots(self.server_list_added_at.capacity(), IPV4, INSTANT);
         misc += dm_slots(self.csam_unique_ips.capacity(), IPADDR, 8);
         misc += dm_slots(self.csam_blocked_hashes.capacity(), UHASH, 16);
-        misc += dm_slots(self.obf_decode_cache.capacity(), SOCKV4, 5);
+        misc += dm_slots(self.obf_decode_cache.capacity(), SOCKV4, 9);
         misc += dm_slots(self.banned_bots.capacity(), IPADDR, INSTANT);
         misc += dm_slots(self.banned_publishers.capacity(), UHASH, INSTANT);
         misc += dm_slots(self.bot_query_log.capacity(), IPADDR, size_of::<BotTracker>());
@@ -2368,6 +2534,21 @@ impl ServerState {
     /// have already been tombstoned, so `id_of(hash)` would resolve to None and
     /// purge nothing — leaving dead ids in `user_files` forever (an RSS leak).
     /// FileId values stay valid after tombstone, so this works regardless.
+    /// Take files out of the index whatever their sources: the slab record,
+    /// its keywords and the reverse index. For files the content filter now
+    /// refuses (`/api/indexcheck?purge=1`). Returns how many were live.
+    pub fn purge_files(&self, ids: &[file_id::FileId]) -> usize {
+        let mut n = 0;
+        for id in ids {
+            if let Some(name) = self.file_slab.tombstone_take_name(*id) {
+                self.keyword_index.remove_file(*id, &name);
+                n += 1;
+            }
+        }
+        self.purge_ids_from_user_files(ids);
+        n
+    }
+
     pub fn purge_ids_from_user_files(&self, ids: &[file_id::FileId]) {
         if ids.is_empty() {
             return;

@@ -33,6 +33,10 @@ pub const OP_GETSOURCES_OBFU: u8 = 0x23;
 // have to parse it out of the login tags, which not all clients send reliably).
 //   payload: target_id(4) + requester_udp_port(2)
 pub const OP_LOWID_HOLEPUNCH_REQUEST: u8 = 0x60;
+/// Internal, never on the wire: a frame with this opcode on a session's push
+/// channel asks its task to probe the connection (issue #41) — a short
+/// `TCP_USER_TIMEOUT`, then the payload sent as `OP_SERVERSTATUS`.
+pub const INTERNAL_PROBE: u8 = 0x00;
 // Server→both clients: each side is told the other's address so they can punch.
 //   payload: peer_ip(4 LE) + peer_tcp_port(2 LE) + peer_udp_port(2 LE)
 //          + peer_user_hash(16) + role(1)   role: 0 = you initiate, 1 = you wait
@@ -227,7 +231,18 @@ pub const SRVFLG_LOWID_HOLEPUNCH: u32 = 0x0002_0000;
 /// 0x61, 30 bytes with the peer's crypt setting appended. 0x40000 and 0x80000
 /// belong to eNode-go (`FlagNatRendezvous`, `FlagServerSearch`); 0x100000 is
 /// the first bit nobody uses, on the server side and the client side.
+///
+/// The same value in the UDP flags of the status reply (and `ST_UDPFLAGS` at
+/// login) says the server also takes `0xA6` from clients logged in elsewhere
+/// (issue #40), in every status reply, to clients and servers.
 pub const SRVFLG_HOLEPUNCH_EXT: u32 = 0x0010_0000;
+
+/// `OP_IDCHANGE`: the server dials a client's IPv6 back before publishing it
+/// (issue #43), so `ST_IPV6_STATUS` carries `IPV6ST_PROBED` and may arrive
+/// again in a later `OP_SERVERIDENT` once the verdict is in. Set only while
+/// the server has an IPv6 route to dial with. 0x200000 is eNode-go's
+/// (NAT wake); 0x400000 is the next free bit.
+pub const SRVFLG_IPV6_PROBE: u32 = 0x0040_0000;
 
 // OFFERFILES self-source markers - SPEC.md §3.3
 pub const SELF_COMPLETE_ID: u32 = 0xFBFB_FBFB;

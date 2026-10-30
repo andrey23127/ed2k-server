@@ -8,7 +8,47 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::path::Path;
 
+/// User hashes shared by many clients: DLP antiLeech's community / corrupt /
+/// invalid hashes (persmule/amule-dlp.antiLeech, antiLeech.cpp), and one
+/// observed here (the last).
+pub const DLP_SHARED_USER_HASHES: &[&str] = &[
+    "00000000000E00000000000000006F00",
+    "0B76CC42CB0E81B0DC6120D2BCB36FF9",
+    "154CE646120E96CC798C439A20D26F8D",
+    "36725093E00E9350F7680C871E946FD1",
+    "3F44A7996F0E17D1F4B319EB58B26F64",
+    "455361F9D95C3CD7E6BF2192D1CB3D02",
+    "559ACC89D80E90C50A7A0CD3224F6F57",
+    "596B305E050EA842CE38DF3811216F3F",
+    "5E02F74DBA0E8A19DBF6733F0AE66F4A",
+    "65C3B2E8940E582630A7F58AF9F26F9E",
+    "66B002DADE0E6DBEDF4FCCAA380E6FD4",
+    "6AE1D2DF4B0E8707B6F6BC29E8746F0F",
+    "769D36987E0E313A1501967D0F146F7A",
+    "888F4742450EF75F9DD8B7E53FA06FF0",
+    "8A537F20B80EF9AF02E59E6C087C6F6B",
+    "9BA09B83DC0EE78BE20280C387936F00",
+    "A2221641460E961C8B7FF21A53FB6F6C",
+    "AAEE84C0C30E247CBB99B459255D6F99",
+    "B1798B2F620E0B676452C6E2EF706F13",
+    "B6491292AE0E07AC8C6045CAC2DD6F9F",
+    "C1533316C00E3E0D0218843A05E46FAC",
+    "C8B5F41441C615FBABAD9A7E55294D01",
+    "C92859E4860EA0F15F7837750C886FB6",
+    "C9E61DEEF30E0360E2741C9CF1396F94",
+    "CB42F563EE0EA7907395420CAC146FF5",
+    "D0D897BD360EEFF329903E04990B6F86",
+    "DA1CEEE05B0E5319B3B48CAED24C6F4A",
+    "EAA383FD9E0E68538C7AC8AD15526F7A",
+    "FE000000000E00000000000000006F00",
+    "FE10F3C0610E0A925B85204CE8456F42",
+    // Not from DLP: mldonkey 3.1.x, seen on ed2k-rust from many addresses in
+    // many countries at once, its owner changing all the time.
+    "3649E68B070E85991648EF223A7F6FFD",
+];
+
 #[derive(Debug, Deserialize, Clone)]
+
 pub struct Config {
     pub server: ServerConfig,
     pub network: NetworkConfig,
@@ -945,12 +985,22 @@ pub struct NetworkConfig {
     /// The hole-punch extension (issue #39): flag 0x100000 in `OP_IDCHANGE`.
     /// Only for a pair of clients that both announced 0x100000 and 0x1000 at
     /// login: a 0x60 wakes the target with 0x37, the server waits up to 3 s
-    /// for the target's fresh 0x9F before sending 0x61 (30 bytes, with the
+    /// for the target's fresh 0x9F before sending 0x61 (30 bytes, as every 0x61; the
     /// peer's crypt setting), and a session that sent an obfuscated 0x9F has
     /// its plain ones ignored. Every other client sees no change. Needs
     /// `lugdunum_natt`. Default on.
     #[serde(default = "default_true")]
     pub holepunch_extension: bool,
+
+    /// Cross-server NAT callback (issue #40): accept Lugdunum's UDP `0xA6`
+    /// from a client that is not logged in here (requester id 0), for a
+    /// target that is. The target gets the usual `0x37`; a target with the
+    /// extension answers with `0x9F` and the requester then gets the target's
+    /// endpoint by UDP `0xA7`. Announced with 0x100000 in the UDP flags of the
+    /// status reply, to clients and servers alike. Limited per source IP and
+    /// per target. Needs `holepunch_extension`. Default on.
+    #[serde(default = "default_true")]
+    pub holepunch_foreign: bool,
 
     /// Accept client connections over IPv6, on the same TCP port.
     ///
@@ -978,6 +1028,18 @@ pub struct NetworkConfig {
     /// watching how it behaves.
     #[serde(default)]
     pub ipv6_publish_sources: bool,
+
+    /// Dial a client's IPv6 back before publishing it (issue #43): the
+    /// identity probe to `[v6]:login port` must answer with the user hash that
+    /// logged in. Until it does the address is not published, and the verdict
+    /// goes to the client in `ST_IPV6_STATUS` with `IPV6ST_PROBED`. Takes
+    /// probe slots from the same server-wide ceiling as the HighID probe; a
+    /// login that finds it full is left unpublished. Only in force with
+    /// `ipv6_publish_sources` and an IPv6 route on this host; announced with
+    /// 0x400000 in `OP_IDCHANGE`. Off: the address is published on trust, as
+    /// before. Default on.
+    #[serde(default = "default_true")]
+    pub ipv6_probe: bool,
 }
 
 fn default_listen_ip6() -> String {
@@ -1010,12 +1072,35 @@ pub struct LimitsConfig {
     /// exempt, `0` = no cap. Live.
     #[serde(default = "default_per_ip")]
     pub max_clients_per_ip: u32,
+    /// A login with a user hash that is already online replaces that session
+    /// only from the same source (the same IPv4, or the same IPv6 prefix of
+    /// `admission.ipv6_source_prefix_bits`), from the IPv6 the IPv4 session
+    /// advertised with the same listen port, or when the old session is
+    /// already gone (issue #41). Any other is refused: user hashes are public.
+    /// `true` restores the old rule, where any address takes the session
+    /// over. Live.
+    #[serde(default)]
+    pub hash_takeover_from_any_address: bool,
+    /// User hashes known to be shared by many installs (issue #41): for
+    /// these the newest login takes the session, as before 0.9.86, since they
+    /// identify no one. Hex, case-insensitive, IN ADDITION to the built-in
+    /// list (`DLP_SHARED_USER_HASHES`: the community, corrupt and invalid
+    /// user hashes of DLP's antiLeech) — add ones `/api/takeover` turns up.
+    /// Degenerate hashes (12+ zero bytes) are shared without being listed.
+    /// Live.
+    #[serde(default)]
+    pub shared_user_hashes: Vec<String>,
     /// Max bytes stored for a file name or nick, cut at a character boundary
     /// AFTER the content filter has seen the whole name. `0` = no cap. Live.
     #[serde(default = "default_max_string")]
     pub max_string_size: u32,
     #[serde(default = "default_ping_delay")]
     pub ping_delay_seconds: u64,
+    /// How long a TCP GETSOURCES answer is reused for the same file, seconds
+    /// (1-600). The Status "Cache hits" row shows how old the entries were
+    /// when a request missed them, to choose it by. Default 120. Live.
+    #[serde(default = "default_getsources_cache_secs")]
+    pub getsources_cache_secs: u64,
 
     /// Maximum file records returned for one search, across all pages.
     ///
@@ -1314,6 +1399,10 @@ fn default_per_ip() -> u32 {
 fn default_max_string() -> u32 {
     250
 }
+fn default_getsources_cache_secs() -> u64 {
+    crate::state::smart_sources::DEFAULT_TTL_SECS
+}
+
 fn default_ping_delay() -> u64 {
     300
 }

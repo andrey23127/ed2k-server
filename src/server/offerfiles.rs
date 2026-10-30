@@ -112,8 +112,13 @@ pub fn parse_offerfiles(payload: &[u8]) -> Result<Vec<OfferedFile>> {
                         }
                     }
                     FT_FILESIZE => {
+                        // A 64-bit tag carries the whole size; eMule sends a
+                        // server two 32-bit ones, other clients may not.
                         if let Some(v) = tag.as_u32() {
                             size_lo = v;
+                        } else if let Some(v) = tag.as_u64() {
+                            size_lo = v as u32;
+                            size_hi = (v >> 32) as u32;
                         }
                     }
                     FT_FILESIZE_HI => {

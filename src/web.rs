@@ -653,6 +653,10 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/admission", get(api_admission))
             .route("/api/ready", get(api_ready))
             .route("/api/review", get(api_review))
+            .route("/api/indexcheck", get(api_indexcheck))
+            .route("/api/natt", get(api_natt))
+            .route("/api/sizemismatch", get(api_sizemismatch))
+            .route("/api/takeover", get(api_takeover))
             .route("/api/updates", get(api_updates_status))
             .route("/api/update", post(api_update_run))
             .route("/login", get(login_page).post(login_submit))
@@ -723,8 +727,24 @@ struct StatusResp {
     /// capability (sent CT_EMULE_UDPPORTS at login = our client mod). Lets the
     /// operator watch adoption of the NAT-traversal client mod.
     natt_capable_clients: u64,
+    /// Clients that sent a 0x9F from their session address this session, and
+    /// of those, obfuscated.
+    natt_9f_clients: u64,
+    natt_9f_clients_obf: u64,
+    /// Obfuscated UDP decoding: by the cached key, on the cold path, failed.
+    obf_decode_hits: u64,
+    obf_decode_cold: u64,
+    obf_decode_failed: u64,
+    obf_crypt_pings: u64,
     ipv6_clients: u64,
     ipv6_sources: u64,
+    /// The IPv6 dial-back (#43): in force, and its outcomes since start
+    /// (ok, no answer, wrong hash, skipped) plus probes still pending.
+    ipv6_probe_active: bool,
+    ipv6_probe: [u64; 5],
+    /// Probes without an answer by stage: timeout, refused, unreachable,
+    /// after the connect.
+    ipv6_probe_fail: [u64; 4],
     /// How many LowID↔LowID hole punches the server has coordinated since start.
     natt_coordinated: u64,
     /// Connected clients that set Lugdunum's NAT callback bit (0x1000).
@@ -741,6 +761,10 @@ struct StatusResp {
     hpext_fresh: u64,
     hpext_timeout: u64,
     hp_bridged: u64,
+    /// Cross-server NAT callbacks (issue #40): foreign 0xA6 forwarded to a
+    /// target here, and answers sent to the requester.
+    natcb_foreign: u64,
+    natcb_foreign_answered: u64,
 }
 
 async fn api_status(
@@ -781,11 +805,37 @@ async fn api_status(
         incoming_seed_challenges_entries: s.server.incoming_seed_challenges.len() as u64,
         banned_bots: s.server.banned_bots.len() as u64,
         natt_capable_clients: s.server.clients.iter().filter(|c| c.natt_capable).count() as u64,
+        natt_9f_clients: s.server.natt_keepalive_seen.len() as u64,
+        natt_9f_clients_obf: s.server.natt_keepalive_seen.iter().filter(|e| *e.value()).count() as u64,
+        obf_decode_hits: s.server.obf_decode_hits.load(std::sync::atomic::Ordering::Relaxed),
+        obf_decode_cold: s.server.obf_decode_cold.load(std::sync::atomic::Ordering::Relaxed),
+        obf_decode_failed: s.server.obf_decode_failed.load(std::sync::atomic::Ordering::Relaxed),
+        obf_crypt_pings: s.server.obf_crypt_pings.load(std::sync::atomic::Ordering::Relaxed),
         // Two different questions, and both are worth watching while this is new:
         // how many sessions could receive an inline IPv6 source record, and how
         // many publishers actually have an address to put in one.
         ipv6_clients: s.server.clients.iter().filter(|c| c.ipv6_capable).count() as u64,
         ipv6_sources: s.server.client_ipv6.len() as u64,
+        ipv6_probe_active: crate::server::ipv6_probe::active(&s.server),
+        ipv6_probe_fail: {
+            let c = |k: &str| s.server.block_stats.get(k).map_or(0, |v| *v);
+            [
+                c("ipv6_probe_fail_timeout"),
+                c("ipv6_probe_fail_refused"),
+                c("ipv6_probe_fail_unreachable"),
+                c("ipv6_probe_fail_after_connect"),
+            ]
+        },
+        ipv6_probe: {
+            let c = |k: &str| s.server.block_stats.get(k).map_or(0, |v| *v);
+            [
+                c("ipv6_probe_ok"),
+                c("ipv6_probe_no_answer"),
+                c("ipv6_probe_wrong_hash"),
+                c("ipv6_probe_skipped_busy") + c("ipv6_probe_skipped_limit"),
+                s.server.ipv6_probe.iter().filter(|p| p.verdict.is_none()).count() as u64,
+            ]
+        },
         natt_coordinated: s
             .server
             .block_stats
@@ -820,6 +870,11 @@ async fn api_status(
         hpext_fresh: s.server.block_stats.get("holepunch_ext_fresh").map_or(0, |v| *v),
         hpext_timeout: s.server.block_stats.get("holepunch_ext_timeout").map_or(0, |v| *v),
         hp_bridged: s.server.block_stats.get("holepunch_bridged").map_or(0, |v| *v),
+        natcb_foreign: s.server.block_stats.get("natcb_forwarded_foreign").map_or(0, |v| *v),
+        natcb_foreign_answered: ["foreign_natcb_answered_fresh", "foreign_natcb_answered_after_wait"]
+            .iter()
+            .map(|k| s.server.block_stats.get(*k).map_or(0, |v| *v))
+            .sum(),
     })
 }
 
@@ -922,6 +977,13 @@ struct StatsResp {
     /// real structural cost without lazy-page noise. 0.0 if no files / no jemalloc.
     bytes_per_file: f64,
     cache_hit_pct: f64,
+    /// GETSOURCES cache detail: misses on an expired entry, entries not
+    /// stored for a full cache, entries now.
+    gs_cache_expired: u64,
+    gs_cache_skipped: u64,
+    gs_cache_entries: u64,
+    gs_cache_expired_ages: [u64; 5],
+    gs_cache_ttl: u64,
 }
 
 async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
@@ -1098,6 +1160,11 @@ async fn api_stats(State(s): State<WebState>) -> Json<StatsResp> {
             }
         },
         cache_hit_pct: hit_rate as f64 * 100.0,
+        gs_cache_expired: s.server.smart_sources.detail().0,
+        gs_cache_skipped: s.server.smart_sources.detail().1,
+        gs_cache_entries: s.server.smart_sources.entry_count() as u64,
+        gs_cache_expired_ages: s.server.smart_sources.expired_ages(),
+        gs_cache_ttl: s.server.smart_sources.ttl_secs(),
     })
 }
 
@@ -2640,6 +2707,18 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         }
     }
 
+    // The audit: the same window, reduced to signals, with a name shown only
+    // where nothing but the rule that fired points at abuse.
+    if let Some(fmt) = param("format").filter(|f| *f == "audit" || *f == "auditcsv") {
+        let out = audit_report(&s, &by_hash, since, &window_desc, fmt == "auditcsv", max_examples);
+        if !flag("peek") {
+            if let Ok(mut g) = s.server.review_watermark.lock() {
+                *g = Some(now);
+            }
+        }
+        return ([("content-type", "text/plain; charset=utf-8")], out);
+    }
+
     if csv {
         // `size` and `sizeflag` exist so the masquerade test can be done by
         // sorting a column instead of opening each file in a client. `sizeflag`
@@ -2950,6 +3029,592 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
         }
     }
     ([("content-type", "text/plain; charset=utf-8")], out)
+}
+
+/// `/api/review?format=audit` and `format=auditcsv`: the false-positive
+/// audit (see `server::review_audit`). Grouped by rule like the plain review,
+/// but every name is first reduced to signals, and shown only when it is
+/// clean in a rule that is not a working marker. L3 hits stay counted, never
+/// named; decoy and alias names follow the same rule.
+fn audit_report(
+    s: &WebState,
+    by_hash: &std::collections::HashMap<[u8; 16], (crate::state::CsamCatch, Vec<String>)>,
+    since: Option<std::time::Instant>,
+    window_desc: &str,
+    csv: bool,
+    max_examples: usize,
+) -> String {
+    use crate::filter::Layer;
+    use crate::server::review_audit::{self as ra, Verdict};
+    let filter = &s.server.filter;
+
+    // Publishers per hash, in the same window.
+    let mut publishers: std::collections::HashMap<[u8; 16], usize> = std::collections::HashMap::new();
+    for e in s.server.csam_files_by_user.iter() {
+        for (h, c) in e.value().0.iter() {
+            if since.map_or(true, |cut| c.at >= cut) {
+                *publishers.entry(*h).or_insert(0) += 1;
+            }
+        }
+    }
+
+    struct Entry {
+        hash: [u8; 16],
+        layer: Layer,
+        reason: String,
+        name: String,
+        size: u64,
+        kind: ra::Kind,
+        sig: ra::Signals,
+        names: usize,
+        unrelated: usize,
+        sizeflag: bool,
+        publishers: usize,
+    }
+    let mut entries: Vec<Entry> = Vec::with_capacity(by_hash.len());
+    for (h, (c, names)) in by_hash {
+        let sig = if c.layer == Layer::L3HashBlock {
+            ra::Signals::default()
+        } else {
+            ra::signals(filter, &c.name, c.layer, &c.reason)
+        };
+        entries.push(Entry {
+            hash: *h,
+            layer: c.layer,
+            reason: c.reason.clone(),
+            name: c.name.clone(),
+            size: c.size,
+            kind: ra::kind_of(&c.name),
+            sig,
+            names: names.len(),
+            unrelated: unrelated_name_count(names),
+            sizeflag: size_contradicts_extension(&c.name, c.size),
+            publishers: publishers.get(h).copied().unwrap_or(0),
+        });
+    }
+
+    // Rules: (layer, reason) -> indexes into `entries`.
+    let mut rules: std::collections::HashMap<(String, String), Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.layer != Layer::L3HashBlock {
+            rules
+                .entry((format!("{:?}", e.layer), e.reason.clone()))
+                .or_default()
+                .push(i);
+        }
+    }
+    let verdict_of = |ix: &Vec<usize>| -> Verdict {
+        ra::verdict(ix.len(), ix.iter().filter(|&&i| entries[i].sig.strong()).count())
+    };
+    let mut verdicts: std::collections::HashMap<(String, String), Verdict> =
+        std::collections::HashMap::new();
+    for (k, ix) in &rules {
+        verdicts.insert(k.clone(), verdict_of(ix));
+    }
+    let visible = |e: &Entry| -> bool {
+        let v = verdicts
+            .get(&(format!("{:?}", e.layer), e.reason.clone()))
+            .copied()
+            .unwrap_or(Verdict::Marker);
+        ra::name_visible(&e.sig, v, e.layer, e.kind)
+    };
+    let is_decoy = |e: &Entry| e.layer == Layer::L3HashBlock && (e.unrelated > 0 || e.sizeflag);
+    let suggest = |e: &Entry| -> &'static str {
+        if e.layer == Layer::L3HashBlock {
+            return if is_decoy(e) { "poison?" } else { "keep" };
+        }
+        let v = verdicts
+            .get(&(format!("{:?}", e.layer), e.reason.clone()))
+            .copied()
+            .unwrap_or(Verdict::Marker);
+        if e.sig.strong() || v == Verdict::Marker {
+            "keep"
+        } else if v == Verdict::LikelyFalsePositive && !e.sig.explicit {
+            "whitelist?"
+        } else {
+            // Explicit words only, or a mixed rule: the hash is for a look.
+            "review"
+        }
+    };
+    let b = |x: bool| if x { "1" } else { "0" };
+
+    if csv {
+        let mut out = String::from(
+            "hash;layer;reason;size;kind;explicit;age;minor;marker2;sizeflag;names;unrelated;publishers;suggest;name\n",
+        );
+        for e in &entries {
+            let name = if visible(e) { e.name.replace(';', ",") } else { String::new() };
+            out.push_str(&format!(
+                "{};{:?};{};{};{};{};{};{};{};{};{};{};{};{};{}\n",
+                hex::encode(e.hash),
+                e.layer,
+                e.reason.replace(';', ","),
+                e.size,
+                e.kind.as_str(),
+                b(e.sig.explicit),
+                b(e.sig.age),
+                b(e.sig.minor),
+                b(e.sig.marker2),
+                if e.sizeflag { "!" } else { "" },
+                e.names,
+                e.unrelated,
+                e.publishers,
+                suggest(e),
+                name
+            ));
+        }
+        return out;
+    }
+
+    let l3: Vec<&Entry> = entries.iter().filter(|e| e.layer == Layer::L3HashBlock).collect();
+    let mut out = format!(
+        "# ed2k-server filter audit\n# window: {window_desc}\n# blocks in window: {} unique hashes; L3 hash-list hits: {} (counted, never named)\n\
+         # A name is shown only when nothing in it but the rule that fired points at abuse\n\
+         # (no explicit word, no child's age, no child word, no second listed term), and\n\
+         # its rule is not a working marker. Everything else is counted.\n\n",
+        entries.len(),
+        l3.len()
+    );
+
+    let mut keys: Vec<&(String, String)> = rules.keys().collect();
+    keys.sort_by_key(|k| (std::cmp::Reverse(rules[*k].len()), (*k).clone()));
+    out.push_str("=== RULES ===\n# hits | child% (age/child word/2nd term) | e=explicit a=age m=child word t=2nd term | audio doc video image other | publishers | verdict | layer | rule\n");
+    for k in &keys {
+        let ix = &rules[*k];
+        let n = ix.len();
+        let cnt = |f: &dyn Fn(&Entry) -> bool| ix.iter().filter(|&&i| f(&entries[i])).count();
+        let strong = cnt(&|e| e.sig.strong());
+        let pubs: usize = ix.iter().map(|&i| entries[i].publishers).sum();
+        out.push_str(&format!(
+            "{:>5} | {:>3}% | e{} a{} m{} t{} | {} {} {} {} {} | {:>4} | {} | {} | {}\n",
+            n,
+            strong * 100 / n.max(1),
+            cnt(&|e| e.sig.explicit),
+            cnt(&|e| e.sig.age),
+            cnt(&|e| e.sig.minor),
+            cnt(&|e| e.sig.marker2),
+            cnt(&|e| e.kind == ra::Kind::Audio),
+            cnt(&|e| e.kind == ra::Kind::Doc),
+            cnt(&|e| e.kind == ra::Kind::Video),
+            cnt(&|e| e.kind == ra::Kind::Image),
+            cnt(&|e| !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Video | ra::Kind::Image)),
+            pubs,
+            verdicts[*k].as_str(),
+            k.0,
+            k.1
+        ));
+    }
+
+    out.push_str("\n=== VISIBLE NAMES, BY RULE ===\n# hash | MB | kind | [!] size impossible for the extension | name\n");
+    for k in &keys {
+        let ix = &rules[*k];
+        let shown: Vec<&Entry> = ix.iter().map(|&i| &entries[i]).filter(|e| visible(e)).collect();
+        if shown.is_empty() {
+            continue;
+        }
+        out.push_str(&format!(
+            "\n--- {} | {} | {} | {} of {} shown ---\n",
+            k.0,
+            k.1,
+            verdicts[*k].as_str(),
+            shown.len(),
+            ix.len()
+        ));
+        for e in shown.iter().take(max_examples) {
+            let short: String = e.name.chars().take(140).collect();
+            out.push_str(&format!(
+                "{} {:>6} {:<8}{} {}\n",
+                hex::encode(e.hash),
+                e.size / 1048576,
+                e.kind.as_str(),
+                if e.sizeflag { " [!]" } else { "" },
+                short
+            ));
+        }
+        if shown.len() > max_examples {
+            out.push_str(&format!("... +{} more (format=auditcsv lists all)\n", shown.len() - max_examples));
+        }
+    }
+
+    // Hashes with explicit words only, in rules that are not markers: names
+    // withheld, for a look in the admin panel.
+    let review: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.layer != Layer::L3HashBlock && suggest(e) == "review" && !visible(e))
+        .collect();
+    if !review.is_empty() {
+        out.push_str(&format!(
+            "\n=== HASHES TO LOOK AT ({}) ===\n# Name withheld (explicit words), rule not a marker: legal adult content the term\n# fires on is a false positive too. hash | layer | rule | MB | kind\n",
+            review.len()
+        ));
+        for e in review.iter().take(200) {
+            out.push_str(&format!(
+                "{} | {:?} | {} | {} | {}\n",
+                hex::encode(e.hash),
+                e.layer,
+                e.reason,
+                e.size / 1048576,
+                e.kind.as_str()
+            ));
+        }
+        if review.len() > 200 {
+            out.push_str(&format!("... +{} more (format=auditcsv lists all)\n", review.len() - 200));
+        }
+    }
+
+    // Decoy signature among L3 hits: candidates to move to the poison list.
+    let decoys: Vec<&&Entry> = l3.iter().filter(|e| is_decoy(e)).collect();
+    if !decoys.is_empty() {
+        out.push_str(&format!(
+            "\n=== L3 HITS WITH A DECOY SIGNATURE ({} of {}) ===\n# Candidates to move from the CSAM hash list to the poison list. Names only when clean.\n",
+            decoys.len(),
+            l3.len()
+        ));
+        for e in decoys.iter().take(60) {
+            let name = if ra::plain_name_visible(filter, &e.name) {
+                e.name.chars().take(120).collect::<String>()
+            } else {
+                "[name withheld]".to_string()
+            };
+            out.push_str(&format!(
+                "{} {} names ({} unrelated), {} MB{}  {}\n",
+                hex::encode(e.hash),
+                e.names,
+                e.unrelated,
+                e.size / 1048576,
+                if e.sizeflag { " [!]" } else { "" },
+                name
+            ));
+        }
+    }
+
+    // Indexed files carrying unrelated names: decoy leads for the poison list.
+    let mut aliases: Vec<_> = s
+        .server
+        .file_aliases
+        .iter()
+        .map(|e| {
+            let a = e.value().clone();
+            let u = unrelated_name_count(&a.names);
+            (*e.key(), a, u)
+        })
+        .filter(|(_, _, u)| *u > 0)
+        .collect();
+    aliases.sort_by_key(|(_, a, u)| (std::cmp::Reverse(*u), std::cmp::Reverse(a.size)));
+    if !aliases.is_empty() {
+        out.push_str(&format!(
+            "\n=== INDEXED FILES UNDER UNRELATED NAMES ({}) ===\n# Decoy leads for the poison list. Names only when clean.\n",
+            aliases.len()
+        ));
+        for (h, a, u) in aliases.iter().take(40) {
+            let flag = a.names.iter().any(|n| size_contradicts_extension(n, a.size));
+            out.push_str(&format!(
+                "{} {} names ({} unrelated), {} B{}\n",
+                hex::encode(h),
+                a.names.len(),
+                u,
+                a.size,
+                if flag { " [!]" } else { "" }
+            ));
+            let mut withheld = 0;
+            for n in a.names.iter().take(6) {
+                if ra::plain_name_visible(filter, n) {
+                    let short: String = n.chars().take(110).collect();
+                    out.push_str(&format!("    {short}\n"));
+                } else {
+                    withheld += 1;
+                }
+            }
+            if withheld > 0 {
+                out.push_str(&format!("    [{withheld} withheld]\n"));
+            }
+        }
+    }
+    out
+}
+
+/// `/api/natt`: every NAT-T counter since start, and the live gauges, for
+/// analysing the hole punch, Lugdunum's callback, the extension and the
+/// cross-server path. Counters are `block_stats` keys with these prefixes:
+/// `holepunch_`, `hp_`, `natt_`, `natcb`, `foreign_natcb_`.
+/// `/api/sizemismatch` (issue #45): the last size disagreements, newest
+/// first, and the same grouped by file: for each hash the stored size and
+/// every other size seen, with how many distinct addresses published or asked
+/// for it. Hashes, sizes and addresses only.
+async fn api_sizemismatch(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let recent: Vec<serde_json::Value> = s
+        .server
+        .size_mismatch_recent
+        .lock()
+        .map(|q| q.iter().rev().cloned().collect())
+        .unwrap_or_default();
+    // hash -> (stored, other size -> (publisher ips, requester ips))
+    type Seen = (BTreeSet<String>, BTreeSet<String>);
+    let mut by_hash: BTreeMap<String, (u64, BTreeMap<u64, Seen>)> = BTreeMap::new();
+    for e in &recent {
+        let (Some(h), Some(st), Some(o), Some(ip), Some(k)) = (
+            e["hash"].as_str(),
+            e["stored_size"].as_u64(),
+            e["other_size"].as_u64(),
+            e["ip"].as_str(),
+            e["kind"].as_str(),
+        ) else {
+            continue;
+        };
+        let entry = by_hash.entry(h.to_string()).or_insert((st, BTreeMap::new()));
+        let seen = entry.1.entry(o).or_default();
+        if k == "offer" {
+            seen.0.insert(ip.to_string());
+        } else {
+            seen.1.insert(ip.to_string());
+        }
+    }
+    let mut files: Vec<serde_json::Value> = by_hash
+        .into_iter()
+        .map(|(h, (stored, others))| {
+            let current = s
+                .server
+                .file_slab
+                .with_record_by_hash(
+                    &{
+                        let mut b = [0u8; 16];
+                        if let Ok(v) = hex::decode(&h) {
+                            if v.len() == 16 {
+                                b.copy_from_slice(&v);
+                            }
+                        }
+                        b
+                    },
+                    |_id, r| (r.size, r.sources.len(), r.complete_source_count()),
+                );
+            let others: Vec<serde_json::Value> = others
+                .into_iter()
+                .map(|(size, (pubs, reqs))| {
+                    serde_json::json!({
+                        "size": size,
+                        "publishers": pubs.len(),
+                        "publisher_ips": pubs,
+                        "requesters": reqs.len(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "hash": h,
+                "stored_size_then": stored,
+                "stored_size_now": current.map(|c| c.0),
+                "sources_now": current.map(|c| c.1),
+                "complete_sources_now": current.map(|c| c.2),
+                "other_sizes": others,
+            })
+        })
+        .collect();
+    files.sort_by_key(|f| {
+        std::cmp::Reverse(
+            f["other_sizes"]
+                .as_array()
+                .map_or(0, |a| a.iter().map(|o| o["publishers"].as_u64().unwrap_or(0) + o["requesters"].as_u64().unwrap_or(0)).sum::<u64>()),
+        )
+    });
+    Json(serde_json::json!({
+        "kept": recent.len(),
+        "cap": crate::state::SIZE_MISMATCH_RECENT_MAX,
+        "files": files,
+        "recent": recent,
+    }))
+}
+
+async fn api_natt(State(s): State<WebState>) -> Json<serde_json::Value> {
+    let mut counters: std::collections::BTreeMap<String, u64> = Default::default();
+    for e in s.server.block_stats.iter() {
+        let k = e.key();
+        if ["holepunch_", "hp_", "natt_", "natcb", "foreign_natcb_"]
+            .iter()
+            .any(|p| k.starts_with(p))
+        {
+            counters.insert(k.clone(), *e.value());
+        }
+    }
+    let srv = &s.server;
+    let flags = |f: u32| srv.clients.iter().filter(|c| c.server_flags & f == f).count();
+    let now = srv.file_slab.now_secs();
+    let recent: Vec<serde_json::Value> = srv
+        .natt_recent
+        .lock()
+        .map(|q| {
+            q.iter()
+                .rev()
+                .map(|e| {
+                    let mut e = e.clone();
+                    let at = e["secs_ago_base"].as_u64().unwrap_or(0) as u32;
+                    e["secs_ago"] = serde_json::json!(now.saturating_sub(at));
+                    if let Some(o) = e.as_object_mut() {
+                        o.remove("secs_ago_base");
+                    }
+                    e
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "recent": recent,
+        "counters": counters,
+        "gauges": {
+            "clients": srv.clients.len(),
+            "lowid_clients": srv.lowid_count(),
+            "clients_0x1000": flags(crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL),
+            "clients_extension": flags(crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT | crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL),
+            "clients_sent_9f": srv.natt_keepalive_seen.len(),
+            "clients_sent_9f_obfuscated": srv.natt_keepalive_seen.iter().filter(|e| *e.value()).count(),
+            "clients_udp_port_announced": srv.clients.iter().filter(|c| c.natt_capable).count(),
+            "keepalive_ports_known": srv.natt_udp_ports.len(),
+            "extension_waits_pending": srv.natt_keepalive_waiters.len(),
+            "lugdunum_requesters_seen": srv.lugdunum_natt_seen.len(),
+            "foreign_sources_tracked": srv.natcb_foreign_sources.len(),
+            "foreign_targets_woken_last_min": srv.natcb_foreign_wakes.len(),
+            "pairs_asked_last_10min": srv.holepunch_recent.len(),
+        },
+        "config": {
+            "lugdunum_natt": srv.live_cfg.load().network.lugdunum_natt,
+            "holepunch_extension": srv.live_cfg.load().network.holepunch_extension,
+            "holepunch_foreign": srv.live_cfg.load().network.holepunch_foreign,
+        }
+    }))
+}
+
+/// `/api/takeover`: logins refused because their user hash was online from
+/// another address (issue #41), grouped by hash, worst first. A hash with
+/// many refusals from one or two other addresses is two installs sharing a
+/// user hash; many addresses is a hash someone hands around.
+async fn api_takeover(State(s): State<WebState>) -> Json<serde_json::Value> {
+    use std::collections::HashMap;
+    let mut by_hash: HashMap<[u8; 16], (u32, Vec<String>)> = HashMap::new();
+    for e in s.server.takeover_lost.iter() {
+        let ((h, src), (_, n)) = (e.key(), e.value());
+        let slot = by_hash.entry(*h).or_default();
+        slot.0 += n;
+        if slot.1.len() < 8 {
+            slot.1.push(src.to_string());
+        }
+    }
+    let mut rows: Vec<_> = by_hash.into_iter().collect();
+    rows.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    let total: u32 = rows.iter().map(|(_, (n, _))| n).sum();
+    let hashes = rows.len();
+    let list: Vec<serde_json::Value> = rows
+        .into_iter()
+        .take(100)
+        .map(|(h, (n, contenders))| {
+            let owner = s.server.clients.get(&h).map(|c| {
+                serde_json::json!({
+                    "ip": c.ip.to_string(),
+                    "software": c.software_detail.clone(),
+                    "high_id": c.is_high_id,
+                })
+            });
+            serde_json::json!({
+                "user_hash": hex::encode(h),
+                "refused": n,
+                "contenders": contenders,
+                // Report only: many contenders suggest a hash that installs
+                // share, to add to limits.shared_user_hashes after a look. An
+                // attacker can produce the same picture, so it is never
+                // acted on by itself.
+                "looks_shared": contenders.len() >= 3,
+                "owner": owner,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        "refused_tracked": total,
+        "hashes": hashes,
+        "top": list,
+    }))
+}
+
+/// `/api/indexcheck`: every file in the index against the content filter as
+/// it is now (issue: lists reloaded after a file was indexed are never
+/// applied to it). Hashes only, never names:
+/// `hash;layer;reason;sources;size;whitelisted`. `whitelisted=1` marks a
+/// file the filter would block but the whitelist lets through. With
+/// `purge=1` the blocked, non-whitelisted files are taken out of the index.
+/// One run at a time; it walks the whole index.
+async fn api_indexcheck(State(s): State<WebState>, uri: axum::http::Uri) -> impl IntoResponse {
+    static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
+    let purge = uri.query().unwrap_or("").split('&').any(|kv| kv == "purge=1" || kv == "purge=true");
+    if RUNNING.swap(true, Ordering::AcqRel) {
+        return (
+            axum::http::StatusCode::CONFLICT,
+            [("content-type", "text/plain; charset=utf-8")],
+            "# an index check is already running\n".to_string(),
+        );
+    }
+    let state = Arc::clone(&s.server);
+    let res = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut rows = String::from("hash;layer;reason;sources;size;whitelisted\n");
+        let mut purge_ids = Vec::new();
+        let mut checked = 0u64;
+        let mut by_layer: std::collections::BTreeMap<&'static str, u64> = Default::default();
+        let mut whitelisted = 0u64;
+        state.file_slab.for_each_live_copied(|batch| {
+            for (id, hash, size, name, sources) in batch {
+                checked += 1;
+                if let crate::filter::FilterResult::Block(layer, reason) =
+                    state.filter.check_ignoring_whitelist(&hash, &name)
+                {
+                    let wl = state.filter.is_whitelisted(&hash);
+                    if wl {
+                        whitelisted += 1;
+                    } else {
+                        *by_layer.entry(layer.stat_key()).or_insert(0) += 1;
+                        purge_ids.push(id);
+                    }
+                    rows.push_str(&format!(
+                        "{};{:?};{};{};{};{}\n",
+                        hex::encode(hash),
+                        layer,
+                        reason.replace(';', ","),
+                        sources,
+                        size,
+                        if wl { 1 } else { 0 }
+                    ));
+                }
+            }
+        });
+        let purged = if purge { state.purge_files(&purge_ids) } else { 0 };
+        if purged > 0 {
+            *state
+                .block_stats
+                .entry("indexcheck_purged".to_string())
+                .or_insert(0) += purged as u64;
+        }
+        let mut head = format!(
+            "# index check: {checked} files in {:.1} s; would block {} (not whitelisted), whitelisted {whitelisted}; purged {purged}\n",
+            started.elapsed().as_secs_f64(),
+            purge_ids.len()
+        );
+        for (k, v) in &by_layer {
+            head.push_str(&format!("# {k}: {v}\n"));
+        }
+        head + &rows
+    })
+    .await;
+    RUNNING.store(false, Ordering::Release);
+    match res {
+        Ok(body) => (
+            axum::http::StatusCode::OK,
+            [("content-type", "text/plain; charset=utf-8")],
+            body,
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "text/plain; charset=utf-8")],
+            format!("# index check failed: {e}\n"),
+        ),
+    }
 }
 
 /// Admission gauges and counters (issue #25).
@@ -3942,7 +4607,7 @@ async function refreshStatus() {
      <tr><td>TCP Port</td><td>${st.tcp_port}</td></tr>
      <tr><td>Seckey</td><td><code style="font-size:.75rem">${st.seckey_hex}</code></td></tr>
      ${st.tls_fingerprint ? `<tr><td>HTTPS certificate</td><td><code style="font-size:.7rem">${st.tls_fingerprint}</code> <span style="color:#6b7280;font-size:.75rem">SHA-256; the browser shows the same when the connection is genuine</span></td></tr>` : ''}
-     <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}%</td></tr>
+     <tr><td>Cache hits</td><td>${sys.cache_hit_pct.toFixed(1)}% · ${fmt(sys.gs_cache_entries)} entries · ${fmt(sys.gs_cache_expired)} misses on an expired entry (past the TTL by &lt;1 min ${fmt(sys.gs_cache_expired_ages[0])} · 1–2 min ${fmt(sys.gs_cache_expired_ages[1])} · 2–5 min ${fmt(sys.gs_cache_expired_ages[2])} · 5–10 min ${fmt(sys.gs_cache_expired_ages[3])} · 10–20 min ${fmt(sys.gs_cache_expired_ages[4])}) · ${fmt(sys.gs_cache_skipped)} not stored (full) <span style="color:#6b7280;font-size:.75rem">TCP GETSOURCES answered from the ${sys.gs_cache_ttl} s source-list cache (limits.getsources_cache_secs); how long past the TTL a request came shows what a longer TTL would catch; "not stored" means the 200k cap is too small</span></td></tr>
      <tr><td>Searches served</td><td>${fmt(sys.searches_served)} <span style="color:#6b7280;font-size:.75rem">since start</span></td></tr>
      ${sys.highid_observe_enabled ? `<tr><td>HighID hello check (${sys.highid_downgrade_enabled ? 'verdict' : 'observe'})</td><td>${fmt(sys.highid_observe_verified)} verified${sys.highid_observe_verified_marker ? ` (${fmt(sys.highid_observe_verified_marker)} with a different client-type marker in the hello)` : ''} · ${fmt(sys.highid_observe_no_answer)} no answer · ${fmt(sys.highid_observe_mismatch)} wrong hash · ${fmt(sys.highid_observe_skipped)} skipped${sys.highid_downgrade_enabled || sys.highid_downgraded ? `<br>${fmt(sys.highid_marks_active)} marked now · ${fmt(sys.highid_downgraded)} logins given LowID by a mark · ${fmt(sys.highid_marks_cleared)} marks cleared (own hash again)` : ''} <span style="color:#6b7280;font-size:.75rem">${sys.highid_downgrade_enabled ? 'HighID clients re-checked with OP_HELLO in the background, login not delayed. A wrong hash marks (IP, port, hash); its next logins get LowID until the mark expires or its own hash answers again. "No answer" never costs HighID.' : 'HighID clients re-checked with OP_HELLO; "no answer" would be LowID on Lugdunum. Verdict unchanged.'}</span>${sys.highid_observe_reasons ? `<br><span style="color:#6b7280;font-size:.75rem">${escapeHtml(sys.highid_observe_reasons)}</span>` : ''}${sys.highid_mismatch_recent ? `<br><span style="color:#6b7280;font-size:.75rem">wrong hash, last ${fmt(sys.highid_mismatch_recent)}: answering client connected from the SAME IP ${fmt(sys.highid_mismatch_same_ip)} (second client behind one NAT) · from another IP ${fmt(sys.highid_mismatch_other_ip)} · not connected here ${fmt(sys.highid_mismatch_not_here)}</span>` : ''}</td></tr>` : ''}
      <tr><td>Busiest IP</td><td>${fmt(sys.busiest_ip_logged_in)} logged in${sys.busiest_ip ? ` from <code>${sys.busiest_ip}</code>${sys.busiest_ip_country ? ' ('+countryFlag(sys.busiest_ip_country)+' '+escapeHtml(sys.busiest_ip_country)+')' : ''}${sys.busiest_ip_provider ? ' · '+escapeHtml(sys.busiest_ip_provider) : ''} · ${fmt(sys.busiest_ip_connections)} connections` : ''} <span style="color:#6b7280;font-size:.75rem">most logged-in clients behind one address right now (a NAT or CGNAT); connections = its open TCP sockets, which limits.max_clients_per_ip = ${sys.max_clients_per_ip ? fmt(sys.max_clients_per_ip) : 'off'} caps; loopback exempt</span></td></tr>
@@ -3955,13 +4620,15 @@ async function refreshStatus() {
      <tr><td>Searches by file hash</td><td>${fmt(sys.searches_by_hash)} <span style="color:#6b7280;font-size:.75rem">ed2k::HASH, ed2k links and magnets, answered from the hash index (hash lookup services)</span></td></tr>
      <tr><td>Ranking scan cap hit</td><td>${fmt(sys.searches_rank_capped)} (${sys.searches_rank_capped_pct.toFixed(1)}%) <span style="color:#6b7280;font-size:.75rem">ranked over part of the candidate set, not all of it — raise limits.search_rank_scan if this is a large share</span></td></tr>
      <tr><td>Banned bots (24h)</td><td>${fmt(st.banned_bots)}</td></tr>
-     <tr><td>NAT-T capable clients</td><td>${fmt(st.natt_capable_clients)} <span style="color:#6b7280;font-size:.75rem">connected clients with the NAT-traversal mod</span></td></tr>
+     <tr><td>NAT-T clients</td><td>${fmt(st.natt_9f_clients)} sent 0x9F this session (${fmt(st.natt_9f_clients_obf)} obfuscated) · ${fmt(st.natt_capable_clients)} announced a UDP port (0xF9) <span style="color:#6b7280;font-size:.75rem">a 0x9F from the session's address shows a client that reads 0x61; 0xF9 is sent by stock clients too. Detail: /api/natt</span></td></tr>
      <tr><td>IPv6-capable clients</td><td>${fmt(st.ipv6_clients)} <span style="color:#6b7280;font-size:.75rem">sessions that can parse an inline IPv6 source record</span></td></tr>
      <tr><td>IPv6 publishers</td><td>${fmt(st.ipv6_sources)} <span style="color:#6b7280;font-size:.75rem">connected clients with a usable IPv6 address</span></td></tr>
+     <tr><td>IPv6 dial-back</td><td>${st.ipv6_probe_active ? `ok ${fmt(st.ipv6_probe[0])} · no answer ${fmt(st.ipv6_probe[1])} (timeout ${fmt(st.ipv6_probe_fail[0])}, refused ${fmt(st.ipv6_probe_fail[1])}, unreachable ${fmt(st.ipv6_probe_fail[2])}, after connect ${fmt(st.ipv6_probe_fail[3])}) · wrong hash ${fmt(st.ipv6_probe[2])} · skipped ${fmt(st.ipv6_probe[3])} · pending ${fmt(st.ipv6_probe[4])}` : 'off'} <span style="color:#6b7280;font-size:.75rem">${st.ipv6_probe_active ? 'addresses published only after they answer' : 'off, no IPv6 route, or not publishing IPv6: addresses published on trust'}</span></td></tr>
      <tr><td>NAT-T punches coordinated</td><td>${fmt(st.natt_coordinated)} <span style="color:#6b7280;font-size:.75rem">LowID↔LowID since start (0x60 → 0x61 to both)</span></td></tr>
      <tr><td>Lugdunum NAT callbacks</td><td>${fmt(st.natcb_forwarded_tcp + st.natcb_forwarded_udp)} forwarded (TCP 0x37 ${fmt(st.natcb_forwarded_tcp)} · UDP 0xA7 ${fmt(st.natcb_forwarded_udp)}) · ${fmt(st.natcb_refused)} refused · ${fmt(st.natcb_capable_clients)} capable clients <span style="color:#6b7280;font-size:.75rem">0xA6 requests from clients that set 0x1000 at login; reasons in the Blocks tab (natcb_*)</span></td></tr>
      <tr><td>Hole punch extension</td><td>${fmt(st.hpext_started)} started · ${fmt(st.hpext_fresh)} with a fresh 0x9F · ${fmt(st.hpext_timeout)} after the 3 s wait · ${fmt(st.hpext_clients)} clients · ${fmt(st.hp_bridged)} bridged <span style="color:#6b7280;font-size:.75rem">0x60 between two clients with 0x100000; bridged = 0x37 to a Lugdunum-only target</span></td></tr>
-     <tr><td>obf_decode_cache</td><td>${fmt(st.obf_decode_cache_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 8192)</span></td></tr>
+     <tr><td>Cross-server NAT callbacks</td><td>${fmt(st.natcb_foreign)} forwarded · ${fmt(st.natcb_foreign_answered)} answered <span style="color:#6b7280;font-size:.75rem">0xA6 from clients logged in elsewhere (requester id 0); answered = 0xA7 to the requester from a target with the extension; refusals in the Blocks tab (natcb_foreign_* and the natcb_* target reasons)</span></td></tr>
+     <tr><td>Obfuscated UDP</td><td>${fmt(st.obf_decode_hits)} by the cached key · ${fmt(st.obf_decode_cold)} cold decodes · ${fmt(st.obf_crypt_pings)} crypt pings answered · ${fmt(st.obf_decode_failed)} undecodable · ${fmt(st.obf_decode_cache_entries)} cached senders <span style="color:#6b7280;font-size:.75rem">a cold decode first tries the client key for the sender's IP (one attempt), then the peer-server keys; most cold senders are clients of other servers sending one global query; senders stay cached 30 min (cap 262k)</span></td></tr>
      <tr><td>seed_challenges</td><td>${fmt(st.incoming_seed_challenges_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 2048)</span></td></tr>
      </table>`;
 }
@@ -4311,6 +4978,7 @@ async function refreshBlocks() {
           'rate_limit':              { label: 'Rate limit',                desc: 'queries throttled' },
           'max_connections_per_ip':  { label: 'Too many connections',      desc: 'TCP connections refused: the IP already had limits.max_clients_per_ip open' },
           'server_full':             { label: 'Server full',               desc: 'logins refused: limits.max_clients clients were connected' },
+          'login_hash_in_use':       { label: 'Hash online elsewhere',     desc: 'logins refused: the user hash was online from another address (issue #41); limits.hash_takeover_from_any_address restores the old rule' },
         }[r.reason] || { label: r.reason, desc: '' };
         const uniq = (r.unique_ips != null) ? r.unique_ips.toLocaleString() : '—';
         return `<tr><td>${meta.label}</td><td>${r.count.toLocaleString()}</td>`

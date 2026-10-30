@@ -484,6 +484,10 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    // The IPv6 dial-back (#43) needs a route to dial with.
+    let v6_route = ed2k_server::server::ipv6_probe::detect_route();
+    state.ipv6_route.store(v6_route, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(ipv6_route = v6_route, "IPv6 dial-back route");
     let _ = state.bot_log_path.set(ed2k_server::server::bot_detector::ledger_path(
         &cfg.storage.bot_log_path,
         &args.config,
@@ -909,6 +913,32 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         !v.is_empty()
                     });
                 state_clean
+                    .natcb_foreign_sources
+                    .retain(|_, s| !s.idle());
+                state_clean.smart_sources.sweep_expired();
+                ed2k_server::server::ipv6_probe::sweep(&state_clean);
+                state_clean
+                    .undecodable_from_session_seen
+                    .retain(|_, t| t.elapsed() < std::time::Duration::from_secs(3600));
+                state_clean
+                    .wrong_ip_9f_seen
+                    .retain(|_, t| t.elapsed() < std::time::Duration::from_secs(3600));
+                state_clean
+                    .takeover_lost
+                    .retain(|_, e| e.0.elapsed() < std::time::Duration::from_secs(3600));
+                state_clean
+                    .holepunch_recent
+                    .retain(|_, t| t.elapsed() < std::time::Duration::from_secs(600));
+                state_clean
+                    .ext_timed_out
+                    .retain(|_, t| t.elapsed() < std::time::Duration::from_secs(60));
+                state_clean
+                    .takeover_probes
+                    .retain(|_, t| t.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)));
+                state_clean
+                    .natcb_foreign_wakes
+                    .retain(|_, w| w.back().is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60)));
+                state_clean
                     .lugdunum_natt_seen
                     .retain(|_, s| s.at.elapsed() < ed2k_server::server::lugdunum_natt::SEEN_TTL);
                 // Bot detector keeps per-IP sliding windows. IPs that haven't
@@ -985,12 +1015,28 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 // re-derives the key on the next packet; incoming_seed_challenges
                 // re-handshakes on the next 60s probe. Real seeds (a few dozen)
                 // never reach the cap, so only scanner/churn noise is swept.
-                const OBF_CACHE_CAP: usize = 8192;
+                // obf_decode_cache: aged, not cleared wholesale. An entry is
+                // ~40 bytes, so the cap is ~10 MB; a sender seen within the
+                // TTL keeps its entry, so a client pays the cold path once
+                // per half hour instead of once per sweep.
+                const OBF_CACHE_CAP: usize = 262_144;
+                const OBF_CACHE_TTL_SECS: u32 = 1800;
                 const SEED_CHAL_CAP: usize = 2048;
-                if state_clean.obf_decode_cache.len() > OBF_CACHE_CAP {
-                    let n = state_clean.obf_decode_cache.len();
-                    state_clean.obf_decode_cache.clear();
-                    info!(cleared = n, "obf_decode_cache over cap, swept");
+                {
+                    let now = state_clean.file_slab.now_secs();
+                    state_clean
+                        .obf_decode_cache
+                        .retain(|_, e| now.saturating_sub(e.2) < OBF_CACHE_TTL_SECS);
+                    if state_clean.obf_decode_cache.len() > OBF_CACHE_CAP {
+                        state_clean
+                            .obf_decode_cache
+                            .retain(|_, e| now.saturating_sub(e.2) < 300);
+                    }
+                    if state_clean.obf_decode_cache.len() > OBF_CACHE_CAP {
+                        let n = state_clean.obf_decode_cache.len();
+                        state_clean.obf_decode_cache.clear();
+                        info!(cleared = n, "obf_decode_cache over cap, cleared");
+                    }
                 }
                 if state_clean.incoming_seed_challenges.len() > SEED_CHAL_CAP {
                     let n = state_clean.incoming_seed_challenges.len();

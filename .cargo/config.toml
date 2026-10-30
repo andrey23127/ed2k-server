@@ -28,6 +28,13 @@
 [env]
 JEMALLOC_SYS_WITH_MALLOC_CONF = "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,thp:never"
 
+# ── MSRV-aware updates (issue #48) ──────────────────────────────────────────
+# Keep `cargo update` on dependency versions that build with the declared
+# rust-version (1.75). Cargo 1.84+ reads this; older Cargo warns about an
+# unused key and goes on.
+[resolver]
+incompatible-rust-versions = "fallback"
+
 # ── Optional CPU optimization (uncomment ONE that matches YOUR build host) ───
 # Commented out so the project builds portably everywhere. Enabling a specific
 # target-cpu produces a binary tuned to that microarchitecture — only run such a

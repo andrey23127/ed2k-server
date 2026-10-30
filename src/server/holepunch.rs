@@ -43,7 +43,8 @@
 //!      the peer's crypt setting appended), then resends at +1.2 s and +3 s;
 //!   5. with no 0x9F within 3 s, it sends the same 0x61 with the ports it
 //!      would have used anyway. A lost 0x9F costs 3 s, never the punch.
-//! Any other pair gets exactly today's punch: 29 bytes, at once, no 0x37.
+//! Any other pair gets the punch at once, no 0x37. Every 0x61 is 30 bytes
+//! since issue #42: the peer's crypt setting is byte 29 for every pair.
 //!
 //! BRIDGE (issue #39). A client that implements only Lugdunum's callback
 //! (NeoMule's "CanLow2Low") ignores 0x61. A 0x60 whose target set 0x1000,
@@ -55,7 +56,7 @@ use crate::proto::{opcodes::*, Frame};
 use crate::server::lugdunum_natt::{self, SRVCAP_NATTRAVERSAL};
 use crate::state::{ClientHandle, ServerState};
 use bytes::{BufMut, BytesMut};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -85,7 +86,7 @@ const OBSERVED_UDP_FRESH: Duration = Duration::from_secs(600);
 ///     when no other client is connected from that address, since it is
 ///     shared by every client there;
 ///  3. the port the client announced (0xF9 at login, or in its 0x60).
-fn observed_udp_port(state: &ServerState, user_hash: &[u8; 16], ip: IpAddr, announced: u16) -> u16 {
+pub(crate) fn observed_udp_port(state: &ServerState, user_hash: &[u8; 16], ip: IpAddr, announced: u16) -> u16 {
     if let Some(e) = state.natt_udp_ports.get(user_hash) {
         let (port, seen) = *e;
         if port != 0 && seen.elapsed() < OBSERVED_UDP_FRESH {
@@ -131,6 +132,18 @@ pub const FAIL_TARGET_NOT_CONNECTED: u8 = 1;
 pub const FAIL_TARGET_IS_HIGHID: u8 = 2;
 pub const FAIL_BAD_REQUEST: u8 = 3;
 pub const FAIL_TARGET_NO_UDP: u8 = 4;
+/// One of the two sessions is not over IPv4, so the server has no IPv4
+/// endpoint to hand the other side: a 0x61 would carry 0.0.0.0. The punch is
+/// UDP over IPv4 only.
+pub const FAIL_NO_IPV4: u8 = 5;
+
+/// The IPv4 of a session address, an IPv4-mapped IPv6 included.
+fn session_v4(ip: IpAddr) -> Option<Ipv4Addr> {
+    match ip {
+        IpAddr::V4(v4) => Some(v4),
+        IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+    }
+}
 
 /// Handle OP_LOWID_HOLEPUNCH_REQUEST from a logged-in client.
 ///
@@ -231,6 +244,13 @@ pub fn handle_holepunch_request(
         return Some(FAIL_TARGET_IS_HIGHID);
     }
 
+    // Both ends need an IPv4 the other can be told (an IPv6-only session has
+    // a LowID too, being unreachable on IPv4).
+    if session_v4(requester_ip).is_none() || session_v4(t_ip).is_none() {
+        send_fail(state, requester_user_hash, target_id, FAIL_NO_IPV4);
+        return Some(FAIL_NO_IPV4);
+    }
+
     // The target must have announced a UDP port (i.e. it is also a modified
     // client). A stock LowID client cannot participate as a target.
     if t_udp == 0 {
@@ -255,21 +275,18 @@ pub fn handle_holepunch_request(
     let requester_udp_eff =
         observed_udp_port(state, requester_user_hash, requester_ip, requester_udp_port);
 
-    // A pair using the extension also gets each other's crypt setting
-    // (issue #39); everyone else keeps the 29 bytes.
+    // Each side also gets the other's crypt setting, byte 29 (issue #39 for
+    // extension pairs, issue #42 for everyone): with the hash at bytes 8-23
+    // it lets the dialler obfuscate from its first datagram, so a target
+    // that requires the crypt layer accepts the stream. Parsers read fields
+    // by length and ignore what follows, so the 30-byte frame is safe for
+    // clients that know only 29.
     let r_flags = state
         .clients
         .get(requester_user_hash)
         .map_or(0, |c| c.server_flags);
-    let ext = has_extension(state, r_flags) && has_extension(state, t_flags);
-    let (crypt_of_target, crypt_of_requester) = if ext {
-        (
-            Some(lugdunum_natt::crypt_setting(t_flags)),
-            Some(lugdunum_natt::crypt_setting(r_flags)),
-        )
-    } else {
-        (None, None)
-    };
+    let crypt_of_target = Some(lugdunum_natt::crypt_setting(t_flags));
+    let crypt_of_requester = Some(lugdunum_natt::crypt_setting(r_flags));
 
     // Each side also gets the server ID of the peer described (issue #38):
     // the requester its 0x60 target id, so it can tell which of several
@@ -431,9 +448,111 @@ fn requester_alive(state: &ServerState, user_hash: &[u8; 16]) -> bool {
         .unwrap_or(false)
 }
 
-fn count(state: &ServerState, key: &str) {
+pub(crate) fn count(state: &ServerState, key: &str) {
     *state.block_stats.entry(key.to_string()).or_insert(0) += 1;
 }
+
+/// A client family for a counter key: "aMule", "eMule", "emule-qt"…, cut to
+/// a short ASCII token so a client cannot mint counters with its own text.
+pub(crate) fn sw_family(state: &ServerState, user_hash: &[u8; 16]) -> String {
+    let (sw, detail) = state
+        .clients
+        .get(user_hash)
+        .map(|c| (c.software.clone(), c.software_detail.clone()))
+        .unwrap_or_default();
+    let clean = |s: &str, n: usize| -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(*c, '-' | '.'))
+            .take(n)
+            .collect()
+    };
+    let family = clean(&sw, 16);
+    let family = if family.is_empty() { "unknown".to_string() } else { family };
+    // The mod, from "eMule v0.50a [Xtreme 9.1]": eMule mods report as eMule.
+    match detail.split_once('[').and_then(|(_, m)| m.split_once(']')).map(|(m, _)| clean(m, 20)) {
+        Some(m) if !m.is_empty() => format!("{family}/{m}"),
+        _ => family,
+    }
+}
+
+/// How many detailed NAT-T events /api/natt keeps.
+pub const NATT_RECENT_MAX: usize = 60;
+
+/// Record one NAT-T request in detail for /api/natt: the two clients'
+/// software, login fingerprint and flags, the target's id parity and UDP
+/// port, and the outcome. Counters say how often; this says who.
+pub(crate) fn note_event(
+    state: &ServerState,
+    kind: &str,
+    requester: Option<&ClientHandle>,
+    target: Option<&ClientHandle>,
+    target_id: u32,
+    outcome: &str,
+) {
+    note_event_from(state, kind, requester, target, target_id, outcome, None)
+}
+
+/// `note_event` with the requester's datagram source, for a requester that
+/// is not logged in here (a foreign 0xA6).
+pub(crate) fn note_event_from(
+    state: &ServerState,
+    kind: &str,
+    requester: Option<&ClientHandle>,
+    target: Option<&ClientHandle>,
+    target_id: u32,
+    outcome: &str,
+    from: Option<std::net::SocketAddr>,
+) {
+    let who = |c: Option<&ClientHandle>| {
+        c.map(|c| {
+            serde_json::json!({
+                "software": c.software_detail,
+                "login_fp": c.login_fp,
+                "flags": format!("0x{:x}", c.server_flags),
+                "high_id": c.is_high_id,
+                "udp_port": c.udp_port,
+                "session_ip": c.ip.to_string(),
+                "sent_9f": state.natt_keepalive_seen.contains_key(&c.user_hash),
+            })
+        })
+    };
+    let ev = serde_json::json!({
+        "secs_ago_base": state.file_slab.now_secs(),
+        "kind": kind,
+        "target_id": target_id,
+        "target_id_odd": target_id & 1 == 1,
+        "requester": who(requester),
+        "target": who(target),
+        "outcome": outcome,
+        "from": from.map(|a| a.to_string()),
+    });
+    if let Ok(mut q) = state.natt_recent.lock() {
+        if q.len() >= NATT_RECENT_MAX {
+            q.pop_front();
+        }
+        q.push_back(ev);
+    }
+}
+
+/// The FAIL reason as a counter suffix.
+fn fail_name(reason: u8) -> &'static str {
+    match reason {
+        FAIL_TARGET_NOT_CONNECTED => "holepunch_fail_not_connected",
+        FAIL_TARGET_IS_HIGHID => "holepunch_fail_highid",
+        FAIL_BAD_REQUEST => "holepunch_fail_bad_request",
+        FAIL_TARGET_NO_UDP => "holepunch_fail_no_udp",
+        FAIL_NO_IPV4 => "holepunch_fail_no_ipv4",
+        _ => "holepunch_fail_other",
+    }
+}
+
+/// How long a repeated 0x60 for the same pair counts as a repeat: a client
+/// asks again when the first punch did not give it a connection, so this is
+/// the closest the server gets to a failure rate.
+const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+/// A target's 0x9F this soon after its extension wait timed out counts as
+/// late (the client answers, just slower than the wait).
+pub const LATE_9F_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The whole handling of an OP_LOWID_HOLEPUNCH_REQUEST: the extension when
 /// both peers use it, otherwise today's punch with its resends, plus the
@@ -448,11 +567,25 @@ pub fn request(
     requester_udp_port: u16,
     target_id: u32,
 ) {
+    // Counters (NAT-T analysis): requests, by client family, and repeats.
+    count(state, "holepunch_requests");
+    count(state, &format!("hp_req_sw:{}", sw_family(state, &requester_user_hash)));
+    {
+        let now = std::time::Instant::now();
+        let key = (requester_user_hash, target_id);
+        if let Some(prev) = state.holepunch_recent.insert(key, now) {
+            if now.duration_since(prev) < REPEAT_WINDOW {
+                count(state, "holepunch_repeat_10min");
+            }
+        }
+    }
     // A target the punch can be coordinated with at all; the checks and
     // their FAIL answers stay in `handle_holepunch_request`.
     let target = state
         .client_by_assigned_id(target_id)
-        .filter(|t| t.user_hash != requester_user_hash && !t.is_high_id && t.is_alive());
+        .filter(|t| t.user_hash != requester_user_hash && !t.is_high_id && t.is_alive())
+        // No wake-up for a pair that cannot be given IPv4 endpoints.
+        .filter(|t| session_v4(t.ip).is_some() && session_v4(requester_ip).is_some());
     if let Some(t) = &target {
         let r_flags = state
             .clients
@@ -478,7 +611,7 @@ pub fn request(
             }
         }
     }
-    handle_holepunch_request(
+    let failed = handle_holepunch_request(
         state,
         &requester_user_hash,
         requester_id,
@@ -487,6 +620,12 @@ pub fn request(
         requester_udp_port,
         target_id,
     );
+    count(state, failed.map_or("holepunch_first_info", fail_name));
+    {
+        let req = state.clients.get(&requester_user_hash).map(|c| c.clone());
+        let tgt = target.clone().or_else(|| state.client_by_assigned_id(target_id));
+        note_event(state, "0x60", req.as_ref(), tgt.as_ref(), target_id, failed.map_or("holepunch_first_info", fail_name));
+    }
     if let Some(t) = &target {
         bridge(state, &requester_user_hash, requester_ip, t);
     }
@@ -554,14 +693,42 @@ fn start_extension(
         .note(crate::admission::PushKind::Holepunch, outcome);
     count(state, "holepunch_ext_started");
     let state = Arc::clone(state);
+    let target_hash = target.user_hash;
     tokio::spawn(async move {
         let _guards = guards;
+        let started = std::time::Instant::now();
         let fresh = matches!(tokio::time::timeout(EXT_WAIT, rx).await, Ok(Ok(())));
         count(&state, if fresh { "holepunch_ext_fresh" } else { "holepunch_ext_timeout" });
+        if fresh {
+            // How soon the target answered, in buckets.
+            let ms = started.elapsed().as_millis();
+            count(
+                &state,
+                match ms {
+                    0..=499 => "holepunch_ext_9f_under_0.5s",
+                    500..=999 => "holepunch_ext_9f_0.5_1s",
+                    1000..=1999 => "holepunch_ext_9f_1_2s",
+                    _ => "holepunch_ext_9f_2_3s",
+                },
+            );
+        } else {
+            // Lost, or a client that does not answer 0x37 with 0x9F at all?
+            // Whether it ever sent one this session tells the two apart; a
+            // 0x9F soon after counts as late (see `keepalive_arrived`).
+            count(
+                &state,
+                if state.natt_keepalive_seen.contains_key(&target_hash) {
+                    "holepunch_ext_timeout_target_sent_9f_before"
+                } else {
+                    "holepunch_ext_timeout_target_never_sent_9f"
+                },
+            );
+            state.ext_timed_out.insert(target_hash, std::time::Instant::now());
+        }
         if !requester_alive(&state, &requester_user_hash) {
             return;
         }
-        let _ = handle_holepunch_request(
+        let failed = handle_holepunch_request(
             &state,
             &requester_user_hash,
             requester_id,
@@ -570,6 +737,17 @@ fn start_extension(
             requester_udp_port,
             target_id,
         );
+        count(&state, failed.map_or("holepunch_first_info", fail_name));
+        {
+            let req = state.clients.get(&requester_user_hash).map(|c| c.clone());
+            let tgt = state.clients.get(&target_hash).map(|c| c.clone());
+            let outcome = format!(
+                "extension, {}: {}",
+                if fresh { "fresh 0x9F" } else { "after the wait" },
+                failed.map_or("holepunch_first_info", fail_name)
+            );
+            note_event(&state, "0x60", req.as_ref(), tgt.as_ref(), target_id, &outcome);
+        }
         retry_loop(
             &state,
             requester_user_hash,
@@ -587,6 +765,11 @@ fn start_extension(
 /// A 0x9F from `user_hash`'s own address was accepted: release the
 /// extension coordinations waiting for it.
 pub fn keepalive_arrived(state: &ServerState, user_hash: &[u8; 16]) {
+    if let Some((_, at)) = state.ext_timed_out.remove(user_hash) {
+        if at.elapsed() < LATE_9F_WINDOW {
+            count(state, "holepunch_ext_late_9f");
+        }
+    }
     if let Some((_, waiters)) = state.natt_keepalive_waiters.remove(user_hash) {
         for w in waiters {
             let _ = w.send(());
@@ -614,9 +797,10 @@ fn bridge(state: &ServerState, requester_user_hash: &[u8; 16], requester_ip: IpA
         .push
         .note(crate::admission::PushKind::Holepunch, outcome);
     count(state, "holepunch_bridged");
+    count(state, &format!("hp_bridged_sw:{}", sw_family(state, &target.user_hash)));
 }
 
-/// OP_LOWID_HOLEPUNCH_INFO payload, 29 bytes:
+/// OP_LOWID_HOLEPUNCH_INFO payload, 30 bytes (29 + peer_crypt):
 ///   peer_ip(4 LE) + peer_tcp_port(2 LE) + peer_udp_port(2 LE)
 ///   + peer_user_hash(16) + role(1) + peer_id(4 LE)
 /// `peer_id` (issue #38) is the server ID of the peer described; a client
@@ -636,8 +820,7 @@ fn build_info(
     match ip {
         // eD2k stores IPv4 as a u32; writing the octets in order is equivalent
         // to u32::from_le_bytes(octets) written little-endian.
-        IpAddr::V4(v4) => p.put_u32_le(u32::from_le_bytes(v4.octets())),
-        _ => p.put_u32_le(0),
+        ip => p.put_u32_le(session_v4(ip).map_or(0, |v4| u32::from_le_bytes(v4.octets()))),
     }
     p.put_u16_le(tcp_port);
     p.put_u16_le(udp_port);
@@ -753,8 +936,8 @@ mod tests {
         assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
     }
 
-    /// Mixed pairs and legacy pairs: today's 29-byte 0x61 at once, no 0x37,
-    /// whichever side has the extension.
+    /// Mixed pairs and legacy pairs: 0x61 at once (30 bytes since #42), no
+    /// 0x37, whichever side has the extension.
     #[tokio::test]
     async fn a_pair_without_the_extension_on_both_sides_is_unchanged() {
         for (fa, fb) in [(EXT, SRVCAP_NATTRAVERSAL), (SRVCAP_NATTRAVERSAL, EXT), (0, 0), (EXT, 0)] {
@@ -764,8 +947,8 @@ mod tests {
             // B has proven it reads 0x61, so no bridge either.
             s.natt_keepalive_seen.insert([0xB; 16], false);
             ask(&s, 0xA, 11, 1, 13);
-            assert_eq!(opcodes(&drain(&mut a)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)], "{fa:#x} {fb:#x}");
-            assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)], "{fa:#x} {fb:#x}");
+            assert_eq!(opcodes(&drain(&mut a)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)], "{fa:#x} {fb:#x}");
+            assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)], "{fa:#x} {fb:#x}");
         }
     }
 
@@ -780,8 +963,8 @@ mod tests {
         let mut b = peer(&s, 0xB, 13, 2, EXT);
         s.natt_keepalive_seen.insert([0xB; 16], false);
         ask(&s, 0xA, 11, 1, 13);
-        assert_eq!(opcodes(&drain(&mut a)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)]);
-        assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)]);
+        assert_eq!(opcodes(&drain(&mut a)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
+        assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
     }
 
     /// The bridge: a target that set 0x1000 and never sent a 0x9F also gets
@@ -793,9 +976,9 @@ mod tests {
             let mut a = peer(&s, 0xA, 11, 1, requester_flags);
             let mut b = peer(&s, 0xB, 13, 2, SRVCAP_NATTRAVERSAL);
             ask(&s, 0xA, 11, 1, 13);
-            assert_eq!(opcodes(&drain(&mut a)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)]);
+            assert_eq!(opcodes(&drain(&mut a)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
             let to_b = drain(&mut b);
-            assert_eq!(opcodes(&to_b), vec![(OP_LOWID_HOLEPUNCH_INFO, 29), (0x37, 11)]);
+            assert_eq!(opcodes(&to_b), vec![(OP_LOWID_HOLEPUNCH_INFO, 30), (0x37, 11)]);
             // ip, the requester's port, its id, crypt 0.
             assert_eq!(to_b[1].payload, vec![10, 0, 0, 1, 0x40, 0x12, 11, 0, 0, 0, 0]);
         }
@@ -804,7 +987,7 @@ mod tests {
         let _a = peer(&s, 0xA, 11, 1, 0);
         let mut b = peer(&s, 0xB, 13, 2, 0);
         ask(&s, 0xA, 11, 1, 13);
-        assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)]);
+        assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
         let s = Arc::new(ServerState::for_test());
         let mut cfg = (**s.live_cfg.load()).clone();
         cfg.network.lugdunum_natt = false;
@@ -812,7 +995,7 @@ mod tests {
         let _a = peer(&s, 0xA, 11, 1, 0);
         let mut b = peer(&s, 0xB, 13, 2, SRVCAP_NATTRAVERSAL);
         ask(&s, 0xA, 11, 1, 13);
-        assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 29)]);
+        assert_eq!(opcodes(&drain(&mut b)), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
     }
 
     /// A bridged target without a UDP port still gets the 0x37: it dials
@@ -879,6 +1062,27 @@ mod tests {
         assert_eq!((udp, hash, id), (40001, a, 100), "B is told A's port and id");
         let (tcp, udp, hash, id) = info_of(&mut rx_a);
         assert_eq!((tcp, udp, hash, id), (24830, 40002, b, 200), "A is told B's port and id");
+    }
+
+    #[test]
+    fn a_pair_without_ipv4_on_both_sides_is_refused() {
+        let state = ServerState::for_test();
+        let v6: IpAddr = "2001:db8::5".parse().unwrap();
+        let v4 = IpAddr::V4(Ipv4Addr::new(5, 6, 7, 9));
+        let (a, b) = ([0x51u8; 16], [0x52u8; 16]);
+        let _rx_a = state.register_test_client_at(a, 101, false, 4672, v4);
+        let _rx_b = state.register_test_client_at(b, 201, false, 4672, v6);
+        assert_eq!(
+            handle_holepunch_request(&state, &b, 201, v6, 4662, 4672, 101),
+            Some(FAIL_NO_IPV4),
+            "an IPv6 requester is not handed 0.0.0.0"
+        );
+        assert_eq!(
+            handle_holepunch_request(&state, &a, 101, v4, 4662, 4672, 201),
+            Some(FAIL_NO_IPV4),
+            "nor is an IPv4 requester told an IPv6 target's 0.0.0.0"
+        );
+        assert_eq!(session_v4("::ffff:1.2.3.4".parse().unwrap()), Some(Ipv4Addr::new(1, 2, 3, 4)));
     }
 
     #[test]

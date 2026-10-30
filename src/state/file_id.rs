@@ -430,6 +430,30 @@ impl SlabShard {
 ///   map. This is the Lugdunum-style intrusive index that replaced the former
 ///   `DashMap<FileHash, FileId>` (Stage 4 "lever C": removes the duplicate hash
 ///   and the DashMap overhead, and the old cross-structure lock ordering).
+/// Do two sizes for one hash describe the same file? 0 is unknown and agrees
+/// with anything; so does a size cut to 32 bits against the full one above
+/// 4 GiB (a client without large-file support publishes or asks with the
+/// low 32 bits only), which is the same file and the same sources.
+pub fn sizes_agree(a: u64, b: u64) -> bool {
+    if a == 0 || b == 0 || a == b {
+        return true;
+    }
+    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+    lo <= u64::from(u32::MAX) && hi > u64::from(u32::MAX) && hi & u64::from(u32::MAX) == lo
+}
+
+/// What `add_or_refresh_source_sized` did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SizedMerge {
+    /// Added or refreshed; the stored name when the publisher used another.
+    Merged(Option<Arc<str>>),
+    /// The record holds another size (given) and still has sources: not
+    /// merged.
+    SizeMismatch(u64),
+    /// No live record for the hash.
+    Unknown,
+}
+
 pub struct FileSlab {
     shards: Vec<std::sync::RwLock<SlabShard>>,
     /// Live file count, maintained by get_or_insert/insert_sourceless/tombstone
@@ -620,6 +644,47 @@ impl FileSlab {
         name
     }
 
+    /// Tombstone `id` whatever its sources, returning its name for the keyword
+    /// removal that must follow. For a file the content filter now refuses
+    /// (`/api/indexcheck?purge=1`).
+    pub fn tombstone_take_name(&self, id: FileId) -> Option<FileName> {
+        self.tombstone_where(id, |_| true)
+    }
+
+    /// Visit every live record as owned copies, one `SCAN_CHUNK` at a time:
+    /// the copies are taken under the shard lock and `f` runs after it is
+    /// released, so slow work on each file (a content-filter check) never
+    /// holds writers off. `(id, hash, size, name, sources)`.
+    pub fn for_each_live_copied<F: FnMut(Vec<(FileId, FileHash, u64, String, u32)>)>(&self, mut f: F) {
+        const SCAN_CHUNK: usize = 4 * 1024;
+        for (s_no, shard) in self.shards.iter().enumerate() {
+            let mut start = 0usize;
+            loop {
+                let sh = shard.read().unwrap();
+                let end = sh.records.len().min(start + SCAN_CHUNK);
+                if start >= end {
+                    break;
+                }
+                let mut batch = Vec::with_capacity(end - start);
+                for i in start..end {
+                    let r = &sh.records[i];
+                    if r.alive() {
+                        batch.push((
+                            make_id(s_no as u32, i as u32),
+                            r.hash,
+                            r.size,
+                            r.name().to_string(),
+                            r.sources.len() as u32,
+                        ));
+                    }
+                }
+                drop(sh);
+                f(batch);
+                start = end;
+            }
+        }
+    }
+
     /// Tombstone by hash (convenience for callers that hold a hash, not an id).
     pub fn tombstone_by_hash(&self, hash: &FileHash) -> bool {
         if let Some(id) = self.id_of(hash) {
@@ -756,6 +821,48 @@ impl FileSlab {
             None
         } else {
             Some(Arc::from(r.name()))
+        }
+    }
+
+    /// `add_or_refresh_source_named` for a publisher that also gave a size
+    /// (issue #45). A record is one (hash, size); a publisher whose size
+    /// differs is not merged into it, or a sized GETSOURCES for one file
+    /// would get the sources of another. The first size stays, unless the
+    /// record has no source left: then the new publisher's size replaces it,
+    /// so a wrong size cannot hold a hash once its publisher has gone. 0 on
+    /// either side means unknown and matches anything.
+    pub fn add_or_refresh_source_sized(
+        &self,
+        hash: &FileHash,
+        size: u64,
+        src: Source,
+        published_as: &str,
+    ) -> SizedMerge {
+        let Some(id) = self.id_of(hash) else { return SizedMerge::Unknown };
+        let Some(shard) = self.shards.get(id_shard(id)) else { return SizedMerge::Unknown };
+        let mut sh = shard.write().unwrap();
+        let Some(r) = sh.records.get_mut(id_index(id)) else { return SizedMerge::Unknown };
+        if !r.alive() {
+            return SizedMerge::Unknown;
+        }
+        if !sizes_agree(r.size, size) {
+            if !r.sources.is_empty() {
+                return SizedMerge::SizeMismatch(r.size);
+            }
+            r.size = size;
+        } else if size > r.size {
+            // The full size of a file stored cut to 32 bits (or unknown).
+            r.size = size;
+        }
+        if let Some(existing) = r.sources.iter_mut().find(|s| s.user_hash == src.user_hash) {
+            existing.set_complete(src.complete());
+        } else {
+            r.sources.push(src);
+        }
+        if r.name() == published_as {
+            SizedMerge::Merged(None)
+        } else {
+            SizedMerge::Merged(Some(Arc::from(r.name())))
         }
     }
 
@@ -1376,5 +1483,47 @@ mod tests {
         for i in 0..50u32 {
             assert!(slab.id_of(&h_of(i)).is_some());
         }
+    }
+
+    #[test]
+    fn a_publisher_with_another_size_is_not_merged() {
+        let slab = FileSlab::new();
+        let h = [0x45u8; 16];
+        let a = Source::new([1; 16], "1.2.3.4".parse().unwrap(), 4662, true);
+        let b = Source::new([2; 16], "1.2.3.5".parse().unwrap(), 4662, true);
+        let c = Source::new([3; 16], "1.2.3.6".parse().unwrap(), 4662, true);
+        let (id, _) = slab.get_or_insert(h, 2_000_000_000, "f", a);
+        assert_eq!(
+            slab.add_or_refresh_source_sized(&h, 2_000_000_001, b, "f"),
+            SizedMerge::SizeMismatch(2_000_000_000)
+        );
+        assert_eq!(slab.get(id).unwrap().sources.len(), 1);
+        assert_eq!(slab.add_or_refresh_source_sized(&h, 2_000_000_000, c, "f"), SizedMerge::Merged(None));
+        assert_eq!(slab.add_or_refresh_source_sized(&h, 0, b, "f"), SizedMerge::Merged(None), "0 is unknown");
+        // Once nobody holds the first size, the next publisher's size wins.
+        for u in [[1u8; 16], [2; 16], [3; 16]] {
+            slab.remove_user_source(id, &u);
+        }
+        let d = Source::new([4; 16], "1.2.3.7".parse().unwrap(), 4662, true);
+        assert_eq!(slab.add_or_refresh_source_sized(&h, 7, d, "f"), SizedMerge::Merged(None));
+        assert_eq!(slab.get(id).unwrap().size, 7);
+    }
+
+    #[test]
+    fn a_size_cut_to_32_bits_is_the_same_file() {
+        let big = 6_442_450_944u64 + 123;
+        assert!(sizes_agree(big, big & 0xFFFF_FFFF));
+        assert!(sizes_agree(big & 0xFFFF_FFFF, big));
+        assert!(sizes_agree(0, 5) && sizes_agree(5, 0));
+        assert!(!sizes_agree(big, big + 1));
+        assert!(!sizes_agree(100, 101));
+        // Stored cut, then the full size arrives: the record takes it.
+        let slab = FileSlab::new();
+        let h = [0x46u8; 16];
+        let a = Source::new([1; 16], "1.2.3.4".parse().unwrap(), 4662, true);
+        let b = Source::new([2; 16], "1.2.3.5".parse().unwrap(), 4662, true);
+        let (id, _) = slab.get_or_insert(h, big & 0xFFFF_FFFF, "f", a);
+        assert_eq!(slab.add_or_refresh_source_sized(&h, big, b, "f"), SizedMerge::Merged(None));
+        assert_eq!(slab.get(id).unwrap().size, big);
     }
 }

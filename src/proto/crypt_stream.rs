@@ -50,6 +50,12 @@ const MAX_ENCRYPT_CHUNK: usize = 64 * 1024;
 const PENDING_KEEP: usize = 512;
 
 impl CryptStream {
+    /// The socket underneath, for socket options (the takeover probe sets
+    /// `TCP_USER_TIMEOUT` on it, issue #41).
+    pub fn tcp(&self) -> &TcpStream {
+        &self.inner
+    }
+
     pub fn plain(stream: TcpStream) -> Self {
         Self::new(stream, None, None, vec![])
     }

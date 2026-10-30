@@ -116,15 +116,20 @@ impl ClientCrypt {
             marker = crate::proto::obfuscation::random_bytes(1)[0];
         }
 
-        let mut out = Vec::with_capacity(11);
+        let mut out = Vec::with_capacity(12);
         out.push(marker);
         out.extend_from_slice(&keypart.to_le_bytes());
 
-        // Encrypted from here on. No padding: the length byte is honoured by
-        // every implementation and zero keeps the exchange one packet shorter.
-        let mut body = Vec::with_capacity(6);
+        // Encrypted from here on: <magic 4><methods supported 1><method
+        // preferred 1><padding length 1>, as eMule and aMule read it
+        // (EncryptedStreamSocket, ONS_BASIC_CLIENTA_METHODTAGSPADLEN reads
+        // three bytes). This sent one method byte only, so the peer took the
+        // first byte of the HELLO as the padding length (issue #44). No
+        // padding: zero keeps the exchange one packet shorter.
+        let mut body = Vec::with_capacity(7);
         body.extend_from_slice(&MAGIC_SYNC.to_le_bytes());
-        body.push(0); // encryption method: RC4
+        body.push(0); // methods supported: obfuscation (RC4)
+        body.push(0); // method preferred: the same
         body.push(0); // padding length
         send.apply(&mut body);
         out.extend_from_slice(&body);
@@ -270,7 +275,14 @@ pub async fn probe_identity_hash(
                 %addr, elapsed_us = started.elapsed().as_micros(), error = %e,
                 "probe_identity: connect failed"
             );
-            return Err("connect refused");
+            // A reset means the host is there and the port closed (or a
+            // firewall that rejects); anything else (an ICMP unreachable, no
+            // route) means the packets did not get there.
+            return Err(if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                "connect refused"
+            } else {
+                "connect unreachable"
+            });
         }
         Err(_) => {
             debug!(
@@ -318,19 +330,6 @@ pub async fn probe_identity_hash(
         None
     };
 
-    let mut hello = build_hello(our_user_hash, our_id, our_port);
-    if let Some(c) = crypt.as_mut() {
-        c.send.apply(&mut hello);
-    }
-    match tokio::time::timeout(deadline, stream.write_all(&hello)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            debug!(%addr, error = %e, "probe_identity: write failed");
-            return Err("write failed");
-        }
-        Err(_) => return Err("write timeout"),
-    }
-
     // The peer answers the handshake before anything else, with its own magic
     // value under ITS send key — which is our recv key. Getting this right also
     // proves the peer knows its own user hash, since the key is derived from it.
@@ -360,9 +359,12 @@ pub async fn probe_identity_hash(
         if head[4] != 0 {
             return Err("peer chose an encryption method we do not implement");
         }
-        // Masked to four bits, as Lugdunum does: the field is a byte but no
-        // implementation sends more than 15 bytes of padding here.
-        let pad = (head[5] & 0x0F) as usize;
+        // The whole byte. A client pads its answer to the server it is
+        // logging into with under 16 bytes (aMule: `AwaitingTestFromIP`),
+        // which is why masking to four bits, as Lugdunum does, seemed right;
+        // to anyone else, a later re-check or the IPv6 dial-back, it pads
+        // up to its CryptTCPPaddingLength, 254 by default (issue #44).
+        let pad = head[5] as usize;
         if pad > 0 {
             let mut sink = vec![0u8; pad];
             match tokio::time::timeout(deadline, stream.read_exact(&mut sink)).await {
@@ -372,6 +374,22 @@ pub async fn probe_identity_hash(
             c.recv.apply(&mut sink);
         }
         debug!(%addr, pad, "probe_identity: obfuscated handshake accepted");
+    }
+
+    // The HELLO only once the handshake is complete: a peer still
+    // negotiating treats bytes beyond the step it is on as an error, and on
+    // a fast path the two writes arrive as one segment (issue #44).
+    let mut hello = build_hello(our_user_hash, our_id, our_port);
+    if let Some(c) = crypt.as_mut() {
+        c.send.apply(&mut hello);
+    }
+    match tokio::time::timeout(deadline, stream.write_all(&hello)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            debug!(%addr, error = %e, "probe_identity: write failed");
+            return Err("write failed");
+        }
+        Err(_) => return Err("write timeout"),
     }
 
     // READ FRAMES UNTIL THE RIGHT ONE, rather than assuming the first is it.
@@ -677,14 +695,14 @@ mod tests {
     }
 
     #[test]
-    fn the_obfuscated_opening_has_the_shape_lugdunum_sends() {
+    fn the_obfuscated_opening_has_the_shape_emule_reads() {
         // Layout, initiator side:
         //   [1] semi-random marker, in the clear
         //   [4] key part, in the clear
-        //   [6] RC4( magic 0x835E6FC4 | method 0 | padding length 0 )
+        //   [7] RC4( magic 0x835E6FC4 | supported 0 | preferred 0 | padding 0 )
         let peer = [0x5Au8; 16];
         let (_state, opening) = ClientCrypt::start(&peer);
-        assert_eq!(opening.len(), 11, "1 + 4 + 6");
+        assert_eq!(opening.len(), 12, "1 + 4 + 7");
         assert!(
             !crate::proto::obfuscation::FORBIDDEN_MARKERS.contains(&opening[0]),
             "the clear marker must not look like a protocol byte"
@@ -722,8 +740,94 @@ mod tests {
             MAGIC_SYNC,
             "the peer must recover the magic value"
         );
-        assert_eq!(body[4], 0, "encryption method RC4");
-        assert_eq!(body[5] & 0x0F, 0, "no padding");
+        assert_eq!(body.len(), 7);
+        assert_eq!(body[4], 0, "methods supported: RC4");
+        assert_eq!(body[5], 0, "method preferred: RC4");
+        assert_eq!(body[6], 0, "no padding");
+    }
+
+    /// A peer that negotiates the way aMule's receiving side does
+    /// (EncryptedStreamSocket::Negotiate): one step at a time, bytes beyond
+    /// the step it is on before it has answered are an error, and it pads its
+    /// answer with more than 15 bytes, as it does to anyone but the server it
+    /// is logging into (issue #44).
+    #[tokio::test]
+    async fn the_obfuscated_probe_negotiates_before_its_hello() {
+        use crate::proto::obfuscation::{Rc4, MAGIC_SYNC, MAGIC_VALUE_REQUESTER, MAGIC_VALUE_SERVER};
+        use md5::{Digest, Md5};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let peer_hash = [0x3Cu8; 16];
+        let ours = server_pseudo_user_hash(&[1u8; 16]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut opening = [0u8; 12];
+            s.read_exact(&mut opening).await.unwrap();
+            // Nothing more may be waiting: the HELLO must follow our answer.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut extra = [0u8; 1];
+            let early = tokio::time::timeout(Duration::from_millis(10), s.read(&mut extra)).await;
+            assert!(early.is_err(), "data beyond the negotiation before the answer");
+            let keypart = &opening[1..5];
+            let key = |magic: u8| {
+                let mut h = Md5::new();
+                h.update(peer_hash);
+                h.update([magic]);
+                h.update(keypart);
+                Rc4::new(&h.finalize(), true)
+            };
+            let mut recv = key(MAGIC_VALUE_REQUESTER);
+            let mut send = key(MAGIC_VALUE_SERVER);
+            let mut body = opening[5..].to_vec();
+            recv.apply(&mut body);
+            assert_eq!(u32::from_le_bytes([body[0], body[1], body[2], body[3]]), MAGIC_SYNC);
+            assert_eq!(body[6], 0, "padding length is the third byte");
+            // Answer with 200 bytes of padding.
+            let mut answer = MAGIC_SYNC.to_le_bytes().to_vec();
+            answer.push(0);
+            answer.push(200);
+            answer.extend(std::iter::repeat(0x55).take(200));
+            send.apply(&mut answer);
+            s.write_all(&answer).await.unwrap();
+            // Now the HELLO, decrypted from its first byte.
+            let mut head = [0u8; 6];
+            s.read_exact(&mut head).await.unwrap();
+            recv.apply(&mut head);
+            assert_eq!((head[0], head[5]), (PROTO_EDONKEY, OP_HELLO));
+            let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
+            let mut rest = vec![0u8; len - 1];
+            s.read_exact(&mut rest).await.unwrap();
+            recv.apply(&mut rest);
+            assert_eq!(&rest[1..17], &ours[..], "the HELLO carries the server's hash");
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&peer_hash);
+            reply.extend_from_slice(&0x0100_007Fu32.to_le_bytes());
+            reply.extend_from_slice(&4662u16.to_le_bytes());
+            reply.extend_from_slice(&0u32.to_le_bytes());
+            reply.extend_from_slice(&[0u8; 6]);
+            let mut frame = vec![PROTO_EDONKEY];
+            frame.extend_from_slice(&((reply.len() + 1) as u32).to_le_bytes());
+            frame.push(OP_HELLOANSWER);
+            frame.extend_from_slice(&reply);
+            send.apply(&mut frame);
+            s.write_all(&frame).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        let got = probe_identity_hash(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            &peer_hash,
+            &ours,
+            0x0100_007F,
+            6082,
+            3000,
+            true,
+        )
+        .await;
+        peer.await.unwrap();
+        assert_eq!(got, Ok(peer_hash));
     }
 
     #[test]

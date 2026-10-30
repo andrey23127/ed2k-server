@@ -48,6 +48,160 @@ impl std::error::Error for SessionRefused {}
 /// A reservation, not a count-then-insert (issue #25): the slot is taken with
 /// one compare-and-swap before the login does any work, so concurrent logins
 /// cannot all see room. The connection task holds it until it ends.
+/// May a login from `ip` with listen port `listen_port` replace `prev`, the
+/// live session of the same user hash (issue #41)? User hashes are public:
+/// every hello and every source exchange carries them, so a hash alone does
+/// not say who is asking. Yes when:
+///  1. the old session is already gone (its connection task has ended);
+///  2. the same source: the same IPv4, or the same IPv6 prefix — the
+///     NAT-dropped reconnect this replacement exists for;
+///  3. a dual-stack move: the old session is IPv4, the new one comes from
+///     exactly the IPv6 the old one advertised (`CT_MOD_IP_V6`) and has the
+///     same listen port. Only that host can connect from that address. Not
+///     the other way: that would trust an address the newcomer claims.
+pub(crate) fn may_replace_session(
+    state: &ServerState,
+    prev: &crate::state::ClientHandle,
+    ip: std::net::IpAddr,
+    listen_port: u16,
+) -> bool {
+    use std::net::IpAddr;
+    if !prev.is_alive() || state.live_cfg.load().limits.hash_takeover_from_any_address {
+        return true;
+    }
+    // A hash many people use identifies no one: there is no owner to protect,
+    // and refusing them all but one locks the rest out of the server.
+    if is_shared_hash(state, &prev.user_hash) {
+        return true;
+    }
+    let canon = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    };
+    let (old, new) = (canon(prev.ip), canon(ip));
+    if state.source_key(old) == state.source_key(new) {
+        return true;
+    }
+    matches!((old, new), (IpAddr::V4(_), IpAddr::V6(v6))
+        if prev.ipv6 == Some(v6) && prev.port == listen_port)
+}
+
+/// The takeover probe (issue #41, ModderMule's idea as got3nks refined it).
+/// A contested login makes the old session's task set `TCP_USER_TIMEOUT` to
+/// `PROBE_USER_TIMEOUT` and write it an `OP_SERVERSTATUS`. When the user has
+/// moved, the old path is dead and nothing answers: the kernel aborts the
+/// connection once the write has gone unacknowledged that long, the old
+/// session ends, and the new login, held meanwhile, goes ahead. An ACK means
+/// the old session is alive: the login is refused, and the timeout goes back
+/// to `SESSION_TCP_USER_TIMEOUT`. The wait stays inside the 25 s eMule-family
+/// clients allow for the login answer, so a real move succeeds on the first
+/// attempt instead of after about five minutes.
+const PROBE_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The abort fires at the first retransmission after the timeout: up to a
+/// few seconds past it with exponential backoff.
+const TAKEOVER_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(16);
+/// A contender refused after a probe is refused without one this long.
+const TAKEOVER_CONTENDER_MEMORY: std::time::Duration = std::time::Duration::from_secs(600);
+/// After a probe found the session alive, the next one waits this long.
+const TAKEOVER_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+/// The usual limit on unacknowledged data for client sockets; the same value
+/// as `TCP_USER_TIMEOUT` set at accept in main.rs.
+const SESSION_TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Is the old session gone? Probes it when no probe is running or cooling
+/// down; one probe per session at a time, so contested logins cannot be used
+/// to keep writing to a live owner. A login that arrives while a probe runs
+/// waits for that probe's outcome.
+async fn old_session_gone(state: &ServerState, prev: &ClientHandle) -> bool {
+    if !prev.is_alive() {
+        return true;
+    }
+    let now = std::time::Instant::now();
+    let started = {
+        let mut e = state.takeover_probes.entry(prev.user_hash).or_insert(None);
+        match *e {
+            // Running: wait for it.
+            Some(t) if now.duration_since(t) < TAKEOVER_PROBE_WAIT => t,
+            // Just found the session alive.
+            Some(t) if now.duration_since(t) < TAKEOVER_PROBE_WAIT + TAKEOVER_PROBE_COOLDOWN => {
+                return !prev.is_alive();
+            }
+            _ => {
+                *e = Some(now);
+                let mut p = BytesMut::with_capacity(8);
+                p.put_u32_le(state.client_count() as u32);
+                p.put_u32_le(state.file_count() as u32);
+                let _ = prev.send_frame(Frame::new(INTERNAL_PROBE, p.to_vec()));
+                crate::server::holepunch::count(state, "login_takeover_probe");
+                now
+            }
+        }
+    };
+    let deadline = tokio::time::Instant::from_std(started + TAKEOVER_PROBE_WAIT);
+    while tokio::time::Instant::now() < deadline {
+        if !prev.is_alive() {
+            crate::server::holepunch::count(state, "login_takeover_after_probe");
+            // That session is gone; the next contest is about a new one.
+            state.takeover_probes.remove(&prev.user_hash);
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    !prev.is_alive()
+}
+
+/// Is this user hash used by many installs at once, so that it identifies no
+/// one (issue #41)? Either it is degenerate — 12 or more zero bytes, as the
+/// "corrupt" community hash `00000000000E00000000000000006F00` of a leecher
+/// mod is; a random hash practically never is — or the operator lists it in
+/// `limits.shared_user_hashes` or on the built-in list of DLP's community
+/// hashes. For such a
+/// hash the old rule applies: the newest login takes the session.
+///
+/// Not by how many addresses contest it: that is exactly what a hijacker
+/// produces — three logins from three proxies would turn any user's hash
+/// into a shared one (got3nks). The address count is only reported, in
+/// `/api/takeover`.
+pub(crate) fn is_shared_hash(state: &ServerState, h: &crate::state::UserHash) -> bool {
+    if h.iter().filter(|b| **b == 0).count() >= 12 {
+        return true;
+    }
+    let hex = hex::encode(h);
+    crate::config::DLP_SHARED_USER_HASHES
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(&hex))
+        || state
+            .live_cfg
+            .load()
+            .limits
+            .shared_user_hashes
+            .iter()
+            .any(|s| s.trim().eq_ignore_ascii_case(&hex))
+}
+
+/// Refuse a login whose user hash is online from elsewhere (issue #41).
+async fn refuse_hash_in_use(
+    framed: &mut Framed<CryptStream, Ed2kCodec>,
+    state: &ServerState,
+    peer: SocketAddr,
+    user_hash: &crate::state::UserHash,
+) -> anyhow::Error {
+    *state
+        .block_stats
+        .entry("login_hash_in_use".to_string())
+        .or_insert(0) += 1;
+    let text = b"This user hash is already connected from another address";
+    let mut payload = Vec::with_capacity(2 + text.len());
+    payload.extend_from_slice(&(text.len() as u16).to_le_bytes());
+    payload.extend_from_slice(text);
+    let _ = framed.send(Frame::new(OP_SERVERMESSAGE, payload)).await;
+    if let Some(sup) = crate::health::throttle().allow(peer.ip(), "login_hash_in_use", crate::health::SUPPRESS_WINDOW) {
+        info!(ip = %peer.ip(), user_hash = hex::encode(user_hash), suppressed = sup,
+              "login refused — user hash online from another address");
+    }
+    SessionRefused("user hash online from another address").into()
+}
+
 pub(crate) fn reserve_client_slot(
     state: &ServerState,
     user_hash: &crate::state::UserHash,
@@ -224,12 +378,17 @@ pub async fn handle_admitted_connection(
     // per-IP slot. When the peer abandons such a socket without closing it
     // (seen live: one address kept 100 of them open, silent for 3-5 hours,
     // each until the 6 h backstop), only a short silence limit frees it. It
-    // is not closed outright: two installs sharing one user hash would then
-    // knock each other off in a loop, and a copy that still talks is kept.
+    // is not closed the moment it is replaced: two installs sharing one user
+    // hash would then knock each other off as fast as they reconnect. But it
+    // is fenced: its first frame closes it (issue #46), unless the hash is a
+    // shared one.
     let replaced_idle = std::time::Duration::from_secs(10 * 60);
     // How often a logged-in session re-checks whether it has been replaced.
     let replaced_recheck = std::time::Duration::from_secs(60);
     let mut last_activity = tokio::time::Instant::now();
+    // While a takeover probe runs (issue #41): when to put the socket's
+    // TCP_USER_TIMEOUT back.
+    let mut probe_restore: Option<tokio::time::Instant> = None;
     // A banned bot gets no session for its 24 hours, over TCP as over UDP.
     if state.is_bot_banned(peer.ip()) {
         crate::server::bot_detector::note_banned(&state, peer.ip(), &[]);
@@ -265,7 +424,8 @@ pub async fn handle_admitted_connection(
                 let udp_idle = std::time::Duration::from_millis(c.idle_ms());
                 now + logged_in_backstop.saturating_sub(tcp_idle.min(udp_idle))
             };
-            (deadline, deadline.min(now + replaced_recheck))
+            let wake = deadline.min(now + replaced_recheck);
+            (deadline, probe_restore.map_or(wake, |t| wake.min(t)))
         } else {
             // Not logged in: tight timeout guards against half-open / scanner
             // sockets that complete the crypto handshake but never LOGINREQUEST.
@@ -274,6 +434,13 @@ pub async fn handle_admitted_connection(
 
         tokio::select! {
             _ = tokio::time::sleep_until(wake) => {
+                if probe_restore.is_some_and(|t| tokio::time::Instant::now() >= t) {
+                    // The probe got its ACK in time: back to the usual limit.
+                    probe_restore = None;
+                    let _ = socket2::SockRef::from(framed.get_ref().tcp())
+                        .set_tcp_user_timeout(Some(SESSION_TCP_USER_TIMEOUT));
+                    continue;
+                }
                 if tokio::time::Instant::now() < deadline {
                     // A re-check tick, not a timeout.
                     continue;
@@ -307,6 +474,36 @@ pub async fn handle_admitted_connection(
                 if let Some(c) = client.as_ref() { c.touch_activity(); }
                 match result {
                     Some(Ok(frame)) => {
+                        // A replaced session holds no authority (issue #46):
+                        // the user's state belongs to the new login, and a
+                        // frame from here would publish, search or relay
+                        // under an identity this socket no longer owns. Its
+                        // first frame closes it, so a client still using it
+                        // notices and logs in again; a silent one goes after
+                        // `replaced_idle`, as before.
+                        //
+                        // Not for a shared hash (DLP's list, mldonkey's, the
+                        // operator's): it identifies no one, its sessions
+                        // are different installs, and closing the displaced
+                        // one only sent it straight back to displace the
+                        // other. Live, fencing them turned 1.2k shared-hash
+                        // takeovers in ten hours into 11k in eight.
+                        if let Some(c) = client.as_ref() {
+                            let current = state
+                                .clients
+                                .get(&c.user_hash)
+                                .is_some_and(|e| e.same_session(c));
+                            if !current && !is_shared_hash(&state, &c.user_hash) {
+                                debug!(ip = %peer.ip(),
+                                       opcode = format_args!("0x{:02X}", frame.opcode),
+                                       "frame on a replaced session — closing it");
+                                *state
+                                    .block_stats
+                                    .entry("replaced_session_frame_refused".to_string())
+                                    .or_insert(0) += 1;
+                                break;
+                            }
+                        }
                         // Boxed: the dispatch future (login, search, offer
                         // handling and every await inside them) is several KB.
                         // Inline it was part of this connection's state for the
@@ -378,7 +575,16 @@ pub async fn handle_admitted_connection(
                     break;
                 }
             }
-            Some(frame) = rx.recv() => {
+            Some(mut frame) = rx.recv() => {
+                if frame.opcode == INTERNAL_PROBE {
+                    // Issue #41: data unacknowledged for PROBE_USER_TIMEOUT
+                    // now aborts the connection — the read below then ends
+                    // the session, and the login waiting on it goes ahead.
+                    let _ = socket2::SockRef::from(framed.get_ref().tcp())
+                        .set_tcp_user_timeout(Some(PROBE_USER_TIMEOUT));
+                    probe_restore = Some(tokio::time::Instant::now() + TAKEOVER_PROBE_WAIT);
+                    frame = Frame::new(OP_SERVERSTATUS, std::mem::take(&mut frame.payload));
+                }
                 if let Err(e) = framed.send(frame).await {
                     debug!(ip = %peer.ip(), error = %e, "send error on pushed frame");
                     break;
@@ -463,6 +669,7 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         // stale entry here survives indefinitely because nothing else
         // references it.
         state.client_ipv6.remove(&c.user_hash);
+        state.ipv6_probe.remove(&c.user_hash);
         // Its keepalive port goes too: a reconnect from another address
         // must not be handed out with the old mapping (issue #37).
         state.natt_udp_ports.remove(&c.user_hash);
@@ -610,6 +817,41 @@ async fn dispatch(
                     return Err(SessionRefused("banned CSAM publisher").into());
                 }
             }
+            // Issue #41: the hash is online from elsewhere. Checked before the
+            // slot and the HighID probe, and again just before the insert.
+            let online = state.clients.get(&req.user_hash).map(|c| c.clone());
+            if let Some(prev) = online {
+                if prev.is_alive() && is_shared_hash(state, &prev.user_hash) {
+                    crate::server::holepunch::count(state, "login_takeover_shared_hash");
+                }
+                if !may_replace_session(state, &prev, peer.ip(), req.port) {
+                    // A contender this hash's owner already outlasted: two
+                    // installs sharing one user hash retry every few seconds,
+                    // and probing the owner for each would keep its socket
+                    // on a 10 s fuse. Refused without a probe for a while.
+                    let key = (req.user_hash, state.source_key(peer.ip()));
+                    let known = state
+                        .takeover_lost
+                        .get(&key)
+                        .is_some_and(|e| e.0.elapsed() < TAKEOVER_CONTENDER_MEMORY);
+                    let gone = !known && old_session_gone(state, &prev).await;
+                    if !gone {
+                        if known {
+                            crate::server::holepunch::count(state, "login_hash_in_use_known_contender");
+                        }
+                        let mut e = state
+                            .takeover_lost
+                            .entry(key)
+                            .or_insert((std::time::Instant::now(), 0));
+                        if !known {
+                            e.0 = std::time::Instant::now();
+                        }
+                        e.1 = e.1.saturating_add(1);
+                        drop(e);
+                        return Err(refuse_hash_in_use(framed, state, peer, &req.user_hash).await);
+                    }
+                }
+            }
             // limits.max_clients (live; 0 = no cap). Reserved before
             // handle_login, which runs the HighID probe — a full server should
             // not spend a connection on a client it is about to turn away. A
@@ -638,7 +880,16 @@ async fn dispatch(
             };
             // OFFERFILES v1 only for a client that asked for it (issue #19).
             let wants_v1 = crate::server::offer_pacing::client_requests_v1(&req.tags);
+            let listen_port = req.port;
             let mut new_client = handle_login(cfg, state, peer.ip(), req).await;
+            // The HighID probe took time: another login with this hash may
+            // have come in meanwhile. From here to the insert nothing waits.
+            let online = state.clients.get(&new_client.user_hash).map(|c| c.clone());
+            if let Some(prev) = online {
+                if !may_replace_session(state, &prev, peer.ip(), listen_port) {
+                    return Err(refuse_hash_in_use(framed, state, peer, &new_client.user_hash).await);
+                }
+            }
             // OFFERFILES v1 snapshot (issue #19): taken once, here, and both
             // advertised from and enforced from for the life of the connection.
             //
@@ -673,12 +924,21 @@ async fn dispatch(
             // client map, so the two cannot get out of step: a client with no
             // usable v6 must have NO entry rather than a stale one from a
             // previous session at a different address.
-            match new_client.ipv6 {
-                Some(a) => {
-                    state.client_ipv6.insert(new_client.user_hash, a);
+            // With the dial-back on (#43) the address waits for its probe,
+            // which starts after the welcome batch.
+            let probe_v6 = new_client.ipv6.filter(|_| crate::server::ipv6_probe::active(state));
+            match (new_client.ipv6, probe_v6) {
+                (Some(a), Some(_)) => {
+                    state.ipv6_probe.remove(&new_client.user_hash);
+                    let _ = crate::server::ipv6_probe::mark_pending(state, new_client.user_hash, a);
                 }
-                None => {
+                (Some(a), None) => {
+                    state.client_ipv6.insert(new_client.user_hash, a);
+                    state.ipv6_probe.remove(&new_client.user_hash);
+                }
+                (None, _) => {
                     state.client_ipv6.remove(&new_client.user_hash);
+                    state.ipv6_probe.remove(&new_client.user_hash);
                 }
             }
             // A new session proves its 0x9F handling afresh (issue #39).
@@ -728,6 +988,15 @@ async fn dispatch(
             sess.ident_sent = ident;
             for f in crate::server::login::build_welcome_batch_with(cfg, state, &new_client, ident, peer.port()) {
                 framed.send(f).await?;
+            }
+            if let Some(a) = probe_v6 {
+                crate::server::ipv6_probe::start(
+                    state_arc,
+                    new_client.user_hash,
+                    a,
+                    new_client.port,
+                    new_client.server_flags,
+                );
             }
         }
 
@@ -925,7 +1194,8 @@ async fn dispatch(
             let Some(c) = client.as_ref() else {
                 return Err(anyhow::anyhow!("GETSOURCES before login"));
             };
-            if let Ok(req) = GetSourcesRequest::parse(&frame.payload) {
+            if let Ok(mut req) = GetSourcesRequest::parse(&frame.payload) {
+                req.obfu = frame.opcode == OP_GETSOURCES_OBFU;
                 state.note_activity(
                     peer.ip(),
                     crate::server::activity::Kind::TcpSources,
@@ -978,17 +1248,29 @@ async fn dispatch(
             if matches!(outcome, Published(_) | Unusable | Withdrawn) {
                 // Side table first, then the client map, as at login: the
                 // source encoder reads the table by user hash.
-                match c.ipv6 {
-                    Some(a) => {
+                let mut probe = c.ipv6.filter(|_| crate::server::ipv6_probe::active(state));
+                match (c.ipv6, probe) {
+                    // A new address is dialled back like the login one (#43).
+                    (Some(a), Some(_)) => {
+                        if !crate::server::ipv6_probe::mark_pending(state, c.user_hash, a) {
+                            // Same address: its verdict stands, no new dial.
+                            probe = None;
+                        }
+                    }
+                    (Some(a), None) => {
                         state.client_ipv6.insert(c.user_hash, a);
                     }
-                    None => {
+                    (None, _) => {
                         state.client_ipv6.remove(&c.user_hash);
+                        state.ipv6_probe.remove(&c.user_hash);
                     }
                 }
                 if let Some(mut h) = state.clients.get_mut(&c.user_hash) {
                     h.ipv6 = c.ipv6;
                     h.ipv6_capable = c.ipv6_capable;
+                }
+                if let Some(a) = probe {
+                    crate::server::ipv6_probe::start(state_arc, c.user_hash, a, c.port, c.server_flags);
                 }
             }
             debug!(ip = %peer.ip(), ?outcome, "IPv6 update");
@@ -1282,5 +1564,105 @@ mod task_size_tests {
         // heap; 1264 after.
         let size = std::mem::size_of_val(&fut);
         assert!(size <= 2048, "connection future grew to {size} bytes");
+    }
+}
+
+/// Issue #41: who may take over a live session of the same user hash.
+#[cfg(test)]
+mod takeover_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    fn live(st: &ServerState, ip: IpAddr, v6: Option<Ipv6Addr>) -> (ClientHandle, mpsc::Receiver<Frame>) {
+        let rx = st.register_test_client_at([7; 16], 1, false, 0, ip);
+        {
+            let mut c = st.clients.get_mut(&[7; 16]).unwrap();
+            c.ipv6 = v6;
+            c.port = 4662;
+        }
+        (st.clients.get(&[7; 16]).unwrap().clone(), rx)
+    }
+
+    fn v4(a: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(5, 6, 7, a))
+    }
+
+    #[test]
+    fn only_the_same_source_takes_a_live_session_over() {
+        let st = ServerState::for_test();
+        let (prev, _rx) = live(&st, v4(8), None);
+        assert!(may_replace_session(&st, &prev, v4(8), 4662), "a reconnect from the same IPv4");
+        assert!(may_replace_session(&st, &prev, v4(8), 1234), "the port doesn't matter there");
+        let mapped: IpAddr = "::ffff:5.6.7.8".parse().unwrap();
+        assert!(may_replace_session(&st, &prev, mapped, 4662), "the same IPv4, v4-mapped");
+        assert!(!may_replace_session(&st, &prev, v4(9), 4662), "another address");
+    }
+
+    #[test]
+    fn ipv6_compares_by_prefix() {
+        let st = ServerState::for_test();
+        let a: IpAddr = "2001:db8:1:2::10".parse().unwrap();
+        let (prev, _rx) = live(&st, a, None);
+        let same_64: IpAddr = "2001:db8:1:2::99".parse().unwrap();
+        let other_64: IpAddr = "2001:db8:1:3::10".parse().unwrap();
+        assert!(may_replace_session(&st, &prev, same_64, 4662));
+        assert!(!may_replace_session(&st, &prev, other_64, 4662));
+    }
+
+    #[test]
+    fn a_dual_stack_move_goes_one_way_only() {
+        let st = ServerState::for_test();
+        let six: Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let (prev, _rx) = live(&st, v4(8), Some(six));
+        assert!(may_replace_session(&st, &prev, IpAddr::V6(six), 4662));
+        assert!(!may_replace_session(&st, &prev, IpAddr::V6(six), 4663), "another listen port");
+        let other: IpAddr = "2001:db8::6".parse().unwrap();
+        assert!(!may_replace_session(&st, &prev, other, 4662), "another IPv6");
+        // An IPv6 session is not taken over from IPv4, whatever it claims.
+        let st = ServerState::for_test();
+        let (prev, _rx) = live(&st, IpAddr::V6(six), Some(six));
+        assert!(!may_replace_session(&st, &prev, v4(8), 4662));
+    }
+
+    #[test]
+    fn a_session_that_is_gone_or_the_old_rule_lets_anyone_in() {
+        let st = ServerState::for_test();
+        let (prev, rx) = live(&st, v4(8), None);
+        assert!(!may_replace_session(&st, &prev, v4(9), 4662));
+        drop(rx);
+        assert!(may_replace_session(&st, &prev, v4(9), 4662), "its connection task has ended");
+        let st = ServerState::for_test();
+        let (prev, _rx) = live(&st, v4(8), None);
+        let mut cfg = (**st.live_cfg.load()).clone();
+        cfg.limits.hash_takeover_from_any_address = true;
+        st.live_cfg.store(Arc::new(cfg));
+        assert!(may_replace_session(&st, &prev, v4(9), 4662));
+    }
+
+    /// A shared hash (degenerate, or listed) is nobody's: the newest login
+    /// takes it. Contenders from many addresses do not make one shared.
+    #[test]
+    fn a_shared_hash_falls_back_to_the_old_rule() {
+        let st = ServerState::for_test();
+        let (prev, _rx) = live(&st, v4(8), None);
+        assert!(!may_replace_session(&st, &prev, v4(9), 4662));
+        for a in [20u8, 21, 22, 23] {
+            st.takeover_lost.insert(([7; 16], v4(a)), (std::time::Instant::now(), 1));
+        }
+        assert!(!is_shared_hash(&st, &[7; 16]), "an attacker's three proxies prove nothing");
+        assert!(!may_replace_session(&st, &prev, v4(9), 4662));
+        let mut cfg = (**st.live_cfg.load()).clone();
+        cfg.limits.shared_user_hashes.push(hex::encode([7u8; 16]).to_uppercase());
+        st.live_cfg.store(Arc::new(cfg));
+        assert!(is_shared_hash(&st, &[7; 16]));
+        assert!(may_replace_session(&st, &prev, v4(9), 4662));
+        // A degenerate hash is shared without a list.
+        let mut zero = [0u8; 16];
+        zero[5] = 0x0e;
+        zero[14] = 0x6f;
+        assert!(is_shared_hash(&st, &zero));
+        // The default list holds DLP's community hashes.
+        let cb: [u8; 16] = hex::decode("cb42f563ee0ea7907395420cac146ff5").unwrap().try_into().unwrap();
+        assert!(is_shared_hash(&ServerState::for_test(), &cb));
     }
 }

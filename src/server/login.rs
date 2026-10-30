@@ -281,6 +281,10 @@ pub fn build_welcome_batch_with(
             tcp_flags |= SRV_TCPFLG_IPV6;
             // And the in-session update opcode (issue #34), on its own bit.
             tcp_flags |= crate::proto::opcodes::SRVFLG_IPV6_UPDATE;
+            // And the dial-back of the client's IPv6 (issue #43).
+            if crate::server::ipv6_probe::active(state) {
+                tcp_flags |= crate::proto::opcodes::SRVFLG_IPV6_PROBE;
+            }
         }
 
         let mut payload = BytesMut::with_capacity(20);
@@ -427,7 +431,19 @@ pub fn build_server_ident(cfg: &Config, state: &ServerState, client: &ClientHand
         //   GetObfuscationPortTCP() != 0 && ((UDPFlags & 0x400) || (TCPFlags & 0x400))
         // Single source of truth, shared with GLOBSERVSTATRES — see the
         // per-bit table on SERVER_UDP_FLAGS.
-        Tag::byte(ST_UDPFLAGS, TagValue::U32(SERVER_UDP_FLAGS)),
+        Tag::byte(
+            ST_UDPFLAGS,
+            TagValue::U32(
+                SERVER_UDP_FLAGS
+                    | if crate::server::lugdunum_natt::foreign_enabled(&live) {
+                        // Cross-server NAT callback (issue #40); a login is
+                        // always a client's.
+                        crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT
+                    } else {
+                        0
+                    },
+            ),
+        ),
         // ST_TCPPORTOBFUSCATION / ST_UDPPORTOBFUSCATION — eMule casts to uint16,
         // but values are stored in tags as u32 (eMule code: m_nObfuscationPortTCP = (uint16)tag->GetInt()).
         // Non-zero TCP obf port is required for SupportsObfuscationTCP() to return true.
@@ -468,13 +484,13 @@ pub fn build_server_ident(cfg: &Config, state: &ServerState, client: &ClientHand
         // Bits are only ever set to "yes". The tag is omitted entirely when
         // there is no verdict, so a client that sees it can trust every bit
         // — an unset bit means no, never unknown.
-        let mut status: u8 = 0;
-        if client.ipv6.is_some() {
-            status |= IPV6ST_HAVE | IPV6ST_REACHABLE;
-        }
-        // IPV6ST_PROBED stays unset: we accept the address on trust (from
-        // the socket, or from the login tag) and never dial it back. Setting
-        // it would claim a check we do not perform.
+        // With the dial-back on (#43), REACHABLE is a probed fact: a running
+        // probe gives HAVE alone, its verdict HAVE|PROBED or
+        // HAVE|REACHABLE|PROBED. With it off the address is taken on trust,
+        // HAVE|REACHABLE, and PROBED stays unset rather than claim a check
+        // that was not made.
+        let status: u8 =
+            crate::server::ipv6_probe::status_bits(state, &client.user_hash, client.ipv6);
         if status != 0 {
             tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
         }
@@ -524,10 +540,12 @@ const ST_IPV6: u8 = 0xAE;
 /// `ST_IPV6_STATUS` — the server's verdict on the client's advertised IPv6.
 const ST_IPV6_STATUS: u8 = 0xAB;
 /// The server holds a public IPv6 for this session.
-const IPV6ST_HAVE: u8 = 0x01;
+pub(crate) const IPV6ST_HAVE: u8 = 0x01;
 /// That address is treated as reachable and the client is published as a v6
 /// source.
-const IPV6ST_REACHABLE: u8 = 0x02;
+pub(crate) const IPV6ST_REACHABLE: u8 = 0x02;
+/// The server dialled the address back (#43); REACHABLE then gives the result.
+pub(crate) const IPV6ST_PROBED: u8 = 0x04;
 
 /// `OP_IDCHANGE` / `OP_GLOBSERVSTATRES` flag bit: this server speaks the IPv6
 /// extension. See the warning at `SRVCAP_IPV6` about the direction asymmetry.
@@ -848,7 +866,7 @@ pub async fn assign_client_id_for(
 /// observe numbers are only worth something if they describe exactly what the
 /// verdict does. The hairpin code keeps its own copy on purpose (see
 /// `spawn_highid_observe`); if its fallback list ever changes, change this too.
-async fn highid_identity_answer(
+pub(crate) async fn highid_identity_answer(
     ip: IpAddr,
     port: u16,
     user_hash: [u8; 16],
@@ -891,14 +909,14 @@ async fn highid_identity_answer(
 
 /// What the server presents of itself in the identity probe's OP_HELLO.
 #[derive(Clone, Copy)]
-struct HighIdProbeIdent {
+pub(crate) struct HighIdProbeIdent {
     ours: [u8; 16],
     our_id: u32,
     our_port: u16,
 }
 
 impl HighIdProbeIdent {
-    fn from_config(live: &Config) -> Self {
+    pub(crate) fn from_config(live: &Config) -> Self {
         use crate::server::highid_probe::{high_id_from_ip, server_pseudo_user_hash};
         Self {
             // Never the peer's own hash — a client handed its own hash thinks
@@ -1834,8 +1852,7 @@ mod tests {
         assert_eq!(IPV6ST_HAVE, 0x01);
         assert_eq!(IPV6ST_REACHABLE, 0x02);
         assert_eq!(IPV6ST_HAVE | IPV6ST_REACHABLE, 0x03);
-        // 0x04 (PROBED) is deliberately not defined here.
-        assert_eq!((IPV6ST_HAVE | IPV6ST_REACHABLE) & 0x04, 0);
+        assert_eq!(IPV6ST_PROBED, 0x04);
     }
 
     #[test]

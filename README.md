@@ -57,6 +57,8 @@ stable at the scale of the largest real eD2k servers (tens of millions of files)
 - **Linux x86-64.** Developed and tested on **Debian 13 (codename trixie)**. Other
   modern distributions (Ubuntu, etc.) work the same way.
 - A Rust toolchain (`rustc` / `cargo`) ≥ 1.75 — install via [rustup](https://rustup.rs).
+  The committed `Cargo.lock` builds with 1.75 (`cargo build --release --locked`);
+  `.cargo/config.toml` keeps a newer Cargo's `cargo update` on versions that do.
 - Build tools: a C compiler and `make` (jemalloc-sys builds a small C library).
   On Debian/Ubuntu: `sudo apt install build-essential`.
 - RAM scales with index size. A small/medium server runs comfortably in a few
@@ -336,11 +338,13 @@ a watched file) or needs a **restart**.
 | `highid_downgrade_on_wrong_hash` | **Verdict.** The same background check, acted on: a port that answers with a *different* client's user hash marks (IP, port, login hash), and that client's next logins get LowID while the mark lasts (see below). Default off | live |
 | `highid_wrong_hash_ttl_secs` | How long a wrong-hash mark lasts. Default 86400 (a day) | live |
 | `lugdunum_natt` | Lugdunum's NAT callback (see *NAT traversal*): flag `0x1000` in `OP_IDCHANGE`, odd LowIDs and a 24-byte `OP_IDCHANGE` for clients that set `0x1000`, UDP `0xA6` forwarded as TCP `0x37` / UDP `0xA7`. Default on | live |
-| `holepunch_extension` | The hole-punch extension (see *NAT traversal*): flag `0x100000` in `OP_IDCHANGE`. Only for two clients that both announced `0x100000` with `0x1000`: a `0x60` wakes the target with `0x37`, waits up to 3 s for its fresh `0x9F`, then sends a 30-byte `0x61` with the peer's crypt setting. Also: plain `0x9F` ignored from a session that sent an obfuscated one. Needs `lugdunum_natt`. Default on | live |
+| `holepunch_extension` | The hole-punch extension (see *NAT traversal*): flag `0x100000` in `OP_IDCHANGE`. Only for two clients that both announced `0x100000` with `0x1000`: a `0x60` wakes the target with `0x37`, waits up to 3 s for its fresh `0x9F`, then sends `0x61`. Also: plain `0x9F` ignored from a session that sent an obfuscated one. Needs `lugdunum_natt`. Default on | live |
+| `holepunch_foreign` | Cross-server NAT callback (see *NAT traversal*): UDP `0xA6` with requester id 0 from a client logged in elsewhere wakes a target here with `0x37`; a target with the extension then gets the requester its endpoint by UDP `0xA7`. Announced with `0x100000` in the UDP flags of the status reply. Limited per source IP and per target. Needs `holepunch_extension`. Default on | live |
 | `ipv6_enabled` | Accept clients over IPv6 on the same TCP port, plus an IPv6 UDP socket on `tcp_port + 4`. Separate IPv6-only sockets, so the IPv4 path is unchanged; a host without IPv6 logs a warning and serves IPv4 only. Default off | restart |
 | `listen_ip6` | Bind address for the IPv6 sockets. Default `::` | restart |
 | `this_ip6` | The server's public IPv6, announced in `OP_SERVERIDENT` when `ipv6_publish_sources` is on. Empty = not announced | live |
 | `ipv6_publish_sources` | Publish IPv6 sources to clients that can parse them, and advertise the extension in `OP_IDCHANGE` and UDP pings. Independent of `ipv6_enabled`. Default off | live |
+| `ipv6_probe` | Dial a client's IPv6 back before publishing it (issue #43; see *IPv6*). In force only with `ipv6_publish_sources` and an IPv6 route on this host; announced with `0x400000` in `OP_IDCHANGE`. Off, or without a route: addresses are published on trust. Default on | live |
 
 > **UDP ports are derived from `tcp_port`, not configured.** The eD2k protocol
 > fixes the whole UDP block relative to the TCP port, and seed servers compute a
@@ -409,6 +413,9 @@ a watched file) or needs a **restart**.
 |---|---|---|
 | `max_clients` | Max concurrent logged-in clients, also advertised (`ST_MAXUSERS`). Reserved atomically before the login does any work, so concurrent logins cannot overshoot it. A login beyond it gets "Server full" and is closed; a client replacing its own stale session is always let in. `0` = no cap | live |
 | `max_clients_per_ip` | Max open TCP connections per client IP — per `admission.ipv6_source_prefix_bits` prefix for IPv6 — checked at accept before any work is done. Loopback is exempt; `0` = no cap. The Status tab shows the busiest IP — the address with the most logged-in clients, with its open connections — so you can check the value against real traffic (a provider NAT puts many users behind one address) | live |
+| `getsources_cache_secs` | How long a TCP GETSOURCES answer is reused for the same file, seconds (1–600). The Status "Cache hits" row shows how long past the TTL requests came for an expired entry (up to 20 min), to choose it by. Default 120 | live |
+| `hash_takeover_from_any_address` | A login whose user hash is already online replaces that session only when it is plausibly the same machine: the same IPv4 or the same IPv6 prefix (the NAT-dropped reconnect), or the IPv6 the IPv4 session advertised (`CT_MOD_IP_V6`) with the same listen port, or the old session is already gone. Otherwise the new login is held while the old session is probed: its socket gets a 10 s `TCP_USER_TIMEOUT` and an `OP_SERVERSTATUS`. A user who moved has a dead old path: nothing acknowledges the write, the kernel aborts the old connection, and the held login goes ahead (about 11 s, inside the 25 s clients wait for a login answer). An acknowledged write means the owner is still there: the login gets a server message and is closed (Blocks tab: "Hash online elsewhere"). One probe per session at a time, then a 10 s pause; a contender refused after a probe is refused without one for ten minutes. A hash that is degenerate (12+ zero bytes) or listed in `shared_user_hashes` is shared, identifies no one, and keeps the old rule. `/api/takeover` lists the refused hashes with their contenders. User hashes are public, so without this anyone could take a live session over (issue #41). `true` restores the old rule. Default `false` | live |
+| `shared_user_hashes` | User hashes many installs share (hex), in addition to a built-in list: the 30 community, corrupt and invalid hashes of DLP's antiLeech, and mldonkey's `3649E68B070E85991648EF223A7F6FFD`. For these the newest login takes the session, as before 0.9.86. Add the ones `/api/takeover` marks `looks_shared` after a look (an attacker can produce many contenders too, so that is never applied by itself). Default empty | live |
 | `soft_limit_files`, `hard_limit_files` | Advertised to clients (`ST_SOFTFILES` / `ST_HARDFILES`) and enforced with Lugdunum semantics. `soft_limit_files` is the per-client indexing budget: new files beyond it are not indexed and the client gets one server message per connection; re-offers of files it already sources and filtered files use no budget; the session stays up. `hard_limit_files` is a per-packet bound: an `OFFERFILES` declaring that many records or more is rejected and the connection closed — keep it well above 200 (the eMule batch size). `0` disables either | live |
 | `max_string_size` | Max bytes STORED for a file name or nick (cut at a character boundary). The content filter always sees the full name first. `0` = no cap | live |
 | `ping_delay_seconds` | Server keep-alive ping interval | restart |
@@ -690,6 +697,35 @@ contain a marker word, or historical texts whose title does — so an override t
 left the term layers running did nothing for the one class of mistake that
 happens in practice.
 
+### Auditing the filter: `/api/review?format=audit` and `/api/indexcheck`
+
+Two admin endpoints for keeping the lists right, built so that the reader
+never has to go through the names the filter blocked rightly.
+
+**`/api/review?format=audit`** (and `format=auditcsv`) looks for false
+positives in the blocks of the window (same `hours`, `all`, `peek` parameters
+as the plain review). Every blocked name is reduced to signals — explicit
+adult words, a child's age, a word for a child, a second listed term — and a
+name is shown only when it has none of them and its rule is not a working
+marker (a quarter or more of its hits point at a child). The report has a
+table per rule (hits, signal counts, audio/doc/video/image split,
+publishers, verdict: likely false positive / mixed / marker), the visible
+names under each rule, the hashes of names withheld for explicit words only
+(legal adult titles the term fires on, to look at by hash), and, as before,
+L3 hits with a decoy signature and indexed files under unrelated names — those
+with clean names only. The CSV has one line per hash:
+`hash;layer;reason;size;kind;explicit;age;minor;marker2;sizeflag;names;unrelated;publishers;suggest;name`,
+`suggest` being `whitelist?`, `review`, `keep` or (L3) `poison?`, and `name`
+empty when withheld.
+
+**`/api/indexcheck`** runs every indexed file through the filter as it is now.
+Lists reloaded after a file was indexed were never applied to it; this finds
+those files: `hash;layer;reason;sources;size;whitelisted`, no names. A file the
+whitelist lets through is listed with `whitelisted=1`. `?purge=1` takes the
+blocked, non-whitelisted ones out of the index (counted as
+`indexcheck_purged`). One run at a time; the walk copies names a few thousand
+at a time and filters them outside the index locks.
+
 ### Layer 2: age plus context
 
 Layer 2's word lists live in `layer2_terms_file` rather than in the binary, and
@@ -831,14 +867,16 @@ else the port you announced (`0xF9`, or the one in your `0x60`).
 | Opcode | Value | Direction | Payload |
 |---|---|---|---|
 | `OP_LOWID_HOLEPUNCH_REQUEST` | `0x60` | client → server (TCP) | `<target_id 4><our_udp_port 2>` |
-| `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4>` |
+| `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4><peer_crypt 1>` |
 | `OP_LOWID_HOLEPUNCH_FAIL` | `0x62` | server → client (TCP) | `<target_id 4><reason 1>` |
 | `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>` |
 | `OP_IDCHANGE` TCP flags bit | `0x20000` | server → client (TCP) | set when the server accepts `0x60` |
 
 To download from a LowID source **B**, send `0x60` with B's assigned id and your UDP
 port. The server replies `0x61` to **both** you and B — each gets the other's address
-plus a role byte — or `0x62` if B is HighID, gone, or has a dead session. On `0x61`
+plus a role byte — or `0x62` if B is HighID, gone, or has a dead session
+(reasons 1–3), has no UDP port (4), or one of the two sessions is not over
+IPv4 (5: there is no IPv4 endpoint to hand out). On `0x61`
 both sides punch and raise the tunnel; on `0x62` retry or fall back. The `role` byte
 is advisory: when both sides initiate, as they should, order does not matter.
 
@@ -847,8 +885,11 @@ the `target_id` of its `0x60`, so it can match a `0x61` to one of several
 requests in flight; the target gets the requester's ID. It was added in 0.9.84;
 earlier servers send 25 bytes. **Read it only when the payload is at least 29
 bytes**, and accept longer payloads: fields may be appended later, never
-inserted. Between two clients using the extension (below) it is 30 bytes:
-`peer_crypt(1)` is appended.
+inserted. Since 0.9.86 every `0x61` is 30 bytes (issue #42): `peer_crypt(1)`
+is appended, the peer's `(CT_SERVER_FLAGS >> 9) & 7` (supports / requests /
+requires the crypt layer). With the user hash at bytes 8–23 it lets the
+dialler obfuscate from its first datagram, so a peer that requires the crypt
+layer accepts the stream. Read it only from 30 bytes or more.
 (`0x60`–`0x62` are unused in the server TCP opcode space, which runs `0x01`–`0x44`,
 and `0x9F` was free in the server UDP namespace — no conflict on the server link.)
 
@@ -927,7 +968,7 @@ unchanged. Counted on the Status tab as "bridged".
 emule-qt. It applies only when the server sets `0x100000` in the `OP_IDCHANGE`
 flags and **both** clients set `0x100000` together with `0x1000` in
 `CT_SERVER_FLAGS` at login. Every other pair gets exactly the punch above:
-`0x61` at once, 29 bytes, no `0x37`. Off with
+`0x61` at once, no `0x37`. Off with
 `network.holepunch_extension = false` (it needs `lugdunum_natt`).
 
 1. The requester sends a `0x9F` (server-key obfuscated when it has the key)
@@ -936,7 +977,7 @@ flags and **both** clients set `0x100000` together with `0x1000` in
    carrying the requester's best port so far.
 3. The target sends `0x9F` at 0, 0.5 and 1 s and starts punching towards that
    endpoint. It dials only as the role in `0x61` says.
-4. On the target's first `0x9F` the server sends `0x61` to both, 30 bytes,
+4. On the target's first `0x9F` the server sends `0x61` to both (30 bytes, as every `0x61`),
    with `peer_crypt` = the peer's `(CT_SERVER_FLAGS >> 9) & 7` (support,
    request, require). Resends follow at +1.2 s and +3 s as usual.
 5. With no `0x9F` from the target within 3 s, the server sends the same
@@ -950,6 +991,53 @@ ignored: only the server's key makes one, so a forged datagram can't move
 that client's port. Clients without the extension keep working as before.
 The Status tab shows coordinations started, released by a fresh `0x9F`, and
 timed out.
+
+### Cross-server NAT callback (issue #40)
+
+Two LowIDs on **different** servers, without a registry: the requester asks
+the target's own server, whose address and the target's LowID it already has
+from source exchange (every version sends a source's server next to its
+LowID). Agreed with aMule and emule-qt. Off with
+`network.holepunch_foreign = false`.
+
+| Step | Wire |
+|---|---|
+| Is it offered? | `0x100000` in the UDP flags of the status reply (`0x97`, plain and obfuscated, to clients and servers) and in `ST_UDPFLAGS` at login. Lugdunum 17.15 ignores the bit |
+| Key | the status ping gives the requester this server's UDP key, `IPObfuscate(secret, requester IP)`, valid only for that address |
+| Request, requester → target's server, UDP | `0xA6` `<target_id 4><0 4>[<crypt 1>]`, server-key obfuscated, to the obfuscation UDP port. Requester id `0` marks it foreign. `crypt` (optional) is the requester's `(CT_SERVER_FLAGS >> 9) & 7`; absent means 0. The source port is the requester's endpoint |
+| Wake, server → target | the usual `0x37` (or `0xA7` when the target asked for a callback itself within 20 s): `<requester_ip><requester_udp_port><0><crypt>`, never with a hash, since the server doesn't know the requester's. No `0x61` follows a `0x37` with requester id 0: the target punches towards the requester's endpoint and waits to be dialled |
+| Answer, server → requester, UDP | only when the target has the extension: on its first `0x9F`, or after 3 s, `0xA7` `<target_ip><target_udp_port><target_id><crypt><hash 16>`, obfuscated with the requester's key, from the port the request arrived on, and resent at +1.2 s and +3 s like `0x61` (the requester ignores copies after the first). `crypt` is the target's setting, with `0x80` when both use the crypt layer and one asks for it; the hash is always there. The port is the target's fresh `0x9F` port, else the one the server would give today. **The requester dials**: it is the side that has the other's hash, which obfuscates the first QUIC Initial; both sides punch, so the path opens either way |
+
+**Requester ID 0 means foreign, everywhere.** On a server that sets
+`0x100000`, every forward that wakes a target (`0x37` or `0xA7`) carries
+requester ID 0 exactly when the request came from a client logged in
+elsewhere. A same-server forward — Lugdunum's `0xA6` path, the extension's
+wake-up, the bridge — always carries the requester's own ID, which is never
+0 here (LowIDs start at 1). A target can rely on "ID 0 on a `0x100000`
+server" alone: punch towards the requester's endpoint, send its `0x9F`
+burst, and wait to be dialled.
+
+The target must be a logged-in LowID that set `0x1000`. Nothing is sent when
+one side requires the crypt layer (the target can't get the requester's hash
+here). Every other case gets no answer at all: an unknown, HighID, gone or
+incapable target, a plain request, a limit reached. So the path is no oracle
+for who is online. Without a session to kick, the limits sit on the source IP
+and on the target:
+
+- per source IP, a burst of 10 requests, then one a second;
+- per source IP, at most 60 different target ids in 10 minutes, counted
+  whether they exist or not, which stops a sweep over LowIDs;
+- per target, at most 6 foreign wake-ups a minute;
+- one answer in flight per requester address and target, inside the shared
+  hole-punch retry pool.
+
+An endpoint goes only to someone who names the target's current server and
+LowID, as on one server. Clients should use a source's server only when it is
+already in their own server list (an address learnt from a peer could
+otherwise aim pings at anyone), and should not sweep other servers. A server
+without the bit drops such a request; Lugdunum 17.15 ignores it too. Refusals
+are counted in the Blocks tab (`natcb_foreign_*` and the `natcb_*` target
+reasons); the Status tab shows forwards and answers.
 
 **5. Keep your LowID source alive.** A share-only client is TCP-silent for hours.
 This server keeps such a source by **(a)** counting your `0x9F` UDP keepalive as
@@ -965,6 +1053,17 @@ sending the `0x9F` keepalive; the rest is the server's bookkeeping. Get the cade
 wrong and a live share-only source is silently evicted after a few minutes — the
 symptom is identical to a successful connection, which makes it easy to misdiagnose.
 
+
+### Watching NAT-T: `/api/natt`
+
+All NAT-T counters since start and the live gauges, as JSON: 0x60 requests
+(by client family), repeats for the same pair within ten minutes, the first
+answer to each (0x61 or a 0x62 reason), every 0x9F by outcome, the
+extension's timing and timeouts, bridges, Lugdunum 0xA6 requests and
+refusals (non-capable targets by even/odd LowID and by requester family),
+and the cross-server path. `recent` holds the last 60 requests in detail
+(both clients' software, login fingerprint, flags, UDP port, 0x9F seen,
+target id parity, outcome). The Status tab shows the headline figures.
 
 ### `OP_IDCHANGE` TCP flag bits in use
 
@@ -990,8 +1089,16 @@ be taken (corrections and new rows welcome, as for the `0xB2` table):
 | `0x40000` | NAT rendezvous (`FlagNatRendezvous`, since 2026-10-20) | eNode-go | no |
 | `0x80000` | server search (`FlagServerSearch`, reserved, not sent) | eNode-go | no |
 | `0x100000` | hole-punch extension (issue #39) | this server | with `holepunch_extension` |
+| `0x200000` | NAT wake-up over TCP (`SRV_TCPFLG_NAT_WAKE`, PR_NAT) | eNode-go | no |
+| `0x400000` | the client's IPv6 is dialled back before it is published (issue #43) | this server | with `ipv6_probe`, `ipv6_publish_sources` and an IPv6 route |
 
-The first bit free everywhere is `0x200000`.
+In the UDP flags word of the status reply, this server sets `0x100000` when
+it takes cross-server `0xA6` (issue #40). Lugdunum's own UDP flags have
+`0x1000`; eNode-go uses `0x10000` and `0x200000` there and keeps `0x80000`
+reserved.
+
+The first bit free in `OP_IDCHANGE` is `0x800000`; in the client's
+`CT_SERVER_FLAGS` and the UDP flags, `0x400000`.
 
 The client's `CT_SERVER_FLAGS` at login (client → server) is a different word
 with its own bits:
@@ -1003,6 +1110,7 @@ with its own bits:
 | `0x1000` | NAT callback; odd LowID, 24-byte `OP_IDCHANGE` | Lugdunum |
 | `0x10000` | asks for meta-search rows | eNode-go |
 | `0x100000` | hole-punch extension, always with `0x1000` | this server |
+| `0x200000` | "wake me", no standing PR_NAT registration (`SRVCAP_NAT_WAKE`) | eNode-go |
 
 ---
 
@@ -1031,9 +1139,10 @@ Every element is ignored by a client that does not know it.
 | client → server | login tag `CT_MOD_IP_V6` | `0xAE`, 16 raw bytes | the client's public IPv6 |
 | server → client | `OP_IDCHANGE` flags / UDP ping flags bit | `0x4000` | server speaks the extension |
 | server → client | `OP_IDCHANGE` flags bit | `0x8000` | server accepts `OP_IPV6_UPDATE` |
+| server → client | `OP_IDCHANGE` flags bit | `0x400000` | server dials the client's IPv6 back before publishing it (issue #43) |
 | client → server | `OP_IPV6_UPDATE` | `0x63`, 16 raw bytes | the client's new IPv6, or zeros to withdraw it; only to a server that set `0x8000` |
 | server → client | `OP_SERVERIDENT` tag `ST_IPV6` | `0xAE`, 16 raw bytes | the server's IPv6 (`this_ip6`) |
-| server → client | `OP_SERVERIDENT` tag `ST_IPV6_STATUS` | `0xAB`, u8 | `0x01` address held, `0x02` treated as reachable |
+| server → client | `OP_SERVERIDENT` tag `ST_IPV6_STATUS` | `0xAB`, u8 | `0x01` address held, `0x02` reachable (published), `0x04` dialled back: `0x02` is then the result |
 | server → client | source record in `OP_FOUNDSOURCES` / UDP answer | id `0xFFFFFFFF`, port, then 16 bytes | an IPv6 source |
 
 The client announces the extension with the `CT_MOD_IP_V6` tag alone. An
@@ -1059,6 +1168,18 @@ Rules the server applies:
   published, any address makes the client able to receive IPv6 records, zeros
   withdraw both. A session that arrived over IPv6 keeps its observed address
   and ignores the update (issue #34).
+- **Dial-back (issue #43).** With `0x400000` set, a claimed address (login
+  tag, `OP_IPV6_UPDATE`, or the address of an IPv6 session) is not published
+  until the server has dialled `[address]:login port` with the HighID
+  identity probe and got back the user hash that logged in. Until then
+  `ST_IPV6_STATUS` is `0x01`. The verdict comes in a fresh `OP_SERVERIDENT`:
+  `0x07` (published) or `0x05` (not published; most often a router that
+  drops inbound IPv6). The client stays able to receive IPv6 records either
+  way. A new address in `OP_IPV6_UPDATE` is dialled again; the same address
+  keeps its verdict. The probe takes slots from the server-wide probe
+  ceiling; a login that finds it full is retried a minute later. At most 4
+  dials per session, since each goes where the client points it. Status tab:
+  "IPv6 dial-back"; Blocks tab: `ipv6_probe_*`.
 - Answers carrying IPv6 records bypass the source cache, which is shared with
   clients that cannot parse them.
 
@@ -1083,7 +1204,11 @@ hours to be fully published. With `limits.offerfiles_v1 = true` the server
 tells a client how fast it may go and holds it to that; at the defaults (200
 files every 500 ms) the same library takes under three minutes. Agreed in
 [issue #19](https://github.com/andrey23127/ed2k-server/issues/19); the client
-side is aMule PR #1715 (experimental, opt-in). Only a client that asks for v1
+side is aMule PR #1715, merged and on by default from aMule's next
+release (checked by got3nks against 0.9.85: all 20 interop scenarios pass).
+aMule waits up to 5 s after `OP_IDCHANGE` for the login `OP_SERVERIDENT`
+before it falls back to the standard pace, and if the limits arrive later
+than that it re-offers the connection's files within them. Only a client that asks for v1
 at login is answered and held to it; every other client publishes exactly as
 with the option off.
 

@@ -880,3 +880,72 @@ async fn tied_results_are_broken_per_query_not_by_file_id() {
 
 #[path = "support/offerfiles_v1_cases.rs"]
 mod offerfiles_v1_cases;
+
+/// A login that replaces a session fences the old socket (issue #46): the old
+/// socket's next frame closes it instead of being handled under the user hash
+/// it no longer owns.
+#[tokio::test]
+async fn a_replaced_session_cannot_act_for_the_user() {
+    let (port, state) = spawn_test_server().await;
+    let hash = [0x46u8; 16];
+    let login = |nick: &'static str| async move {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut f = Framed::new(stream, Ed2kCodec::new(1_000_000));
+        f.send(Frame::new(OP_LOGINREQUEST, build_login(hash, 4662, nick)))
+            .await
+            .unwrap();
+        // Drain the welcome batch.
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), f.next()).await
+        {}
+        f
+    };
+    let mut old = login("old").await;
+    let _new = login("new").await;
+    assert_eq!(state.clients.len(), 1);
+
+    // The old socket publishes: refused, and the socket is closed.
+    old.send(Frame::new(OP_OFFERFILES, build_offerfiles([0x47; 16], "x.bin", 1000)))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(std::time::Duration::from_secs(2), old.next()).await;
+    assert!(
+        matches!(next, Ok(None) | Ok(Some(Err(_)))),
+        "the replaced socket is closed"
+    );
+    assert!(state.file_slab.get_by_hash(&[0x47; 16]).is_none(), "nothing was published");
+    assert_eq!(
+        state.block_stats.get("replaced_session_frame_refused").map(|v| *v),
+        Some(1)
+    );
+}
+
+/// ...but not for a shared hash: its sessions are different installs, and
+/// closing the displaced one only sends it back to displace the other.
+#[tokio::test]
+async fn a_replaced_session_of_a_shared_hash_keeps_working() {
+    let (port, state) = spawn_test_server().await;
+    // Degenerate (12+ zero bytes): shared by definition.
+    let mut hash = [0u8; 16];
+    hash[5] = 0x0E;
+    hash[14] = 0x6F;
+    let login = |nick: &'static str| async move {
+        let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let mut f = Framed::new(stream, Ed2kCodec::new(1_000_000));
+        f.send(Frame::new(OP_LOGINREQUEST, build_login(hash, 4662, nick)))
+            .await
+            .unwrap();
+        while let Ok(Some(Ok(_))) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), f.next()).await
+        {}
+        f
+    };
+    let mut old = login("old").await;
+    let _new = login("new").await;
+    old.send(Frame::new(OP_OFFERFILES, build_offerfiles([0x48; 16], "y.bin", 1000)))
+        .await
+        .unwrap();
+    let next = tokio::time::timeout(std::time::Duration::from_millis(500), old.next()).await;
+    assert!(next.is_err() || matches!(next, Ok(Some(Ok(_)))), "still open");
+    assert!(state.block_stats.get("replaced_session_frame_refused").is_none());
+}

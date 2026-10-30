@@ -114,6 +114,11 @@ highid_wrong_hash_ttl_secs = 86400      # 24 h
 # and waits up to 3 s for its fresh 0x9F before sending 0x61. Everyone else sees
 # no change. Needs lugdunum_natt.
 # holepunch_extension = true
+# Cross-server NAT callback (issue #40): 0xA6 with requester id 0 from a client
+# logged in elsewhere wakes a target here with 0x37; a target with the extension
+# then gets the requester its endpoint by UDP 0xA7. Limited per source IP and per
+# target. Needs holepunch_extension.
+# holepunch_foreign = true
 
 # ── IPv6 ────────────────────────────────────────────────────────────────────
 # Accept clients over IPv6: separate IPv6-only sockets, TCP on tcp_port and UDP
@@ -130,12 +135,26 @@ this_ip6 = ""                           # e.g. "2001:db8:1234::2"
 # to peers that can parse it (eMuleQt, eNode-go and compatible mods). Clients
 # that do not know the extension never see it. Independent of ipv6_enabled.
 ipv6_publish_sources = true
+# Dial a client's IPv6 back (login port, identity probe with its user hash)
+# before publishing it. Only in force when this host has an IPv6 route.
+# ipv6_probe = true
 
 [limits]
 max_clients = 5000
 soft_limit_files = 5000
 hard_limit_files = 7500
 max_clients_per_ip = 10
+# How long a TCP GETSOURCES answer is reused for the same file, seconds (1-600).
+# Status "Cache hits" shows the age of the entries requests missed.
+# getsources_cache_secs = 120
+# A login whose user hash is already online takes that session over only from
+# the same address (IPv6: same prefix), or from the IPv6 the IPv4 session
+# advertised; otherwise it is refused (issue #41). true = any address may.
+# hash_takeover_from_any_address = false
+# User hashes shared by many installs keep the old rule (newest login wins).
+# DLP antiLeech's community hashes are built in; list more here, e.g. ones
+# /api/takeover marks "looks_shared":
+# shared_user_hashes = ["3649E68B070E85991648EF223A7F6FFD"]
 max_string_size = 250
 ping_delay_seconds = 300
 

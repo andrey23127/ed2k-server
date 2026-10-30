@@ -1,6 +1,6 @@
 [package]
 name = "ed2k-server"
-version = "0.9.85"
+version = "0.9.86"
 edition = "2021"
 description = "Modern eDonkey2000 / eMule index server (test/MVP build)"
 license = "MIT"
@@ -101,6 +101,21 @@ version = "=2.6.0"
 # time 0.3.36 (for rcgen) takes powerfmt ^0.2; 0.2.1 needs Rust 1.79.
 [dependencies.powerfmt]
 version = "=0.2.0"
+
+# Issue #48: newer releases of these need Rust 1.81-1.88 (several are
+# edition 2024), and the lockfile had drifted onto them. base64ct comes in
+# with the TLS stack, zeroize with the crypto crates, idna_adapter selects
+# the ICU line under url/idna (1.2.0 = ICU 1.5, Rust 1.67; 1.2.1+ = ICU 2,
+# Rust 1.82+). `.cargo/config.toml` also makes a newer Cargo's resolver
+# honour rust-version on `cargo update`.
+[dependencies.base64ct]
+version = "=1.6.0"
+
+[dependencies.zeroize]
+version = ">=1.8, <1.9"
+
+[dependencies.idna_adapter]
+version = "=1.2.0"
 
 # Stage 4 (memory): inline single-source storage in FileRecord. The `union`
 # feature lets SmallVec overlap its inline-array and heap-pointer storage, so

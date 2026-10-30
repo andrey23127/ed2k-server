@@ -2,6 +2,276 @@
 
 Earlier releases are described in their release commit messages.
 
+## 0.9.86
+
+### Sources with crypt options (issue #42)
+
+`OP_GETSOURCES_OBFU` (0x23) is answered with `OP_FOUNDSOURCES_OBFU` (0x44), as
+Lugdunum does: per source `<id><port><crypt>[<user hash>]`, the crypt byte
+being the source's `(CT_SERVER_FLAGS >> 9) & 7` (supports / requests /
+requires the crypt layer) with 0x80 and the hash when it supports the layer;
+a source whose client has left gets 0. IPv6 sentinel records carry the same
+fields before the address. It used to get the plain 0x42, so a client
+requiring obfuscation dropped every source from this server and no client
+could obfuscate its first connection to one — NAT-T dials included. 0x19
+still gets 0x42; the two replies are cached apart.
+
+Every `OP_LOWID_HOLEPUNCH_INFO` (0x61) now carries the peer's crypt setting
+in byte 29, not only between extension clients. With the user hash it has
+always had (bytes 8–23), the dialler can obfuscate from its first datagram,
+so a target that requires the crypt layer accepts the stream (got3nks: aMule
+dialled plain uTP and such targets refused it). Parsers read by length, so
+the 30-byte frame is safe for 29-byte readers.
+
+Cross-server NAT callback (issue #40): two LowIDs on different servers reach
+each other through the target's own server, with no registry. Same-hash
+logins from another address no longer take a live session over (issue #41).
+A filter audit that never shows a rightly blocked name, and an index check
+against the current filter.
+Two new keys, `network.holepunch_foreign` (on) and
+`limits.hash_takeover_from_any_address` (off).
+
+- **Request.** Lugdunum's UDP `0xA6` `<target_id><0>[<crypt>]` from a client
+  not logged in here, server-key obfuscated. The key is bound to the
+  sender's IP, so a datagram that decodes proves it; the source port is the
+  requester's endpoint. Requester id 0 marks it foreign.
+- **Wake.** The target, a logged-in LowID that set `0x1000`, gets the usual
+  `0x37` (or `0xA7`) with requester id 0 and no hash. Nothing when one side
+  requires the crypt layer.
+- **Answer.** For a target with the extension, the requester gets UDP `0xA7`
+  `<target_ip><target_udp_port><target_id><crypt><hash>` after the target's
+  `0x9F`, or after 3 s with the port the server has, resent at +1.2 s and
+  +3 s like `0x61`; the hash always, since
+  the requester dials and obfuscates its first QUIC Initial with it. The
+  target punches and is dialled; no `0x61` follows. Nothing else is ever
+  answered: no oracle for who is online.
+- **Requester ID 0** marks a foreign request on every path that wakes a
+  target; a same-server forward never carries it (README).
+- **Limits.** Per source IP: a burst of 10, then 1/s, and at most 60
+  different target ids in 10 minutes. Per target: 6 foreign wake-ups a
+  minute. One answer in flight per requester and target.
+- **Announced** with `0x100000` in the UDP flags of the status reply (plain
+  and obfuscated, to clients and servers) and in `ST_UDPFLAGS` at login.
+- Status tab: foreign forwards and answers; Blocks tab: `natcb_foreign_*`.
+- README: the wire contract and the limits; eNode-go's `0x200000` (NAT
+  wake-up, PR_NAT) added to both flag tables, first free bit now `0x400000`.
+
+### NAT-T counters, caches
+
+- Client families in the counters carry the mod ("eMule/Xtreme9.1"): eMule
+  mods all report as eMule.
+- `/api/natt` also lists the last 60 NAT-T requests in detail: kind (0x60,
+  0xA6, foreign 0xA6), both clients' software, login fingerprint, flags,
+  UDP port and whether they sent a 0x9F, the target id's parity, outcome.
+- **`/api/natt`**: every NAT-T counter since start plus live gauges (clients
+  with 0x1000, with the extension, that sent 0x9F this session, obfuscated
+  or not; pending extension waits; foreign sources tracked…). New counters:
+  0x60 requests by client family, repeats for the same pair within 10
+  minutes (the closest the server gets to a failure rate), the first answer
+  per request (0x61 or each 0x62 reason — `holepunch_coordinated` also
+  counts the resends); every 0x9F by outcome (obfuscated, plain, plain
+  ignored, wrong IP, unknown hash); extension: time to the target's 0x9F in
+  buckets, timeouts split by whether the target ever sent a 0x9F, late
+  0x9F; bridges by client family; Lugdunum 0xA6: requests, refusals for a
+  non-capable target split by even/odd LowID and by requester family,
+  forwards by requester family; cross-server: requests, target with or
+  without the extension.
+- `/api/natt` "recent" also logs, once a minute per client, a 0x9F from
+  another address than the client's session, with both addresses (166 in
+  three hours from very few clients: the server can't use those ports).
+- Status: "NAT-T clients" now counts clients that sent a 0x9F this session
+  (and obfuscated ones); the old figure counted the UDP port announced at
+  login, which stock clients send too.
+- **Obfuscated UDP decode cache**: entries are aged out after 30 minutes
+  (cap 262k, ~10 MB) instead of the map being cleared at 8192 every minute,
+  which at 17k clients sent every obfuscated sender back to the cold path
+  once a minute. A cold sender is first tried as a client — this server's
+  key for its IP, direction 0x6B, one attempt — before the peer-server
+  tables are scanned; it used to be the ninth attempt. Status shows decodes
+  by the cached key, cold decodes, crypt pings answered (counted apart: they
+  are not obfuscated eD2k) and undecodable datagrams. Most cold senders are
+  clients of other servers sending a single global query, so cold decodes
+  stay common; they are now cheap.
+- **GETSOURCES cache** (the Status "Cache hits"): TTL 5 → 15 s, cap 4096 →
+  65536, and a full cache skips the new entry instead of clearing itself —
+  at several hundred requests a second the old cap was reached within
+  seconds and the cache wiped about as fast as it filled. Status shows
+  entries, misses on an expired entry with the entry's age (<30 s, 30–60 s,
+  1–2 min, 2–5 min, >5 min: what a longer TTL would catch) and entries not
+  stored. Cap 200k. New key `limits.getsources_cache_secs` (1–600, live),
+  default 120 s: at 15 s about half of all misses (630k of 1.23M in three
+  hours) came 30 s to 2 minutes after the entry was built. A changed TTL
+  starts the cache statistics over; expired entries are swept every minute
+  instead of piling up to the cap. The histogram counts how long past the
+  TTL a request came (<1, 1–2, 2–5, 5–10, 10–20 min): by entry age, at a
+  TTL of 300 s every expired miss fell into ">5 min". A swept entry leaves
+  the map with its payload, but its key and insert time are remembered for
+  20 more minutes (at most 400k, about 10 MB, outside the 200k cap), so a
+  late request still lands in the histogram; dropped outright, every
+  request later than one sweep read as a plain miss. "Entries" counts the
+  fresh ones.
+
+- **Undecodable UDP from a NAT-T client.** An obfuscated datagram no key
+  decodes, from an address with a session here, is counted
+  (`natt_udp_undecodable_from_session`); when the session set `0x1000`, also
+  `natt_undecodable_from_natt_client` and an entry in `/api/natt` "recent"
+  (once a minute per address). A keepalive obfuscated with a server key
+  fetched for another address is unreadable and otherwise looks exactly
+  like one never sent (#40).
+- **`0x62` reason 5** for a `0x60` where either session is not over IPv4
+  (an IPv6-only session is LowID too): the `0x61` would have carried
+  `0.0.0.0` as the peer's address. No extension wake-up for such a pair.
+  Counted as `holepunch_fail_no_ipv4`.
+
+### IPv6 dial-back (issue #43)
+
+A client's IPv6 is published as a source only after the server has dialled
+`[address]:login port` with the HighID identity probe and got back the user
+hash that logged in. Most dual-stack homes have a global address behind a
+router that drops inbound IPv6; published on trust, it sent peers to an
+address that never answered, and a client cannot test its own inbound IPv6.
+Until the verdict the address is held (`ST_IPV6_STATUS` `0x01`); it comes in
+a fresh `OP_SERVERIDENT`: `0x07` published, or `0x05` (`IPV6ST_PROBED` =
+`0x04`) not published. The client stays able to receive IPv6 records. A new
+address in `OP_IPV6_UPDATE` is dialled again, the same one keeps its verdict.
+Shares the server-wide probe ceiling (a probe that finds it full is retried
+a minute later), at most 4 dials per session since the client chooses where
+they go. New key `network.ipv6_probe` (on, live); in force only with
+`ipv6_publish_sources` and an IPv6 route on the host (checked at start and
+every minute), and then announced with `0x400000` in `OP_IDCHANGE`.
+Otherwise addresses are published on trust as before. Status tab: "IPv6
+dial-back", with the failures by stage (connect timeout, refused, ICMP
+unreachable, after the connect); Blocks tab: `ipv6_probe_*`. A probe whose
+connect fails other than by a reset now reads "connect unreachable" instead
+of "connect refused", in the HighID statistics too.
+
+### Reported by itlezy (issues #44–#49)
+
+- **HighID identity probe, obfuscated (#44).** The opening is
+  `<marker><key part>RC4(<magic><methods supported><method preferred><padding
+  length>)`, 12 bytes; it sent one method byte, so eMule and aMule read the
+  first byte of the HELLO as the padding length and lost the stream. The HELLO
+  now goes only after the peer's answer has been read and checked, and the
+  answer's padding length is read as the whole byte: a client pads its answer
+  to anyone but the server it is logging into with up to 254 bytes, which the
+  4-bit mask cut short (the later re-checks and the IPv6 dial-back). Until now
+  an obfuscated probe most likely succeeded only through its plain fallback,
+  which a client requiring obfuscation refuses from any address but the
+  server's own. Live, the HighID check's "no answer" fell from 19% of
+  probes to under 5% (426 of 9.2k in eight hours). Tested against a peer that
+  negotiates as aMule does.
+- **One file, one size (#45).** A publisher whose size differs from the one
+  stored for the hash is not merged into that file (`offer_size_mismatch`),
+  and a sized source request for a hash stored with another size gets no
+  sources (`getsources_size_mismatch_{tcp,udp}_{larger,smaller}`: which
+  side asked for more), over TCP and in UDP `0x94`. The first size stays
+  while the file has sources; once it has none, the next publisher's size
+  replaces it, so a wrong size cannot hold a hash. Size 0 matches anything,
+  and so does a size cut to 32 bits against the full one above 4 GiB (a
+  client without large-file support): that is the same file, and the record
+  takes the full size. A 64-bit `FT_FILESIZE` tag in `OP_OFFERFILES` is read
+  whole (it used to be dropped, leaving size 0). Live: under 1% of source
+  requests in eight hours asked with another size. **`/api/sizemismatch`**
+  keeps the last 1000 disagreements (hash, stored and other size, the
+  publisher's or requester's address, a publisher's software and whether its
+  copy is complete; never a name) and groups them by file: every other size
+  seen, with how many distinct addresses published or asked for it. No second record per (hash, size): the index stays one
+  record per hash.
+- **A replaced session is fenced (#46).** Once a newer login of the same user
+  has taken over, the old socket's next frame closes it instead of being
+  handled under a user hash it no longer owns (`replaced_session_frame_refused`).
+  A silent one still goes after 10 minutes. Not for a shared hash (DLP's,
+  mldonkey's, the operator's): its sessions are different installs, and
+  fencing them sent each displaced one straight back to displace the other —
+  live, shared-hash takeovers went from 1.2k in ten hours to 11k in eight.
+- **Sources a requester can reach (#49).** Up to 800 of a file's sources are
+  looked at (200 for UDP), HighID and departed ones first, LowID after, so the
+  HighID sources are no longer hidden behind a reply's worth of LowIDs (nine
+  sessions in ten are LowID). A stock LowID requester gets no LowID sources; a
+  LowID requester with NAT traversal (`0x1000`, `0x100000` or the announced
+  UDP port) gets the LowIDs that have it too; a HighID requester gets all of
+  them for callbacks. Decided when the reply is served, so the cached payload
+  still serves everyone.
+- **Rust 1.75 (#48).** The lockfile had drifted onto releases that need Rust
+  1.81–1.88 (`base64ct` 1.8, `zeroize` 1.9 and the ICU 2 line under `url`,
+  several of them edition 2024). Pinned in `Cargo.toml` (`base64ct` =1.6.0,
+  `zeroize` <1.9, `idna_adapter` =1.2.0, which selects ICU 1.5), the lockfile
+  regenerated with the MSRV-aware resolver, and `.cargo/config.toml` sets
+  `resolver.incompatible-rust-versions = "fallback"`. Every crate built on
+  Linux now declares a rust-version of 1.75 or lower; the ones that do not
+  are Windows / WASM only.
+- **#47** (HighID only after the identity probe) is not taken: see the issue.
+
+### OFFERFILES v1 (issue #19)
+
+README: aMule's client side (PR #1715) is merged and on by default from its
+next release; its 5 s wait for the login `OP_SERVERIDENT` and its re-offer
+when the limits come late.
+
+### Filter audit
+
+- **`/api/review?format=audit` / `format=auditcsv`.** A false-positive audit
+  that never shows a name the filter blocked rightly. Each blocked name is
+  reduced to signals (explicit adult words, a child's age, a word for a
+  child, a second listed term); a name is shown only with none of them, in
+  a rule that is not a working marker. Per rule: hits, signal counts, file
+  kinds, publishers and a verdict; the visible names; hashes withheld for
+  explicit words only; L3 decoy candidates and alias leads with clean names
+  only. The CSV adds a suggestion per hash (`whitelist?`, `review`, `keep`,
+  `poison?`).
+- **`/api/indexcheck`.** Every indexed file against the filter as it is now,
+  hashes only, with whitelisted ones marked; `?purge=1` takes the blocked
+  ones out of the index. Closes the gap where lists reloaded after a file was
+  indexed were never applied to it.
+
+### Same-hash logins (issue #41)
+
+A login with a user hash that is already online used to replace that
+session from any address. User hashes are public (every hello and source
+exchange carries them), so anyone could take a live session over: its
+shared files, its LowID callbacks, its hole-punch port. It now replaces the
+session only when it is plausibly the same machine:
+
+- the same IPv4, or the same IPv6 prefix (`admission.ipv6_source_prefix_bits`):
+  the NAT-dropped reconnect, as before;
+- a dual-stack move: an IPv4 session's own advertised IPv6 (`CT_MOD_IP_V6`),
+  with the same listen port. Not the other way round;
+- the old session is already gone.
+
+Before refusing, the server holds the new login and probes the old
+session (ModderMule's idea, refined by got3nks): the old socket gets a 10 s
+`TCP_USER_TIMEOUT` and an `OP_SERVERSTATUS`. When the user has moved, the
+old path is dead, nothing acknowledges the write, the kernel aborts the old
+connection after ~10 s and the held login goes ahead — inside the 25 s
+eMule-family clients wait for a login answer, so a real move succeeds on
+the first attempt. An acknowledged write means the owner is there: the
+login gets a server message ("This user hash is already connected from
+another address") and is closed. One probe per session at a time, then a
+10 s pause. A contender refused after a probe is refused without one for
+ten minutes: two installs sharing a user hash retry every few seconds, and
+probing the owner each time kept its socket on a 10 s fuse (the first four
+hours live: 5.5k refusals, 1.4k probes). **A shared hash keeps the
+old rule** — the newest login takes the session — when it is degenerate (12+
+zero bytes, like the leecher mod's community hash
+`00000000000E00000000000000006F00`; a random hash practically never is) or
+on a built-in list — the 30 community, corrupt and invalid hashes of DLP's
+antiLeech, plus mldonkey's `3649E68B070E85991648EF223A7F6FFD`, seen here from
+many addresses in many countries at once (1.2k takeovers in ten hours once
+listed, none refused) — or in the new `limits.shared_user_hashes` (live, added to the
+built-in list). Such a hash
+identifies no one; refusing all but one of its users locked them out (98%
+of the refusals in the first hours came from three such hashes). Not by how
+many addresses contest a hash: that is what a hijacker would produce
+(got3nks) — `/api/takeover` only reports it (`looks_shared`). Counted as
+`login_takeover_shared_hash`. Checked again just before the
+session is stored. Counted in the Blocks tab (`login_hash_in_use`,
+`login_takeover_probe`, `login_takeover_after_probe`,
+`login_hash_in_use_known_contender`). **`/api/takeover`** lists the hashes
+refused, worst first, with the contenders' addresses and the owner's
+address and software: one or two contenders is a shared user hash, many is
+a hash handed around. New key `limits.hash_takeover_from_any_address`
+(off) restores the old rule.
+
 ## 0.9.85
 
 Lugdunum's NAT callback (issue #39), so a client written for the original
