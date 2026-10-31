@@ -705,9 +705,13 @@ never has to go through the names the filter blocked rightly.
 **`/api/review?format=audit`** (and `format=auditcsv`) looks for false
 positives in the blocks of the window (same `hours`, `all`, `peek` parameters
 as the plain review). Every blocked name is reduced to signals — explicit
-adult words, a child's age, a word for a child, a second listed term — and a
-name is shown only when it has none of them and its rule is not a working
-marker (a quarter or more of its hits point at a child). The report has a
+adult words, a child's age, a word for a child, a second listed term (with
+the rule's own term removed across separators) — and a name is shown only
+when it has none of them, its rule is not a working marker (a quarter or more
+of its hits point at a child), and the file is audio, a document or software:
+a film, picture or archive is never named, since a clean-looking name there
+can still be a studio or series marker. The false positives that occur are
+song, book and program titles. The report has a
 table per rule (hits, signal counts, audio/doc/video/image split,
 publishers, verdict: likely false positive / mixed / marker), the visible
 names under each rule, the hashes of names withheld for explicit words only
@@ -716,7 +720,21 @@ L3 hits with a decoy signature and indexed files under unrelated names — those
 with clean names only. The CSV has one line per hash:
 `hash;layer;reason;size;kind;explicit;age;minor;marker2;sizeflag;names;unrelated;publishers;suggest;name`,
 `suggest` being `whitelist?`, `review`, `keep` or (L3) `poison?`, and `name`
-empty when withheld.
+empty when withheld. The age rule on a film or picture is always `keep`.
+
+**`format=hashlists`** gives the additions ready to paste, hashes only: for
+`hash_banlist.txt` every film, picture, archive or other file a term layer
+(L1, L2, L4) blocked in the window; for `hash_filter.txt` every indexed file
+under 3+ unrelated names (decoys); commented out, the audio, document and
+software hits to look at first and the ban-list files that carry 3+ unrelated
+names. **`format=terms`** gives leads for the term lists: words of 4+
+characters in 5+ blocked files of the window that 90% or more of the files
+carrying them are blocked, and that the filter does not block on their own,
+as `word;blocked files;served files`. Words only, never a name.
+**`format=audio`** lists every blocked audio file (mp3, flac, ogg, wav, m4a and
+the rest) by rule, with its name: a sound file is almost never abuse material,
+so these are the false-positive leads. A name with a child signal is still
+withheld. A hash in `hashlists`' ban-list part never appears among its decoys.
 
 **`/api/indexcheck`** runs every indexed file through the filter as it is now.
 Lists reloaded after a file was indexed were never applied to it; this finds
@@ -869,7 +887,8 @@ else the port you announced (`0xF9`, or the one in your `0x60`).
 | `OP_LOWID_HOLEPUNCH_REQUEST` | `0x60` | client → server (TCP) | `<target_id 4><our_udp_port 2>` |
 | `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4><peer_crypt 1>` |
 | `OP_LOWID_HOLEPUNCH_FAIL` | `0x62` | server → client (TCP) | `<target_id 4><reason 1>` |
-| `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>` |
+| `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>[<token 16>]` |
+| `OP_SERVERIDENT` tag `ST_NATT_TOKEN` | `0xAC`, 16 bytes | server → client (TCP) | the session's NAT-T token (since 0.9.87) |
 | `OP_IDCHANGE` TCP flags bit | `0x20000` | server → client (TCP) | set when the server accepts `0x60` |
 
 To download from a LowID source **B**, send `0x60` with B's assigned id and your UDP
@@ -890,6 +909,19 @@ is appended, the peer's `(CT_SERVER_FLAGS >> 9) & 7` (supports / requests /
 requires the crypt layer). With the user hash at bytes 8–23 it lets the
 dialler obfuscate from its first datagram, so a peer that requires the crypt
 layer accepts the stream. Read it only from 30 bytes or more.
+**The NAT-T token (issue #40, since 0.9.87).** A `0x9F` is believed only from the
+session's own address, since a user hash is no secret. That leaves out a client
+whose carrier NAT sends its UDP out of another public IPv4 than its TCP, and one
+logged in over IPv6. So each session that may send `0x9F` (login flag
+`0x100000` or `0x1000`, or a UDP port announced in `0xF9`) gets 16 random bytes,
+`ST_NATT_TOKEN` (`0xAC`, hash type) in `OP_SERVERIDENT`; a client with
+`0x100000` gets that `OP_SERVERIDENT` at login. A `0x9F` of
+`<userhash 16><token 16>` is then the session's own from any address: its source
+address and port become what peers are given in `0x61` and `0xA7`, an IPv6
+session included (no `0x62` reason 5 then). A `0x9F` with a wrong token is
+ignored. Without the token everything is as before. The token is new on every
+login. Counters: `natt_9f_token`, `natt_9f_token_other_ip`, `natt_9f_bad_token`.
+
 (`0x60`–`0x62` are unused in the server TCP opcode space, which runs `0x01`–`0x44`,
 and `0x9F` was free in the server UDP namespace — no conflict on the server link.)
 
@@ -1017,9 +1049,15 @@ wake-up, the bridge — always carries the requester's own ID, which is never
 server" alone: punch towards the requester's endpoint, send its `0x9F`
 burst, and wait to be dialled.
 
-The target must be a logged-in LowID that set `0x1000`. Nothing is sent when
-one side requires the crypt layer (the target can't get the requester's hash
-here). Every other case gets no answer at all: an unknown, HighID, gone or
+The target must be a logged-in LowID that set `0x1000`. The crypt layer: a
+target with the extension is dialled by the requester, which gets the
+target's hash in the `0xA7` and obfuscates its first datagram with it (an
+obfuscated uTP dial opens with a key frame the target answers without knowing
+the requester), so a side that requires the layer only needs the other side
+to support it; the requester's setting is the crypt byte of its `0xA6`, none
+meaning none. A Lugdunum-only target dials the requester itself without its
+hash, so there nothing is sent when one side requires the layer (since
+0.9.87; before, that rule held for every target). Every other case gets no answer at all: an unknown, HighID, gone or
 incapable target, a plain request, a limit reached. So the path is no oracle
 for who is online. Without a session to kick, the limits sit on the source IP
 and on the target:

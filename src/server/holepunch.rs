@@ -78,6 +78,20 @@ use tracing::{debug, warn};
 /// (the next keepalive overwrites it within ~2 min anyway).
 const OBSERVED_UDP_FRESH: Duration = Duration::from_secs(600);
 
+/// Sessions that get a NAT-T token: those that may send `0x9F` — the
+/// extension's `0x100000`, Lugdunum's `0x1000`, or a UDP port announced at
+/// login (aMule's hole punch). The tag reaches only a session that is sent
+/// `OP_SERVERIDENT`.
+pub(crate) fn wants_natt_token(c: &ClientHandle) -> bool {
+    c.natt_capable || c.server_flags & (SRVCAP_NATTRAVERSAL | SRVFLG_HOLEPUNCH_EXT) != 0
+}
+
+/// The address to hand peers for this session's UDP: the IPv4 its token
+/// `0x9F` proved, when that is not the session's own, else the session's.
+pub(crate) fn natt_ip(state: &ServerState, user_hash: &[u8; 16], session_ip: IpAddr) -> IpAddr {
+    state.natt_udp_ip.get(user_hash).map_or(session_ip, |e| *e)
+}
+
 /// The UDP port to hand a peer for the client `user_hash` at `ip` (issue #37).
 /// In order:
 ///  1. the source port of the client's own last 0x9F keepalive, if fresh: it
@@ -163,6 +177,9 @@ pub fn handle_holepunch_request(
     requester_udp_port: u16,
     target_id: u32,
 ) -> Option<u8> {
+    // Where the requester's UDP really is (issue #40): its token 0x9F may
+    // have proved another IPv4 than its session's.
+    let requester_ip = natt_ip(state, requester_user_hash, requester_ip);
     // Record the requester's UDP port so that, if it is later a target, the
     // server already knows how to reach it. Cheap single-shard update. This is
     // the announced port, the last resort of `observed_udp_port`: the port of
@@ -196,6 +213,9 @@ pub fn handle_holepunch_request(
         )
     });
 
+    let target_data = target_data.map(|(ip, tcp, udp, hash, high, alive, flags)| {
+        (natt_ip(state, &hash, ip), tcp, udp, hash, high, alive, flags)
+    });
     let Some((t_ip, t_tcp, t_udp, t_hash, t_high, t_alive, t_flags)) = target_data else {
         debug!(requester_id, target_id, "holepunch: target not connected");
         send_fail(
@@ -585,7 +605,10 @@ pub fn request(
         .client_by_assigned_id(target_id)
         .filter(|t| t.user_hash != requester_user_hash && !t.is_high_id && t.is_alive())
         // No wake-up for a pair that cannot be given IPv4 endpoints.
-        .filter(|t| session_v4(t.ip).is_some() && session_v4(requester_ip).is_some());
+        .filter(|t| {
+            session_v4(natt_ip(state, &t.user_hash, t.ip)).is_some()
+                && session_v4(natt_ip(state, &requester_user_hash, requester_ip)).is_some()
+        });
     if let Some(t) = &target {
         let r_flags = state
             .clients
@@ -654,6 +677,7 @@ enum Ext {
 /// has for the requester now. None when the crypt settings rule it out.
 fn wake_body(state: &ServerState, requester_user_hash: &[u8; 16], requester_ip: IpAddr, target_flags: u32) -> Option<Vec<u8>> {
     let req = state.clients.get(requester_user_hash).map(|c| c.clone())?;
+    let requester_ip = natt_ip(state, requester_user_hash, requester_ip);
     let port = observed_udp_port(state, requester_user_hash, requester_ip, req.udp_port);
     lugdunum_natt::forward_body(&req, SocketAddr::new(requester_ip, port), target_flags)
 }
@@ -1083,6 +1107,10 @@ mod tests {
             "nor is an IPv4 requester told an IPv6 target's 0.0.0.0"
         );
         assert_eq!(session_v4("::ffff:1.2.3.4".parse().unwrap()), Some(Ipv4Addr::new(1, 2, 3, 4)));
+        // Once the IPv6 session's token 0x9F has proved an IPv4 (issue #40),
+        // the pair is punched to that address.
+        state.natt_udp_ip.insert(b, IpAddr::V4(Ipv4Addr::new(5, 6, 7, 10)));
+        assert_eq!(handle_holepunch_request(&state, &b, 201, v6, 4662, 4672, 101), None);
     }
 
     #[test]

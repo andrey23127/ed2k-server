@@ -33,6 +33,8 @@ use tracing::{debug, info, warn};
 
 /// Maximum sources returned in a single UDP GLOBFOUNDSOURCES response.
 const UDP_MAX_SOURCES: usize = 30;
+/// eMule's largest file, 256 GiB. A size above it is not a size.
+const MAX_ED2K_FILE_SIZE: u64 = 256 << 30;
 /// Sources looked at to fill a UDP answer, HighIDs first (issue #49).
 const UDP_SOURCE_SCAN: usize = 200;
 
@@ -1009,6 +1011,16 @@ impl UdpServer {
                         // address: a user hash is no secret, and a keepalive
                         // from elsewhere would send the client's peers there.
                         let same_ip = canon_ip(h.ip) == canon_ip(peer.ip());
+                        // Unless it carries the session's NAT-T token (issue
+                        // #40): <user hash 16><token 16>. The token went to
+                        // this session alone, so the datagram is its own from
+                        // whatever address, and that address is where its
+                        // UDP is. A wrong token is no keepalive at all.
+                        let token = (payload.len() >= 32).then(|| &payload[16..32]);
+                        let token_ok = token.is_some_and(|t| {
+                            self.state.natt_token.get(&uh).is_some_and(|k| k.as_slice() == t)
+                        });
+                        let token_bad = token.is_some() && !token_ok;
                         // Issue #39: on a server offering the extension, once
                         // a session has sent an obfuscated 0x9F its plain
                         // ones are ignored. Only the server key makes one,
@@ -1020,6 +1032,7 @@ impl UdpServer {
                             .is_some_and(|o| *o);
                         let plain_refused = obf.is_none()
                             && sent_obfuscated
+                            && !token_ok
                             && crate::server::holepunch::extension_enabled(&self.state.live_cfg.load());
                         if plain_refused {
                             *self
@@ -1028,7 +1041,14 @@ impl UdpServer {
                                 .entry("natt_keepalive_plain_ignored".to_string())
                                 .or_insert(0) += 1;
                         }
-                        kind = if !same_ip {
+                        // Accepted from the session's own address, or with
+                        // the token from any.
+                        let accepted = !token_bad && (same_ip || token_ok);
+                        kind = if token_bad {
+                            "natt_9f_bad_token"
+                        } else if token_ok && !same_ip {
+                            "natt_9f_token_other_ip"
+                        } else if !same_ip {
                             "natt_9f_wrong_ip"
                         } else if plain_refused {
                             "natt_9f_plain_ignored"
@@ -1037,7 +1057,17 @@ impl UdpServer {
                         } else {
                             "natt_9f_plain"
                         };
-                        if same_ip && !plain_refused {
+                        if accepted && !plain_refused {
+                            if token_ok {
+                                crate::server::holepunch::count(&self.state, "natt_9f_token");
+                            }
+                            // Where peers must punch to: the proven address
+                            // when it is not the session's (issue #40).
+                            if same_ip {
+                                self.state.natt_udp_ip.remove(&uh);
+                            } else {
+                                self.state.natt_udp_ip.insert(uh, canon_ip(peer.ip()));
+                            }
                             // Issue #37: kept per client. The login port
                             // (`udp_port`, 0xF9) stays as announced; it is
                             // filled from here only if the client sent none,
@@ -1057,7 +1087,7 @@ impl UdpServer {
                         // source is otherwise silent on TCP and would be wrongly
                         // evicted after the idle timeout despite a live link.
                         h.touch_activity();
-                        same_ip && !plain_refused
+                        accepted && !plain_refused
                     } else {
                         false
                     };
@@ -1266,6 +1296,15 @@ impl UdpServer {
                 b.copy_from_slice(&payload[i..i + 8]);
                 size = u64::from_le_bytes(b);
                 i += 8;
+                // Live, a quarter of the size disagreements were records
+                // with the 0 sentinel followed by 8 bytes no file has (high
+                // dword random, low byte 0), for files that are not large.
+                // Not a size: answered by hash alone, as before #45.
+                if size > MAX_ED2K_FILE_SIZE {
+                    crate::server::holepunch::count(&self.state, "udp_getsources2_bad_size");
+                    hashes.push((hash, None));
+                    continue;
+                }
             }
             hashes.push((hash, Some(size)));
         }

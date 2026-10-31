@@ -374,10 +374,15 @@ pub fn build_welcome_batch_with(
 /// Sent at login only to a client that announced something that needs it
 /// there: OFFERFILES v1 (the policy tags, issue #19; a client that asked gets
 /// it even when v1 is off, to learn that it is legacy, see the connection
-/// handler) or the IPv6 extension (`ST_IPV6`). Both are recent clients with
-/// a correct parser.
+/// handler), the IPv6 extension (`ST_IPV6`) or the hole-punch extension
+/// (`0x100000`, for `ST_NATT_TOKEN`). All are recent clients with a correct
+/// parser.
 pub fn ident_at_login(client: &ClientHandle) -> bool {
-    client.offer_policy.is_some() || client.ipv6_capable
+    client.offer_policy.is_some()
+        || client.ipv6_capable
+        // The hole-punch extension, for its NAT-T token (issue #40): a recent
+        // client too. Not Lugdunum's 0x1000 alone, which older mods set.
+        || client.server_flags & crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT != 0
 }
 
 /// OP_SERVERIDENT: server hash, IP, port and tags.
@@ -495,6 +500,13 @@ pub fn build_server_ident(cfg: &Config, state: &ServerState, client: &ClientHand
             tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
         }
     }
+    // ST_NATT_TOKEN (issue #40): the session's NAT-T token. A 0x9F carrying
+    // it after the user hash, <user hash 16><token 16>, is believed from any
+    // address: the token went to this session only, over its TCP. Only to a
+    // session that does NAT-T, so every other SERVERIDENT is unchanged.
+    if let Some(t) = state.natt_token.get(&client.user_hash) {
+        tags.push(Tag::byte(ST_NATT_TOKEN, TagValue::Hash16(*t)));
+    }
     // OFFERFILES v1 (issue #19): all three or none, string-named so a
     // client that does not know them skips them. A legacy session (v1 off,
     // or a configuration that cannot be advertised) gets a SERVERIDENT
@@ -539,6 +551,9 @@ const ST_IPV6: u8 = 0xAE;
 
 /// `ST_IPV6_STATUS` — the server's verdict on the client's advertised IPv6.
 const ST_IPV6_STATUS: u8 = 0xAB;
+/// `ST_NATT_TOKEN` — the session's NAT-T token, 16 bytes (issue #40). 0xAC:
+/// next to the IPv6 tags, and not one eNode-go uses (0xA8, 0xAD, 0xAF).
+pub(crate) const ST_NATT_TOKEN: u8 = 0xAC;
 /// The server holds a public IPv6 for this session.
 pub(crate) const IPV6ST_HAVE: u8 = 0x01;
 /// That address is treated as reachable and the client is published as a v6

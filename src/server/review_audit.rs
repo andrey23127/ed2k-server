@@ -60,19 +60,24 @@ pub fn kind_of(name: &str) -> Kind {
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "mp3" | "flac" | "ogg" | "wma" | "m4a" | "ape" | "wav" | "aac" | "opus" | "mpc" | "wv"
-        | "mka" | "ac3" | "dts" | "mid" | "midi" | "cue" => Kind::Audio,
+        "mp3" | "mp2" | "flac" | "ogg" | "oga" | "wma" | "m4a" | "m4b" | "m4r" | "ape" | "wav"
+        | "wave" | "aac" | "opus" | "mpc" | "wv" | "mka" | "ac3" | "dts" | "mid" | "midi"
+        | "cue" | "aif" | "aiff" | "amr" | "au" | "ra" | "tta" | "shn" | "spx" | "caf" | "dsf"
+        | "dff" | "xm" | "mod" | "s3m" | "it" => Kind::Audio,
         "avi" | "mkv" | "mp4" | "wmv" | "mpg" | "mpeg" | "mov" | "flv" | "m4v" | "ts" | "m2ts"
         | "vob" | "rmvb" | "rm" | "3gp" | "webm" | "divx" | "ogm" | "asf" | "srt" | "sub" => {
             Kind::Video
         }
         "jpg" | "jpeg" | "png" | "gif" | "bmp" | "webp" | "tif" | "tiff" => Kind::Image,
         "pdf" | "epub" | "mobi" | "djvu" | "djv" | "doc" | "docx" | "txt" | "rtf" | "chm"
-        | "azw" | "azw3" | "fb2" | "lit" | "cbr" | "cbz" | "ppt" | "pptx" | "xls" | "xlsx"
-        | "odt" | "htm" | "html" | "ps" => Kind::Doc,
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" => Kind::Archive,
-        "exe" | "msi" | "apk" | "dmg" | "iso" | "bin" | "img" | "nrg" | "mdf" | "cab" | "jar"
-        | "deb" | "rpm" => Kind::Software,
+        | "azw" | "azw3" | "fb2" | "lit" | "ppt" | "pptx" | "xls" | "xlsx" | "odt" | "htm"
+        | "html" | "ps" => Kind::Doc,
+        // Comic archives are pictures, and disc images may hold films: neither
+        // is a document or a program, whose clean names the audit shows.
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" | "cbr" | "cbz" | "cb7" => {
+            Kind::Archive
+        }
+        "exe" | "msi" | "apk" | "dmg" | "cab" | "jar" | "deb" | "rpm" => Kind::Software,
         _ => Kind::Other,
     }
 }
@@ -202,6 +207,22 @@ impl Signals {
 }
 
 /// The term a rule's reason names, without the decorations the filter adds.
+/// Lower-cased, with every run of non-alphanumeric characters as one space.
+pub fn separators_to_spaces(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut gap = true;
+    for c in s.to_lowercase().chars() {
+        if c.is_alphanumeric() {
+            out.push(c);
+            gap = false;
+        } else if !gap {
+            out.push(' ');
+            gap = true;
+        }
+    }
+    out
+}
+
 fn reason_term(reason: &str) -> &str {
     reason.trim_end_matches(" (mojibake)").trim()
 }
@@ -209,14 +230,25 @@ fn reason_term(reason: &str) -> &str {
 pub fn signals(filter: &ContentFilter, name: &str, layer: Layer, reason: &str) -> Signals {
     let lower = name.to_lowercase();
     // The rule's own term does not count against the name: it is what is
-    // being judged.
+    // being judged. Removed from a copy with every separator turned into a
+    // space, the way the term layers see it: removed from the raw name, a
+    // term the layers matched across "." or "_" ("Star.Sessions") stayed in,
+    // tripped the layer again and counted as a second marker. On 31.10.2026
+    // that made every L1 and L4 rule a "marker" and withheld every name.
     let stripped = match layer {
         Layer::L1Jargon | Layer::L4Extra => {
-            let t = reason_term(reason).to_lowercase();
-            if t.is_empty() {
+            let t = separators_to_spaces(reason_term(reason));
+            if t.trim().is_empty() {
                 lower.clone()
             } else {
-                lower.replace(&t, " ")
+                let spaced = separators_to_spaces(&lower);
+                let squashed: String = t.chars().filter(|c| *c != ' ').collect();
+                let once = spaced.replace(t.trim(), " ");
+                if squashed.len() > 2 {
+                    once.replace(&squashed, " ")
+                } else {
+                    once
+                }
             }
         }
         _ => lower.clone(),
@@ -288,8 +320,12 @@ pub fn name_visible(sig: &Signals, verdict: Verdict, layer: Layer, kind: Kind) -
     }
     match layer {
         Layer::L3HashBlock => false,
-        Layer::L2AgePattern => matches!(kind, Kind::Audio | Kind::Doc | Kind::Software),
-        _ => true,
+        // A film, a picture or an archive is never shown, under any rule: a
+        // clean-looking name there can still be a studio or series marker
+        // with nothing else in it. The false positives that do occur are
+        // song, book and program titles that carry a term, and those are
+        // what is shown.
+        _ => matches!(kind, Kind::Audio | Kind::Doc | Kind::Software),
     }
 }
 
@@ -344,6 +380,7 @@ mod tests {
         let clean = signals(&f, "Band - Elephant (live).mp3", Layer::L4Extra, "elephant");
         assert!(!clean.dirty());
         assert!(name_visible(&clean, Verdict::LikelyFalsePositive, Layer::L4Extra, Kind::Audio));
+        assert!(!name_visible(&clean, Verdict::LikelyFalsePositive, Layer::L4Extra, Kind::Video));
         let dirty = signals(&f, "elephant porno.avi", Layer::L4Extra, "elephant");
         assert!(dirty.explicit && dirty.dirty() && !dirty.strong());
         assert!(!name_visible(&dirty, Verdict::Mixed, Layer::L4Extra, Kind::Video));
@@ -353,5 +390,10 @@ mod tests {
         let f2 = f.with_extra_terms(vec!["walrus".to_string()]);
         let two = signals(&f2, "elephant walrus.mp4", Layer::L4Extra, "elephant");
         assert!(two.marker2);
+        // The term across separators is the rule's own term, not a second one.
+        let f3 = ContentFilter::new().with_extra_terms(vec!["star sessions".to_string()]);
+        for n in ["Star.Sessions set 01.zip", "Star_Sessions set 01.zip", "star sessions set.zip"] {
+            assert!(!signals(&f3, n, Layer::L4Extra, "star sessions").marker2, "{n}");
+        }
     }
 }

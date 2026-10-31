@@ -2709,8 +2709,13 @@ async fn api_review(State(s): State<WebState>, uri: axum::http::Uri) -> impl Int
 
     // The audit: the same window, reduced to signals, with a name shown only
     // where nothing but the rule that fired points at abuse.
-    if let Some(fmt) = param("format").filter(|f| *f == "audit" || *f == "auditcsv") {
-        let out = audit_report(&s, &by_hash, since, &window_desc, fmt == "auditcsv", max_examples);
+    if let Some(fmt) = param("format")
+        .filter(|f| matches!(*f, "audit" | "auditcsv" | "hashlists" | "terms" | "audio"))
+    {
+        let out = match fmt {
+            "terms" => term_candidates(&s, &by_hash, &window_desc),
+            _ => audit_report(&s, &by_hash, since, &window_desc, fmt, max_examples),
+        };
         if !flag("peek") {
             if let Ok(mut g) = s.server.review_watermark.lock() {
                 *g = Some(now);
@@ -3041,9 +3046,10 @@ fn audit_report(
     by_hash: &std::collections::HashMap<[u8; 16], (crate::state::CsamCatch, Vec<String>)>,
     since: Option<std::time::Instant>,
     window_desc: &str,
-    csv: bool,
+    mode: &str,
     max_examples: usize,
 ) -> String {
+    let csv = mode == "auditcsv";
     use crate::filter::Layer;
     use crate::server::review_audit::{self as ra, Verdict};
     let filter = &s.server.filter;
@@ -3128,7 +3134,15 @@ fn audit_report(
             .get(&(format!("{:?}", e.layer), e.reason.clone()))
             .copied()
             .unwrap_or(Verdict::Marker);
-        if e.sig.strong() || v == Verdict::Marker {
+        // The age rule on a film or a picture is never a whitelist lead. Its
+        // unpaired notations ("12yo", "13y") block on the age alone, so a
+        // missing second signal is the rule working, not a sign of a false
+        // positive: on 31.10.2026 the audit suggested 1160 such hashes for
+        // the whitelist, every one a video or picture with an age and no
+        // other word to judge it by.
+        let age_on_media = e.layer == Layer::L2AgePattern
+            && !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Software);
+        if e.sig.strong() || v == Verdict::Marker || age_on_media {
             "keep"
         } else if v == Verdict::LikelyFalsePositive && !e.sig.explicit {
             "whitelist?"
@@ -3138,6 +3152,110 @@ fn audit_report(
         }
     };
     let b = |x: bool| if x { "1" } else { "0" };
+
+    // Every blocked audio file, by rule, with its name: a sound file is
+    // almost never abuse material, so these are the false-positive leads.
+    // A name with a child signal (an age, a child word, a second listed
+    // term) is still withheld.
+    if mode == "audio" {
+        let mut aud: Vec<&Entry> = entries.iter().filter(|e| e.kind == ra::Kind::Audio).collect();
+        aud.sort_by(|a, b| {
+            (format!("{:?}", a.layer), &a.reason, &a.name).cmp(&(format!("{:?}", b.layer), &b.reason, &b.name))
+        });
+        let mut out = format!(
+            "# ed2k-server blocked audio files, {window_desc}: {} files. Almost always a\n\
+             # song or book title that carries a term. Names with a child signal (an age,\n\
+             # a child word, a second listed term) are withheld.\n\
+             # hash | layer | rule | MB | name\n",
+            aud.len()
+        );
+        for e in aud {
+            let sig = if e.layer == Layer::L3HashBlock {
+                ra::signals(filter, &e.name, e.layer, &e.reason)
+            } else {
+                e.sig
+            };
+            let name = if sig.strong() {
+                "[withheld: child signal]".to_string()
+            } else {
+                e.name.chars().take(160).collect::<String>()
+            };
+            out.push_str(&format!(
+                "{} | {:?} | {} | {} | {}\n",
+                hex::encode(e.hash),
+                e.layer,
+                e.reason,
+                e.size / 1_048_576,
+                name
+            ));
+        }
+        return out;
+    }
+
+    // Ready-made additions for the two hash lists, hashes only.
+    if mode == "hashlists" {
+        let media = |e: &Entry| !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Software);
+        let term_hit = |e: &Entry| !matches!(e.layer, Layer::L3HashBlock | Layer::L5Poison);
+        let mut ban: Vec<&Entry> = entries.iter().filter(|e| term_hit(e) && media(e)).collect();
+        let mut look: Vec<&Entry> = entries.iter().filter(|e| term_hit(e) && !media(e)).collect();
+        ban.sort_by(|a, b| (format!("{:?}", a.layer), &a.reason).cmp(&(format!("{:?}", b.layer), &b.reason)));
+        look.sort_by(|a, b| (format!("{:?}", a.layer), &a.reason).cmp(&(format!("{:?}", b.layer), &b.reason)));
+        let mut out = format!(
+            "# ed2k-server hash list candidates, {window_desc}. Hashes only, never a name.\n\n\
+             # ===== hash_banlist.txt: {} files a term layer (L1, L2, L4) blocked =====\n\
+             # Films, pictures, archives and other files. Not audio, documents or\n\
+             # software: those are below, and format=audit shows their clean names.\n",
+            ban.len()
+        );
+        for e in &ban {
+            out.push_str(&format!("{} ; {:?} {} {}\n", hex::encode(e.hash), e.layer, e.reason, e.kind.as_str()));
+        }
+        out.push_str(&format!(
+            "\n# ===== look first: {} possible false positives =====\n\
+             # Audio, documents and software: song, book and program titles that carry\n\
+             # a term. format=audit shows the clean ones. Not for either list as they are.\n",
+            look.len()
+        ));
+        for e in &look {
+            out.push_str(&format!("# {} ; {:?} {} {}\n", hex::encode(e.hash), e.layer, e.reason, e.kind.as_str()));
+        }
+        // Decoys: indexed files advertised under 3+ unrelated names.
+        let banned: std::collections::HashSet<[u8; 16]> = ban.iter().map(|e| e.hash).collect();
+        let mut decoys: Vec<([u8; 16], usize, u64)> = s
+            .server
+            .file_aliases
+            .iter()
+            .map(|e| (*e.key(), unrelated_name_count(&e.value().names), e.value().size))
+            .filter(|(h, u, _)| *u >= 3 && !s.server.filter.is_whitelisted(h))
+            // A hash some publisher named with a listed term goes to the ban
+            // list, not here: the two lists never share a hash.
+            .filter(|(h, _, _)| !banned.contains(h))
+            .collect();
+        decoys.sort_by_key(|d| (std::cmp::Reverse(d.1), std::cmp::Reverse(d.2)));
+        out.push_str(&format!(
+            "\n# ===== hash_filter.txt: {} indexed files under 3+ unrelated names =====\n\
+             # Decoys: blocked without accusing whoever shares them.\n",
+            decoys.len()
+        ));
+        for (h, u, size) in &decoys {
+            out.push_str(&format!("{} ; decoy, {} unrelated names, {} B\n", hex::encode(h), u, size));
+        }
+        let l3: Vec<&Entry> = entries
+            .iter()
+            .filter(|e| e.layer == Layer::L3HashBlock && e.unrelated >= 3)
+            .collect();
+        out.push_str(&format!(
+            "\n# ===== on hash_banlist.txt with 3+ unrelated names: {} =====\n\
+             # A decoy, or abuse material passed around under other names; both look\n\
+             # alike from here. Move one to hash_filter.txt only once it is known to be\n\
+             # a decoy.\n",
+            l3.len()
+        ));
+        for e in &l3 {
+            out.push_str(&format!("# {} ; {} unrelated names, {} B\n", hex::encode(e.hash), e.unrelated, e.size));
+        }
+        return out;
+    }
 
     if csv {
         let mut out = String::from(
@@ -3170,9 +3288,11 @@ fn audit_report(
     let l3: Vec<&Entry> = entries.iter().filter(|e| e.layer == Layer::L3HashBlock).collect();
     let mut out = format!(
         "# ed2k-server filter audit\n# window: {window_desc}\n# blocks in window: {} unique hashes; L3 hash-list hits: {} (counted, never named)\n\
-         # A name is shown only when nothing in it but the rule that fired points at abuse\n\
-         # (no explicit word, no child's age, no child word, no second listed term), and\n\
-         # its rule is not a working marker. Everything else is counted.\n\n",
+         # A name is shown only for audio, documents and software, only when nothing in it\n\
+         # but the rule that fired points at abuse (no explicit word, no child's age, no\n\
+         # child word, no second listed term), and only when its rule is not a working\n\
+         # marker. Everything else is counted. format=hashlists: list additions;\n\
+         # format=terms: term leads.\n\n",
         entries.len(),
         l3.len()
     );
@@ -3200,7 +3320,13 @@ fn audit_report(
             cnt(&|e| e.kind == ra::Kind::Image),
             cnt(&|e| !matches!(e.kind, ra::Kind::Audio | ra::Kind::Doc | ra::Kind::Video | ra::Kind::Image)),
             pubs,
-            verdicts[*k].as_str(),
+            // Same reason as in `suggest`: for the age rule a low share of
+            // second signals is how it is built, not a false-positive sign.
+            if k.0 == "L2AgePattern" && verdicts[*k] == Verdict::LikelyFalsePositive {
+                "age alone (by design)"
+            } else {
+                verdicts[*k].as_str()
+            },
             k.0,
             k.1
         ));
@@ -3330,6 +3456,76 @@ fn audit_report(
                 out.push_str(&format!("    [{withheld} withheld]\n"));
             }
         }
+    }
+    out
+}
+
+/// `/api/review?format=terms`: words that keep turning up in blocked names
+/// and almost nowhere else, as leads for the term lists. Every word of 4+
+/// characters in the window's blocked names (by distinct file) is counted
+/// against the whole index; listed when 5+ blocked files carry it, 90% or
+/// more of the files that carry it were blocked, and the filter does not
+/// already block the word on its own. Words only, never a name.
+fn term_candidates(
+    s: &WebState,
+    by_hash: &std::collections::HashMap<[u8; 16], (crate::state::CsamCatch, Vec<String>)>,
+    window_desc: &str,
+) -> String {
+    use std::collections::{HashMap, HashSet};
+    let words = |n: &str| -> HashSet<String> {
+        crate::server::review_audit::separators_to_spaces(n)
+            .split(' ')
+            .filter(|w| w.chars().count() >= 4 && !w.chars().all(|c| c.is_ascii_digit()))
+            .map(str::to_string)
+            .collect()
+    };
+    let mut blocked: HashMap<String, usize> = HashMap::new();
+    for (_, names) in by_hash.values() {
+        let mut seen = HashSet::new();
+        for n in names {
+            seen.extend(words(n));
+        }
+        for w in seen {
+            *blocked.entry(w).or_insert(0) += 1;
+        }
+    }
+    let filter = &s.server.filter;
+    let mut cands: HashMap<String, (usize, usize)> = blocked
+        .into_iter()
+        .filter(|(w, n)| {
+            *n >= 5
+                && matches!(
+                    filter.check_ignoring_whitelist(&[0u8; 16], w),
+                    crate::filter::FilterResult::Allow
+                )
+        })
+        .map(|(w, n)| (w, (n, 0)))
+        .collect();
+    // How often each candidate appears in indexed (served) names.
+    s.server.file_slab.for_each_live_copied(|chunk| {
+        for (_, _, _, name, _) in chunk {
+            for w in words(&name) {
+                if let Some(c) = cands.get_mut(&w) {
+                    c.1 += 1;
+                }
+            }
+        }
+    });
+    let mut list: Vec<(String, usize, usize)> = cands
+        .into_iter()
+        .map(|(w, (b, i))| (w, b, i))
+        .filter(|(_, b, i)| *b as f64 / (*b + *i) as f64 >= 0.9)
+        .collect();
+    list.sort_by_key(|(w, b, i)| (std::cmp::Reverse(*b), *i, w.clone()));
+    let mut out = format!(
+        "# ed2k-server term candidates, {window_desc}: words in 5+ blocked files and\n\
+         # almost never in served ones, not blocked by the filter on their own.\n\
+         # Leads, not rules: a studio, series or site name is a good term; a name of\n\
+         # a person or an ordinary word needs care. Test before adding.\n\
+         # word;blocked files;served files\n"
+    );
+    for (w, b, i) in list {
+        out.push_str(&format!("{w};{b};{i}\n"));
     }
     out
 }

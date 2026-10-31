@@ -638,6 +638,14 @@ pub struct ServerState {
     /// written only by 0x9F sent from the session's own IP, and preferred by
     /// the hole-punch coordinator. Swept with `observed_udp_ports`.
     pub natt_udp_ports: DashMap<UserHash, (u16, Instant)>,
+    /// NAT-T session token (issue #40): 16 random bytes sent to the session
+    /// in `OP_SERVERIDENT` (`ST_NATT_TOKEN`). A `0x9F` that carries it is the
+    /// session's own from whatever address it comes.
+    pub natt_token: DashMap<UserHash, [u8; 16]>,
+    /// The IPv4 a session's `0x9F` proved with its token, when it is not the
+    /// session's own address (a carrier NAT that maps UDP elsewhere, or a
+    /// session over IPv6). Handed to peers instead of the session address.
+    pub natt_udp_ip: DashMap<UserHash, IpAddr>,
     /// Each client's last Lugdunum NAT callback request (UDP 0xA6): its
     /// endpoint, the key to answer it with, and its request allowance
     /// (`server::lugdunum_natt`). Swept after `lugdunum_natt::SEEN_TTL`.
@@ -1624,6 +1632,8 @@ impl ServerState {
             incoming_seed_challenges: DashMap::new(),
             observed_udp_ports: DashMap::new(),
             natt_udp_ports: DashMap::new(),
+            natt_token: DashMap::new(),
+            natt_udp_ip: DashMap::new(),
             lugdunum_natt_seen: DashMap::new(),
             natt_keepalive_seen: DashMap::new(),
             natt_keepalive_waiters: DashMap::new(),
@@ -1964,6 +1974,16 @@ impl ServerState {
             .with_record_by_hash(hash, |_id, r| r.size)
             .unwrap_or(0);
         let differs = !crate::state::file_id::sizes_agree(stored, want);
+        if !differs
+            && stored != 0
+            && crate::state::file_id::is_part_estimate(stored.min(want), stored.max(want))
+        {
+            // A size guessed from the part hashes (issue #45): served.
+            *self
+                .block_stats
+                .entry("getsources_size_part_estimate".to_string())
+                .or_insert(0) += 1;
+        }
         if differs {
             // Which side is larger tells a wrong link (asked bigger or
             // smaller than every publisher) from anything systematic.

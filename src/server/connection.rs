@@ -674,6 +674,8 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         // must not be handed out with the old mapping (issue #37).
         state.natt_udp_ports.remove(&c.user_hash);
         state.natt_keepalive_seen.remove(&c.user_hash);
+        state.natt_token.remove(&c.user_hash);
+        state.natt_udp_ip.remove(&c.user_hash);
         // Retract the id→user mapping. Guarded inside by user hash.
         state.unindex_client_id(c.assigned_id, &c.user_hash);
         state.remove_sources_of(&c.user_hash);
@@ -823,6 +825,12 @@ async fn dispatch(
             if let Some(prev) = online {
                 if prev.is_alive() && is_shared_hash(state, &prev.user_hash) {
                     crate::server::holepunch::count(state, "login_takeover_shared_hash");
+                } else if prev.is_alive() && may_replace_session(state, &prev, peer.ip(), req.port) {
+                    // A live session taken over from its own address (a NAT
+                    // reconnect, or two installs behind one NAT): set beside
+                    // `replaced_session_frame_refused`, it shows whether the
+                    // fence of #46 makes such pairs take turns.
+                    crate::server::holepunch::count(state, "login_takeover_same_address");
                 }
                 if !may_replace_session(state, &prev, peer.ip(), req.port) {
                     // A contender this hash's owner already outlasted: two
@@ -943,6 +951,15 @@ async fn dispatch(
             }
             // A new session proves its 0x9F handling afresh (issue #39).
             state.natt_keepalive_seen.remove(&new_client.user_hash);
+            state.natt_udp_ip.remove(&new_client.user_hash);
+            // And gets a fresh token for its 0x9F (issue #40), if it does NAT-T.
+            if crate::server::holepunch::wants_natt_token(&new_client) {
+                let mut t = [0u8; 16];
+                t.copy_from_slice(&crate::proto::obfuscation::random_bytes(16));
+                state.natt_token.insert(new_client.user_hash, t);
+            } else {
+                state.natt_token.remove(&new_client.user_hash);
+            }
             let prev = state
                 .clients
                 .insert(new_client.user_hash, new_client.clone());

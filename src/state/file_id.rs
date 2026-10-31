@@ -439,7 +439,22 @@ pub fn sizes_agree(a: u64, b: u64) -> bool {
         return true;
     }
     let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-    lo <= u64::from(u32::MAX) && hi > u64::from(u32::MAX) && hi & u64::from(u32::MAX) == lo
+    if lo <= u64::from(u32::MAX) && hi > u64::from(u32::MAX) && hi & u64::from(u32::MAX) == lo {
+        return true;
+    }
+    is_part_estimate(lo, hi)
+}
+
+/// eD2k part size: a file's part hashes cover this much each.
+pub const PARTSIZE: u64 = 9_728_000;
+
+/// Is `lo` the size a client guesses for the file of size `hi` from its
+/// part hashes alone, (hashes - 1) × PARTSIZE? A download started from a
+/// bare hash has no size until it learns one, and some clients use that
+/// lower bound meanwhile: live, most size disagreements on ed2k-rust were
+/// exactly this (issue #45). It is the same file.
+pub fn is_part_estimate(lo: u64, hi: u64) -> bool {
+    lo >= PARTSIZE && lo % PARTSIZE == 0 && lo == hi / PARTSIZE * PARTSIZE
 }
 
 /// What `add_or_refresh_source_sized` did.
@@ -1517,6 +1532,11 @@ mod tests {
         assert!(sizes_agree(0, 5) && sizes_agree(5, 0));
         assert!(!sizes_agree(big, big + 1));
         assert!(!sizes_agree(100, 101));
+        // A size guessed from the part hashes: (hashes - 1) x PARTSIZE.
+        assert!(sizes_agree(471_335_211, 48 * PARTSIZE));
+        assert!(sizes_agree(19_456_000, 24_903_680));
+        assert!(!sizes_agree(49 * PARTSIZE, 471_335_211), "not a rounding up");
+        assert!(!sizes_agree(734_396_416, 738_213_657), "another file");
         // Stored cut, then the full size arrives: the record takes it.
         let slab = FileSlab::new();
         let h = [0x46u8; 16];

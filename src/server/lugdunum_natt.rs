@@ -43,7 +43,10 @@
 //! marks it foreign. The key is `IPObfuscate(secret, sender IP)`, so a
 //! datagram that decodes proves the sender's IP; its source port is the
 //! requester's endpoint. The target gets the usual `0x37` with requester id
-//! 0, and no hash (the server does not know the requester's). A target with
+//! 0, and no hash (the server does not know the requester's); for a target
+//! with the extension a required crypt layer on either side only needs
+//! support on the other, since the requester dials with the target's hash
+//! from the `0xA7` (0.9.87). A target with
 //! the extension (0x100000) answers with `0x9F`; the requester then gets
 //! `0xA7` `<target_ip><target_udp_port><target_id><crypt><hash>` by UDP,
 //! obfuscated, from the port it wrote to; without that `0x9F` within 3 s,
@@ -259,6 +262,24 @@ fn body(ip: Ipv4Addr, port: u16, id: u32, own: u8, hash: Option<&[u8; 16]>, othe
     Some(b)
 }
 
+/// Can two crypt settings meet? A side that requires the layer needs the
+/// other to support it.
+pub fn crypt_compatible(a: u8, b: u8) -> bool {
+    !((a & 4 != 0 && b & 1 == 0) || (b & 4 != 0 && a & 1 == 0))
+}
+
+/// The wake-up body for a foreign request to a target with the extension:
+/// `<ip><port><id 0><crypt>`, no hash (the server has none), the requester's
+/// setting as it sent it.
+fn wake_body(ip: Ipv4Addr, port: u16, id: u32, crypt: u8) -> Vec<u8> {
+    let mut b = Vec::with_capacity(11);
+    b.extend_from_slice(&ip.octets());
+    b.extend_from_slice(&port.to_le_bytes());
+    b.extend_from_slice(&id.to_le_bytes());
+    b.push(crypt);
+    b
+}
+
 /// The cross-server path is offered: it builds on the extension.
 pub fn foreign_enabled(cfg: &crate::config::Config) -> bool {
     cfg.network.holepunch_foreign && crate::server::holepunch::extension_enabled(cfg)
@@ -368,15 +389,24 @@ pub fn handle_foreign(
     if !target.is_alive() {
         return Err(Refused::TargetGone);
     }
-    let body = body(
-        ip,
-        peer.port(),
-        0,
-        requester_crypt,
-        None,
-        crypt_setting(target.server_flags),
-    )
-    .ok_or(Refused::CryptMismatch)?;
+    let target_crypt = crypt_setting(target.server_flags);
+    let extension = crate::server::holepunch::has_extension(state, target.server_flags);
+    let body = if extension {
+        // The requester dials (issue #40), and the 0xA7 always gives it the
+        // target's hash: it can obfuscate its first datagram with it, and an
+        // obfuscated uTP dial opens with a key frame the target answers
+        // without knowing the requester. So "requires" on either side is
+        // fine as long as the other side supports the layer (got3nks).
+        if !crypt_compatible(requester_crypt, target_crypt) {
+            return Err(Refused::CryptMismatch);
+        }
+        wake_body(ip, peer.port(), 0, requester_crypt)
+    } else {
+        // A Lugdunum-only target dials the requester itself, with no hash
+        // to obfuscate with: a required layer stops it, as before.
+        body(ip, peer.port(), 0, requester_crypt, None, target_crypt)
+            .ok_or(Refused::CryptMismatch)?
+    };
     {
         let mut w = state.natcb_foreign_wakes.entry(target.user_hash).or_default();
         while w.front().is_some_and(|t| t.elapsed() >= Duration::from_secs(60)) {
@@ -391,13 +421,13 @@ pub fn handle_foreign(
     // the extension sends 0x9F on the 0x37. Listen before it is woken.
     crate::server::holepunch::count(
         state,
-        if crate::server::holepunch::has_extension(state, target.server_flags) {
+        if extension {
             "natcbx_foreign_target_extension"
         } else {
             "natcbx_foreign_target_lugdunum_only"
         },
     );
-    let answer = if crate::server::holepunch::has_extension(state, target.server_flags) {
+    let answer = if extension {
         let mut pseudo = [0xFFu8; 16];
         pseudo[..4].copy_from_slice(&ip.octets());
         pseudo[4..6].copy_from_slice(&peer.port().to_le_bytes());
@@ -438,8 +468,9 @@ pub fn answer_packet(state: &ServerState, target: &[u8; 16], requester_crypt: u8
     if !t.is_alive() || t.is_high_id {
         return None;
     }
-    let ip = v4(t.ip)?;
-    let port = crate::server::holepunch::observed_udp_port(state, &t.user_hash, t.ip, t.udp_port);
+    let t_ip = crate::server::holepunch::natt_ip(state, &t.user_hash, t.ip);
+    let ip = v4(t_ip)?;
+    let port = crate::server::holepunch::observed_udp_port(state, &t.user_hash, t_ip, t.udp_port);
     if port == 0 {
         return None;
     }
@@ -732,6 +763,29 @@ mod tests {
         assert_eq!(handle(&s, &foreign(13), peer, KEY, 6086).unwrap_err(), Refused::ForeignDisabled);
     }
 
+    /// With the extension the requester dials with the target's hash, so a
+    /// side that requires the crypt layer is fine when the other supports it
+    /// (got3nks, #40); without support on the other side it is refused.
+    #[test]
+    fn a_required_crypt_layer_on_the_foreign_path() {
+        let s = st();
+        let _r = client(&s, 0xB, 13, [9, 9, 9, 9], EXT | 0xE00); // requires
+        let _p = client(&s, 0xC, 15, [9, 9, 9, 8], EXT); // no crypt layer
+        let peer = |i: u8| -> SocketAddr { format!("5.6.7.{i}:40000").parse().unwrap() };
+        let with = |id: u32, c: u8| {
+            let mut p = foreign(id);
+            p.push(c);
+            p
+        };
+        let (f, _) = handle(&s, &with(13, 0x01), peer(1), KEY, 6086).unwrap();
+        let Forward::Tcp { frame, .. } = f else { panic!("{f:?}") };
+        assert_eq!(frame.payload, vec![5, 6, 7, 1, 0x40, 0x9C, 0, 0, 0, 0, 0x01]);
+        assert_eq!(handle(&s, &with(13, 0x00), peer(2), KEY, 6086).unwrap_err(), Refused::CryptMismatch);
+        assert_eq!(handle(&s, &foreign(13), peer(3), KEY, 6086).unwrap_err(), Refused::CryptMismatch);
+        // The requester requires it, the target lacks it: refused.
+        assert_eq!(handle(&s, &with(15, 0x07), peer(4), KEY, 6086).unwrap_err(), Refused::CryptMismatch);
+    }
+
     /// A target with the extension owes the requester an answer: its
     /// endpoint, id, crypt setting and hash (both use the crypt layer).
     #[tokio::test]
@@ -779,6 +833,11 @@ mod tests {
         let mut p = foreign(15);
         p.push(0x07);
         assert_eq!(handle(&s, &p, peer, KEY, 6086).unwrap_err(), Refused::CryptMismatch);
+        // With the extension the requester dials with the target's hash: a
+        // side that requires the layer only needs the other to support it.
+        assert!(crypt_compatible(0x07, 0x01) && crypt_compatible(0x01, 0x07));
+        assert!(crypt_compatible(0x07, 0x07) && crypt_compatible(0x00, 0x00));
+        assert!(!crypt_compatible(0x07, 0x00) && !crypt_compatible(0x00, 0x07));
         let v6: SocketAddr = "[2001:db8::1]:40000".parse().unwrap();
         assert_eq!(handle(&s, &foreign(15), v6, KEY, 6086).unwrap_err(), Refused::WrongAddress);
     }
