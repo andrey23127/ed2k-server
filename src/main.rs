@@ -918,6 +918,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                 state_clean.smart_sources.sweep_expired();
                 ed2k_server::server::ipv6_probe::sweep(&state_clean);
                 state_clean
+                    .pending_registrations
+                    .retain(|_, p| p.2.elapsed() < std::time::Duration::from_secs(600));
+                state_clean
                     .undecodable_from_session_seen
                     .retain(|_, t| t.elapsed() < std::time::Duration::from_secs(3600));
                 state_clean

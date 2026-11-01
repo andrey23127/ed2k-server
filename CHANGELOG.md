@@ -2,6 +2,119 @@
 
 Earlier releases are described in their release commit messages.
 
+## 0.9.87
+
+From the first 14 hours of 0.9.86 on ed2k-rust (`/api/sizemismatch`).
+
+### Identity probe and DLP (issue #50)
+
+The probe's hello now carries `CT_EMULE_VERSION` (eMule 0.50a) after
+`CT_NAME`, `CT_VERSION` and `CT_PORT`. Without it a peer whose hash has the
+eMule marker shows as plain "eMule", which DLP bans as "Bad MODSTRING"
+(`DLPCheckModstring_Hard`: `clientversion == "eMule"`, "the client did not
+send client version"). emule-qt with Special DLP banned the probe, so its
+IPv6 address never passed the dial-back. No mod string, as before.
+
+### Cross-server callback and the crypt layer (issue #40)
+
+A foreign `0xA6` for a target with the extension is no longer refused when
+one side requires the crypt layer: there the requester dials, the `0xA7`
+always carries the target's hash, and an obfuscated uTP dial opens with a key
+frame the target answers without knowing the requester (aMule since
+amule-org/amule#2148). Refused only when a side that requires the layer
+meets one that does not support it (the requester's setting is the crypt
+byte of its `0xA6`, none meaning none). A Lugdunum-only target still dials
+the requester itself with no hash, so the old rule stays for it.
+
+### Sizes (issue #45)
+
+- **A size guessed from the part hashes is the same file.** Most size
+  disagreements were exactly `(hashes - 1) × 9 728 000`, the lower bound a
+  client uses for a download started from a bare hash before it learns the
+  real size (55 of 63 publishers; most of them one emule-qt build). Such a
+  size now agrees with the real one: its publisher is merged as a source,
+  its source requests are answered (`getsources_size_part_estimate`), and a
+  record that holds only the guess takes the real size when it arrives.
+- **UDP `0x94` records with an impossible size** — the large-file sentinel 0
+  followed by 8 bytes far above eMule's 256 GiB limit, for files that are
+  not large (a quarter of all disagreements) — are answered by hash alone,
+  as before 0.9.86, and counted (`udp_getsources2_bad_size`).
+  `udp_getsources2_bad_size_realigned` counts those where the 16 bytes
+  right after the 0 are a known hash — i.e. the sender wrote a plain 32-bit
+  0 with no u64 after it. Diagnostic only; parsing is unchanged.
+- What is still refused: sizes that are neither, such as the ~700 MB fakes
+  with sizes a few MB off and links with digits dropped.
+
+### NAT-T token (issue #40)
+
+A `0x9F` used to be believed only from the session's own address, a user hash
+being public. On ed2k-rust an emule-qt client behind a carrier NAT sent all
+its `0x9F` from another IPv4 than its TCP (344 in 14 hours, all ignored), so
+it got the 3 s wait and its announced port every time. Now each session that
+may send `0x9F` (`0x100000`, `0x1000`, or a UDP port in `0xF9`) gets 16
+random bytes in `OP_SERVERIDENT`, tag `ST_NATT_TOKEN` (`0xAC`); a client with
+`0x100000` gets that `OP_SERVERIDENT` at login. A `0x9F` of
+`<user hash 16><token 16>` is the session's own from any address, and that
+address and port are what peers get in `0x61` and `0xA7` — for a session over
+IPv6 too, which can then punch over IPv4 instead of getting reason 5. A wrong
+token is ignored (`natt_9f_bad_token`); counted `natt_9f_token`,
+`natt_9f_token_other_ip`. Checked against a running server: a token `0x9F`
+from 127.0.0.2 for a session on 127.0.0.1 put 127.0.0.2 and its port in the
+peer's `0x61`; the same without the token, or with a wrong one, was ignored.
+
+### Filter audit
+
+- **`format=hashlists`**: the list additions ready to paste, hashes only —
+  `hash_banlist.txt`: every film, picture, archive or other file a term
+  layer blocked in the window; `hash_filter.txt`: every indexed file under
+  3+ unrelated names; commented out, the audio/document/software hits to
+  look at first and ban-list files with 3+ unrelated names.
+- **`format=audio`**: every blocked audio file by rule, with its name (a
+  name with a child signal withheld): the false-positive leads.
+- `hashlists` never lists a hash both for the ban list and as a decoy: one
+  that some publisher named with a listed term goes to the ban list.
+- Comic archives (`cbr`, `cbz`, `cb7`) count as archives and disc images
+  (`iso`, `img`, `bin`, `nrg`, `mdf`) as other, no longer as documents and
+  software whose clean names the audit shows; more audio extensions.
+- **`format=terms`**: term leads — words in 5+ blocked files of the window,
+  90%+ of whose files are blocked, that the filter does not block alone, with
+  their blocked and served counts. Words only.
+- **The second-marker signal** removes the rule's own term across
+  separators. Removed from the raw name, a term the layers matched across
+  "." or "_" stayed in and counted as a second marker: on 31.10 every L1 and
+  L4 rule read "marker" and no name was shown.
+- **Names are shown only for audio, documents and software**, under any
+  rule, never for a film, picture or archive.
+- The age rule on a film or a picture is never suggested for the whitelist any
+more (`suggest` = `keep`), and its rules read "age alone (by design)" instead
+of "likely false positive". Its unpaired notations block on the age alone, so
+a missing second signal is the rule working: on 31.10.2026 the audit
+suggested 1160 such hashes for the whitelist, every one a video or picture
+with nothing but an age to judge it by.
+
+### Server list
+
+A server that registers with us (UDP `0xA0` `<ip><tcp port>[<challenge>]`)
+is sent a `0x96` with a fresh challenge and listed only when a `0x97` echoing
+it comes back from its TCP+4. Refused outright: an address that is not the
+sender's, not public, ours, or a client's (connected, or seen in the last 30
+minutes). An unproven registrant never enters the list, so it is never
+handed out, takes no place under the 2048 cap and no slot of the 50-a-minute
+verification probe. This keeps mldonkey out: an mldonkey client sends `0xA0`
+with its own address to the servers it knows, and does not answer `0x96`;
+nor can anyone list itself with a forged `0x97`, which must carry the
+challenge. Registrations used to be answered and otherwise ignored, so a
+server we knew only from its own registration never appeared: JEmuleServer,
+whose registration Lugdunum does not take, was in nobody's list. Counted as
+`gossip_registration_probed` / `_added` / `_refused`.
+
+### Sessions
+
+- `login_takeover_same_address`: live sessions replaced from their own
+  address (a NAT reconnect, or two installs behind one NAT), to set beside
+  `replaced_session_frame_refused` and see whether the fence of #46 makes
+  such pairs take turns.
+
 ## 0.9.86
 
 ### Sources with crypt options (issue #42)

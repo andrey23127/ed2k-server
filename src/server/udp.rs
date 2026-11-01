@@ -35,6 +35,15 @@ use tracing::{debug, info, warn};
 const UDP_MAX_SOURCES: usize = 30;
 /// eMule's largest file, 256 GiB. A size above it is not a size.
 const MAX_ED2K_FILE_SIZE: u64 = 256 << 30;
+
+/// True when the 16 bytes at `at` form a hash `known` accepts — i.e. a 0x94
+/// record whose 0 size was not followed by a u64 would resume there.
+fn bad_size_realigns(payload: &[u8], at: usize, known: impl Fn(&[u8; 16]) -> bool) -> bool {
+    payload
+        .get(at..at + 16)
+        .and_then(|b| <&[u8; 16]>::try_from(b).ok())
+        .is_some_and(known)
+}
 /// Sources looked at to fill a UDP answer, HighIDs first (issue #49).
 const UDP_SOURCE_SCAN: usize = 200;
 
@@ -1153,7 +1162,12 @@ impl UdpServer {
             }
             OP_GLOB_SERVSTATREQ => self.handle_servstat(payload, peer, obf).await,
             // 0x97 = GLOBSERVSTATRES — seed server responding to our keepalive ping
-            0x97 => self.handle_pingreply(payload, peer, obf.is_some()).await,
+            0x97 => {
+                // Before handle_pingreply, which would otherwise read the
+                // registrant's port from a list it is not in yet.
+                self.confirm_server_registration(payload, peer).await;
+                self.handle_pingreply(payload, peer, obf.is_some()).await
+            }
             OP_SERVER_DESC_REQ => self.handle_server_desc(payload, peer, obf).await,
             // A peer server's answer to our own 0xA2 (Peers tab).
             OP_SERVER_DESC_RES => self.handle_server_desc_res(payload, peer),
@@ -1176,9 +1190,14 @@ impl UdpServer {
             // After registering them, Lugdunum falls through to 0xA4 and sends our list back.
             // We replicate this: register + send list.
             0xA0 => {
-                // The payload is: their_ip(4 LE) + their_port(2 LE) [+ optional extras]
-                // We just note they exist and send our list back.
-                // (Full ServerAdd logic would add them to our peer table — MVP: skip)
+                // The payload is: their_ip(4) + their_port(2 LE) [+ challenge(4)].
+                // The registrant is probed with a 0x96 and listed only when
+                // its 0x97 echoes the challenge (note_server_registration).
+                // It used to be ignored, so a server known to us
+                // only by its own registration (not through a seed's list)
+                // never showed up: JEmuleServer, whose registration Lugdunum
+                // does not take, was in nobody's list.
+                self.note_server_registration(payload, peer).await;
                 let data = crate::server::gossip::build_server_list_res(&self.state).await;
                 if data.len() > 3 {
                     // only send if we have servers
@@ -1302,6 +1321,17 @@ impl UdpServer {
                 // Not a size: answered by hash alone, as before #45.
                 if size > MAX_ED2K_FILE_SIZE {
                     crate::server::holepunch::count(&self.state, "udp_getsources2_bad_size");
+                    // Diagnostic only: if the 0 was a plain 32-bit size and
+                    // the next record starts right after it, the 16 bytes
+                    // there are a hash we know. Parsing is unchanged.
+                    if bad_size_realigns(payload, i - 8, |h| {
+                        self.state.file_slab.id_of(h).is_some()
+                    }) {
+                        crate::server::holepunch::count(
+                            &self.state,
+                            "udp_getsources2_bad_size_realigned",
+                        );
+                    }
                     hashes.push((hash, None));
                     continue;
                 }
@@ -1997,6 +2027,94 @@ impl UdpServer {
     ///   1. If sender's IP is currently connected as a client → drop.
     ///   2. If we never initiated gossip with sender → drop (only seeds and
     ///      peers we've learned ServerKeys from are trusted to send 0xA1).
+    /// An 0xA0 registration: `<ip 4><tcp port 2>[<challenge 4>]`. The
+    /// registrant is NOT listed on its word: it is sent a 0x96 with a fresh
+    /// challenge and listed only when a 0x97 echoing that challenge comes
+    /// back from its TCP+4 (see `handle_pingreply`). An mldonkey client
+    /// sends 0xA0 with its own address to the servers it knows, and does not
+    /// answer 0x96; nor can anyone list itself with a forged 0x97, which
+    /// must carry the challenge. Refused outright: an address that is not
+    /// the sender's, not public, ours, or that of a client (connected or
+    /// seen in the last 30 minutes). One probe per address per 10 minutes,
+    /// at most 4096 pending.
+    async fn note_server_registration(&self, payload: &[u8], from: SocketAddr) {
+        let std::net::IpAddr::V4(src) = canon_ip(from.ip()) else { return };
+        if payload.len() < 6 {
+            return;
+        }
+        let ip = std::net::Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+        let port = u16::from_le_bytes([payload[4], payload[5]]);
+        let cfg = self.state.live_cfg.load();
+        let self_ip: Option<std::net::Ipv4Addr> = cfg.server.this_ip.trim().parse().ok();
+        if ip != src
+            || port == 0
+            || port > 65531
+            || !crate::state::ServerState::is_publishable_source_ip(std::net::IpAddr::V4(ip))
+            || self_ip == Some(ip)
+            || self.state.recent_client_ips.contains_key(&ip)
+            || self.state.conn_per_ip.contains_key(&std::net::IpAddr::V4(ip))
+        {
+            crate::server::holepunch::count(&self.state, "gossip_registration_refused");
+            return;
+        }
+        let addr = std::net::SocketAddrV4::new(ip, port);
+        if self.state.server_list.read().await.contains(&addr) {
+            return;
+        }
+        if let Some(p) = self.state.pending_registrations.get(&ip) {
+            if p.2.elapsed() < std::time::Duration::from_secs(600) {
+                return;
+            }
+        }
+        if self.state.pending_registrations.len() >= 4096 {
+            return;
+        }
+        let challenge: u32 = 0x55AA_0000 | u32::from(u16::from_le_bytes(
+            crate::proto::obfuscation::random_bytes(2)[..2].try_into().unwrap_or([0, 0]),
+        ));
+        self.state
+            .pending_registrations
+            .insert(ip, (port, challenge, std::time::Instant::now()));
+        let mut pkt = vec![PROTO_EDONKEY, 0x96];
+        pkt.extend_from_slice(&challenge.to_le_bytes());
+        let dst = SocketAddr::new(std::net::IpAddr::V4(ip), port.wrapping_add(4));
+        let _ = self.socket.send_to(&pkt, dst).await;
+        crate::server::holepunch::count(&self.state, "gossip_registration_probed");
+    }
+
+    /// A 0x97 that answers a registration probe: same address, from its
+    /// TCP+4, echoing the challenge. The registrant goes into the list.
+    async fn confirm_server_registration(&self, payload: &[u8], from: SocketAddr) {
+        let std::net::IpAddr::V4(ip) = canon_ip(from.ip()) else { return };
+        let Some(p) = self.state.pending_registrations.get(&ip).map(|e| *e) else { return };
+        let (port, challenge, _) = p;
+        let echoed = payload.len() >= 4
+            && u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) == challenge;
+        if !echoed || from.port() != port.wrapping_add(4) {
+            return;
+        }
+        self.state.pending_registrations.remove(&ip);
+        // Became a client meanwhile: not a server.
+        if self.state.recent_client_ips.contains_key(&ip)
+            || self.state.conn_per_ip.contains_key(&std::net::IpAddr::V4(ip))
+        {
+            crate::server::holepunch::count(&self.state, "gossip_registration_refused");
+            return;
+        }
+        let addr = std::net::SocketAddrV4::new(ip, port);
+        let mut list = self.state.server_list.write().await;
+        if list.contains(&addr) || list.len() >= 2048 {
+            return;
+        }
+        list.push(addr);
+        drop(list);
+        self.state
+            .server_list_added_at
+            .insert(ip, std::time::Instant::now());
+        crate::server::holepunch::count(&self.state, "gossip_registration_added");
+        info!(server = %addr, "gossip: server registered itself (0xA0) and answered 0x96");
+    }
+
     async fn handle_server_list_res(&self, payload: &[u8], from: SocketAddr) -> Result<()> {
         let sender_v4 = match from.ip() {
             std::net::IpAddr::V4(v4) => v4,
@@ -2877,3 +2995,80 @@ mod crypt_ping_tests {
         assert!(!is_crypt_ping(&[0, 0, 0, 0, 9, 9]), "zero challenge");
     }
 }
+
+#[cfg(test)]
+mod bad_size_tests {
+    use super::bad_size_realigns;
+
+    #[test]
+    fn a_known_hash_after_the_zero_size_counts_as_realigned() {
+        let a = [0x11u8; 16];
+        let b = [0x22u8; 16];
+        let mut p = Vec::new();
+        p.extend_from_slice(&a);
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&b);
+        p.extend_from_slice(&5u32.to_le_bytes());
+        // The parser read the u64 at 20..28; the realign check looks at 20.
+        assert!(bad_size_realigns(&p, 20, |h| *h == b));
+        assert!(!bad_size_realigns(&p, 20, |h| *h == a));
+        assert!(!bad_size_realigns(&p, 30, |_| true));
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    fn server() -> UdpServer {
+        let state = Arc::new(ServerState::for_test());
+        let cfg = Arc::new((**state.live_cfg.load()).clone());
+        let socket = Arc::new(
+            tokio::runtime::Handle::current()
+                .block_on(async { UdpSocket::bind("127.0.0.1:0").await })
+                .unwrap(),
+        );
+        UdpServer { cfg, state, socket, seckey: [0; 16] }
+    }
+
+    /// A server registering with 0xA0 is listed only once its 0x97 echoes
+    /// the challenge of our 0x96, from its TCP+4; an mldonkey client, which
+    /// sends 0xA0 and never answers, and a forged 0x97 never get in.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_registrant_is_listed_only_after_it_answers() {
+        let srv = tokio::task::spawn_blocking(server).await.unwrap();
+        let ip = std::net::Ipv4Addr::new(93, 184, 216, 34);
+        let mut reg = ip.octets().to_vec();
+        reg.extend_from_slice(&4661u16.to_le_bytes());
+        let from = SocketAddr::new(std::net::IpAddr::V4(ip), 4665);
+        srv.note_server_registration(&reg, from).await;
+        let (port, challenge, _) = *srv.state.pending_registrations.get(&ip).unwrap();
+        assert_eq!(port, 4661);
+        assert!(srv.state.server_list.read().await.is_empty(), "not on its word");
+        // A 0x97 with another challenge, or from another port: nothing.
+        let mut bad = (challenge ^ 1).to_le_bytes().to_vec();
+        bad.extend_from_slice(&[0; 8]);
+        srv.confirm_server_registration(&bad, from).await;
+        let mut good = challenge.to_le_bytes().to_vec();
+        good.extend_from_slice(&[0; 8]);
+        srv.confirm_server_registration(&good, SocketAddr::new(from.ip(), 4666)).await;
+        assert!(srv.state.server_list.read().await.is_empty());
+        // The real answer.
+        srv.confirm_server_registration(&good, from).await;
+        assert_eq!(
+            *srv.state.server_list.read().await,
+            vec![std::net::SocketAddrV4::new(ip, 4661)]
+        );
+        // Someone else's address, a private one, or a client's: refused.
+        let other = SocketAddr::new("93.184.216.35".parse().unwrap(), 4665);
+        srv.note_server_registration(&reg, other).await;
+        assert!(srv.state.pending_registrations.get(&"93.184.216.35".parse().unwrap()).is_none());
+        let cl: std::net::Ipv4Addr = "93.184.216.36".parse().unwrap();
+        srv.state.conn_per_ip.insert(std::net::IpAddr::V4(cl), 1);
+        let mut reg2 = cl.octets().to_vec();
+        reg2.extend_from_slice(&4662u16.to_le_bytes());
+        srv.note_server_registration(&reg2, SocketAddr::new(std::net::IpAddr::V4(cl), 4666)).await;
+        assert!(srv.state.pending_registrations.get(&cl).is_none(), "a client is no server");
+    }
+}
+

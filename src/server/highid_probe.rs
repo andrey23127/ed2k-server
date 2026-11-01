@@ -47,6 +47,11 @@ const PROTO_EMULE: u8 = 0xC5;
 const CT_NAME: u8 = 0x01;
 const CT_PORT: u8 = 0x0F;
 const CT_VERSION: u8 = 0x11;
+/// eMule's client version in the hello, `<compat 8><major 7><minor 7><update 3>`
+/// from bit 24 down to bit 7.
+const CT_EMULE_VERSION: u8 = 0xFB;
+/// eMule 0.50a: compat client 0, version 0.50, update a.
+const PROBE_EMULE_VERSION: u32 = 50 << 10;
 /// eDonkey protocol version announced in CT_VERSION, as every eMule sends it.
 const EDONKEY_VERSION: u32 = 60;
 /// Name we introduce ourselves under. Deliberately not impersonating a client:
@@ -551,6 +556,16 @@ fn build_hello(user_hash: &[u8; 16], our_id: u32, our_port: u16) -> Vec<u8> {
     tag_count += 1;
     push_int_tag(&mut tags, CT_PORT, our_port as u32);
     tag_count += 1;
+    // ⚠ AND A CLIENT VERSION. Without it a peer whose hash carries the eMule
+    //   marker is shown as plain "eMule", and DLP bans exactly that:
+    //   DLPCheckModstring_Hard has `_tcsicmp(clientversion, "eMule") == 0`,
+    //   "the client did not send client version", reported as "Bad
+    //   MODSTRING" (issue #50; Special DLP in emule-qt). A banned probe gets
+    //   no answer, and the IPv6 dial-back then never publishes that client.
+    //   eMule 0.50a is the version most clients report and matches no DLP
+    //   rule (those name 0.47f, 0.95g, v1., v2. and some "Compat" versions).
+    push_int_tag(&mut tags, CT_EMULE_VERSION, PROBE_EMULE_VERSION);
+    tag_count += 1;
 
     let mut body = Vec::with_capacity(32 + tags.len());
     body.push(0x10); // hash size
@@ -871,7 +886,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([f[27], f[28]]), 4661);
         assert_eq!(
             u32::from_le_bytes([f[29], f[30], f[31], f[32]]),
-            3,
+            4,
             "tag count"
         );
         // ...and the frame still ends with the server address fields.
@@ -885,7 +900,7 @@ mod tests {
         let f = build_hello(&[0u8; 16], 0, 4662);
         let mut at = 33; // after hash size, hash, id, port, tag count
         let mut seen = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..4 {
             let ttype = f[at];
             assert_eq!(
                 ttype & 0x80,
@@ -904,7 +919,10 @@ mod tests {
                 other => panic!("unexpected tag type 0x{other:02X}"),
             }
         }
-        assert_eq!(seen, vec![CT_NAME, CT_VERSION, CT_PORT]);
+        assert_eq!(seen, vec![CT_NAME, CT_VERSION, CT_PORT, CT_EMULE_VERSION]);
+        // eMule 0.50a: the version DLP's "no client version" rule needs.
+        let v = u32::from_le_bytes([f[at - 4], f[at - 3], f[at - 2], f[at - 1]]);
+        assert_eq!(((v >> 24) & 0xFF, (v >> 17) & 0x7F, (v >> 10) & 0x7F, (v >> 7) & 7), (0, 0, 50, 0));
         // Everything consumed except the trailing server address fields.
         assert_eq!(at, f.len() - 6);
     }

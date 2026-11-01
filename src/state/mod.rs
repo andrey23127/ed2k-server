@@ -772,6 +772,10 @@ pub struct ServerState {
     /// When each entry was first added to server_list (for the "give it 10
     /// minutes to verify" grace period).
     pub server_list_added_at: DashMap<std::net::Ipv4Addr, std::time::Instant>,
+    /// Servers that registered with 0xA0 and were sent a 0x96: ip -> (TCP
+    /// port, challenge, when). Listed only once the matching 0x97 comes
+    /// back, so an unproven registrant never enters the server list.
+    pub pending_registrations: DashMap<std::net::Ipv4Addr, (u16, u32, std::time::Instant)>,
     /// Per-IP CSAM tracker: counts unique IPs that hit CSAM at least once.
     /// Used to compute "unique users blocked" stat — distinct from total file
     /// blocks (which can be many per user).
@@ -1668,6 +1672,7 @@ impl ServerState {
             conn_tasks: std::sync::atomic::AtomicI64::new(0),
             conn_task_bytes: std::sync::atomic::AtomicU64::new(0),
             server_list_added_at: DashMap::new(),
+            pending_registrations: DashMap::new(),
             csam_unique_ips: DashMap::new(),
             csam_blocked_hashes: DashMap::new(),
             obf_decode_cache: DashMap::new(),
