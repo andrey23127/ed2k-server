@@ -575,6 +575,84 @@ UDP requests are counted after the admission budgets, i.e. those the server
 went on to handle. Off by default; turn it on for a day when the rules need
 tuning, then off again. Switched off, the table is cleared within a minute.
 
+### `[server_met]`
+A `server.met` written from the peer list every `interval_secs`, as Lugdunum's
+`autoservlist` did: the peers on the Peers tab that are verified **and** whose
+ServerKey is known, minus `exclude`, and this server first. The Peers tab
+shows each peer's standing in a `server.met` column while `path` is set.
+
+| Key | Meaning | Apply |
+|---|---|---|
+| `path` | The file to write, or a folder to write `server.met` into. Empty (default) = off | live |
+| `interval_secs` | How often; default 600, at least 60. The first file comes 10 min after start, once the gossip handshakes have run | live (from the next write) |
+| `include_self` | Put this server first (only when `server.public`); default `true` | live |
+| `exclude` | Peers never written: `"1.2.3.4"`, `"1.2.3.0/24"` or `"1.2.3.4:4661"`. Other entries are logged and ignored | live |
+
+The file is written to a temporary name next to it and renamed, so a reader
+never gets half of it. When no peer qualifies (a network outage, a restart)
+nothing is written and the previous file stays.
+
+The format is the one eMule, aMule and the PHP server-list scripts
+(`servermet.php`) all read: header `0xE0`; old-style tags only (type, u16 name
+length, name), string and u32 values only, so a script that does not know
+aMule's short tags reads it; UTF-8 strings with a BOM when not plain ASCII
+(eMule's convention; without it eMule reads the local code page); an exact
+tag count, which aMule requires. Every server gets `ST_PREFERENCE` 0, normal
+priority in eMule and aMule alike. Tags written when known: name,
+description, `users`, `files`, ping, max users, soft and hard file limits, UDP
+flags, LowID users, version (as a string) and the obfuscation ports. No server
+key: one is only good for the address it was given to.
+
+### `[name_db]`
+The name history: every name each file hash is offered under, blocked or
+not, in an SQLite file on disk. The server sees one name, sometimes the only
+copy, of a file the network knows under many; hash-list and whitelist
+decisions made from single names can be poisoned (a legal film published
+once under an abuse name) or simply wrong. The history keeps what they need,
+per name: the filter's verdict (for a whitelisted hash, what the filter says
+without the whitelist), when it was first offered, and its independent
+publishers, by user hash and by /24 (IPv6 /48). Publishers are salted 32-bit
+digests, never addresses. Restart-only.
+
+| Key | Meaning |
+|---|---|
+| `path` | The database file. Empty (default) = off |
+| `max_pending` | Changes gathered before a write: a new name, a new publisher of a stored name, a verdict on a clean one. Default 100 000 (~30 MB) |
+| `flush_secs` | ...or a write at least this often; default 3600 |
+| `queue` | Offers waiting for the writer thread; a full queue drops the offer and counts it, the offer path never waits; default 200 000 (up to ~30 MB while full) |
+| `cache_mb` | SQLite page cache; default 16 |
+| `names_per_hash`, `publishers_per_name` | Caps: 256 and 8 |
+
+Cost. Each offer is looked up by the writer thread (a read). Only a change is
+kept, so re-offers of known files, nearly all the traffic once the history
+has filled, cost nothing in memory or on disk. Changes are written sorted, in
+one transaction: with random keys a write costs about a page per changed row
+unless many share pages, so a large `max_pending` means less disk traffic
+(measured: 100 000 changes ~2.6 KB each, 20 000 ~6.4 KB, WAL and checkpoint
+included). Expect the first day, when every shared file is new, to write some
+tens of GB; afterwards only new names and publishers are written. About 220
+bytes per name on disk. What is pending is written on SIGTERM/SIGINT.
+
+The Status tab shows the counts, size and last write. `GET
+/api/namedb?hash=<hex>` returns one hash: its names with verdict and
+publisher counts, and over all names the distinct publishers and networks,
+those behind flagged names and those behind clean ones. A name the filter
+matched is never printed; a clean one only when it carries no signal (the
+audit's rule). For anything else, `sqlite3` on the file (table `names`,
+view `files`):
+
+```sql
+-- hashes blocked by a term under some name, with clean names from more networks
+SELECT hex(hash), count(*) AS names, sum(layer <> 0) AS flagged,
+       sum(CASE WHEN layer = 0 THEN nnets END) AS clean_nets,
+       sum(CASE WHEN layer IN (1, 2, 4) THEN nnets END) AS term_nets
+FROM names GROUP BY hash
+HAVING term_nets > 0 AND clean_nets > term_nets;
+```
+
+`layer`: 0 clean, 1 L1, 2 L2, 3 L3, 4 L4, 5 L5. `nnets`/`npubs` are per
+name; the same network behind two names counts twice in such a sum.
+
 ### `[admission]`
 Server-wide ceilings on the work remote peers can cause, however the load is
 spread across addresses, listeners and address families (issue #25). All are
@@ -720,7 +798,8 @@ L3 hits with a decoy signature and indexed files under unrelated names — those
 with clean names only. The CSV has one line per hash:
 `hash;layer;reason;size;kind;explicit;age;minor;marker2;sizeflag;names;unrelated;publishers;suggest;name`,
 `suggest` being `whitelist?`, `review`, `keep` or (L3) `poison?`, and `name`
-empty when withheld. The age rule on a film or picture is always `keep`.
+empty when withheld. The age rule on a film or picture is always `keep`,
+and a name the age rule blocked is never shown, whatever its extension.
 
 **`format=hashlists`** gives the additions ready to paste, hashes only: for
 `hash_banlist.txt` every film, picture, archive or other file a term layer
@@ -733,8 +812,8 @@ carrying them are blocked, and that the filter does not block on their own,
 as `word;blocked files;served files`. Words only, never a name.
 **`format=audio`** lists every blocked audio file (mp3, flac, ogg, wav, m4a and
 the rest) by rule, with its name: a sound file is almost never abuse material,
-so these are the false-positive leads. A name with a child signal is still
-withheld. A hash in `hashlists`' ban-list part never appears among its decoys.
+so these are the false-positive leads. A name with a child signal, or one the age rule
+blocked, is still withheld. A hash in `hashlists`' ban-list part never appears among its decoys.
 
 **`/api/indexcheck`** runs every indexed file through the filter as it is now.
 Lists reloaded after a file was indexed were never applied to it; this finds
@@ -887,8 +966,9 @@ else the port you announced (`0xF9`, or the one in your `0x60`).
 | `OP_LOWID_HOLEPUNCH_REQUEST` | `0x60` | client → server (TCP) | `<target_id 4><our_udp_port 2>` |
 | `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4><peer_crypt 1>` |
 | `OP_LOWID_HOLEPUNCH_FAIL` | `0x62` | server → client (TCP) | `<target_id 4><reason 1>` |
-| `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>[<token 16>]` |
+| `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>`, or the token's proof `<userhash 16><counter 4><mac 16>` |
 | `OP_SERVERIDENT` tag `ST_NATT_TOKEN` | `0xAC`, 16 bytes | server → client (TCP) | the session's NAT-T token (since 0.9.87) |
+| `OP_SERVERIDENT` tag `ST_NATT_PROOF` | `0xA9`, u32 = 1 | server → client (TCP) | `0x9F` may carry the token's proof (since 0.9.88) |
 | `OP_IDCHANGE` TCP flags bit | `0x20000` | server → client (TCP) | set when the server accepts `0x60` |
 
 To download from a LowID source **B**, send `0x60` with B's assigned id and your UDP
@@ -909,18 +989,37 @@ is appended, the peer's `(CT_SERVER_FLAGS >> 9) & 7` (supports / requests /
 requires the crypt layer). With the user hash at bytes 8–23 it lets the
 dialler obfuscate from its first datagram, so a peer that requires the crypt
 layer accepts the stream. Read it only from 30 bytes or more.
-**The NAT-T token (issue #40, since 0.9.87).** A `0x9F` is believed only from the
-session's own address, since a user hash is no secret. That leaves out a client
-whose carrier NAT sends its UDP out of another public IPv4 than its TCP, and one
-logged in over IPv6. So each session that may send `0x9F` (login flag
-`0x100000` or `0x1000`, or a UDP port announced in `0xF9`) gets 16 random bytes,
-`ST_NATT_TOKEN` (`0xAC`, hash type) in `OP_SERVERIDENT`; a client with
-`0x100000` gets that `OP_SERVERIDENT` at login. A `0x9F` of
-`<userhash 16><token 16>` is then the session's own from any address: its source
-address and port become what peers are given in `0x61` and `0xA7`, an IPv6
-session included (no `0x62` reason 5 then). A `0x9F` with a wrong token is
-ignored. Without the token everything is as before. The token is new on every
-login. Counters: `natt_9f_token`, `natt_9f_token_other_ip`, `natt_9f_bad_token`.
+**The NAT-T token and its proof (issue #40).** A `0x9F` is believed only from
+the session's own address, since a user hash is no secret. That leaves out a
+client whose carrier NAT or VPN sends its UDP out of another public IPv4 than
+its TCP, and one logged in over IPv6. So each session that may send `0x9F`
+(login flag `0x100000` or `0x1000`, or a UDP port announced in `0xF9`) gets 16
+random bytes, `ST_NATT_TOKEN` (`0xAC`, hash type), and `ST_NATT_PROOF`
+(`0xA9`, u32 = 1) in `OP_SERVERIDENT`; a client with `0x100000` gets that
+`OP_SERVERIDENT` at login. The token is new on every login and never goes on
+UDP. Instead the client proves it:
+
+```text
+<userhash 16><counter u32 LE><mac 16>                 36 bytes
+mac = HMAC-SHA256(key = token, userhash ‖ counter LE), first 16 bytes
+test vector: token 000102…0f, userhash 101112…1f, counter 1
+             → mac 57f631c901f652e692307db3ea25be83
+```
+
+A proof with the right mac and a counter higher than the last accepted one
+in this login is the session's own from any address: its source address and
+port become what peers are given in `0x61` and `0xA7`, an IPv6 session
+included (no `0x62` reason 5 then), and it passes the rule that ignores a
+plain `0x9F` after an obfuscated one. A replay (counter not higher) or a
+wrong mac is ignored. It needs no obfuscation. What it cannot stop: someone on
+the path who blocks or beats a fresh `0x9F` moves the endpoint until the next
+keepalive, and the token is only as private as the TCP session it came over.
+Counters: `natt_9f_proof`, `natt_9f_proof_other_ip`, `natt_9f_proof_bad`,
+`natt_9f_proof_replay`.
+
+0.9.87's form, `<userhash 16><token 16>`, showed the token to anyone on the
+path when sent plain; since 0.9.88 it counts as the user hash alone, from the
+session's own address only (`natt_9f_token_form_ignored`).
 
 (`0x60`–`0x62` are unused in the server TCP opcode space, which runs `0x01`–`0x44`,
 and `0x9F` was free in the server UDP namespace — no conflict on the server link.)

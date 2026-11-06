@@ -1,6 +1,6 @@
 [package]
 name = "ed2k-server"
-version = "0.9.87"
+version = "0.9.88"
 edition = "2021"
 description = "Modern eDonkey2000 / eMule index server (test/MVP build)"
 license = "MIT"
@@ -87,6 +87,13 @@ hyper-util = { version = "=0.1.7", features = ["tokio"] }
 
 # CLI args
 clap = { version = "=4.4.18", features = ["derive"] }
+
+# Name history ([name_db]): SQLite, compiled in (no system library). 0.31 is
+# the line from before Rust 1.77; pinned with its sqlite-sys and hashlink so
+# the tree stays on Rust 1.75.
+rusqlite = { version = "=0.31.0", features = ["bundled"] }
+libsqlite3-sys = { version = "=0.28.0", features = ["bundled"] }
+hashlink = "=0.9.0"
 
 [dev-dependencies]
 tokio-test = "=0.4.4"

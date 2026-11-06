@@ -500,12 +500,14 @@ pub fn build_server_ident(cfg: &Config, state: &ServerState, client: &ClientHand
             tags.push(Tag::byte(ST_IPV6_STATUS, TagValue::U8(status)));
         }
     }
-    // ST_NATT_TOKEN (issue #40): the session's NAT-T token. A 0x9F carrying
-    // it after the user hash, <user hash 16><token 16>, is believed from any
-    // address: the token went to this session only, over its TCP. Only to a
-    // session that does NAT-T, so every other SERVERIDENT is unchanged.
+    // ST_NATT_TOKEN (issue #40): the session's NAT-T token, sent over this
+    // session's TCP only. A 0x9F that proves it (ST_NATT_PROOF, see
+    // natt_proof) is believed from any address; the token itself never goes
+    // on UDP. Only to a session that does NAT-T, so every other SERVERIDENT
+    // is unchanged.
     if let Some(t) = state.natt_token.get(&client.user_hash) {
         tags.push(Tag::byte(ST_NATT_TOKEN, TagValue::Hash16(*t)));
+        tags.push(Tag::byte(ST_NATT_PROOF, TagValue::U32(crate::server::natt_proof::VERSION)));
     }
     // OFFERFILES v1 (issue #19): all three or none, string-named so a
     // client that does not know them skips them. A legacy session (v1 off,
@@ -554,6 +556,10 @@ const ST_IPV6_STATUS: u8 = 0xAB;
 /// `ST_NATT_TOKEN` — the session's NAT-T token, 16 bytes (issue #40). 0xAC:
 /// next to the IPv6 tags, and not one eNode-go uses (0xA8, 0xAD, 0xAF).
 pub(crate) const ST_NATT_TOKEN: u8 = 0xAC;
+/// `ST_NATT_PROOF` — u32 version (1): `0x9F` may carry a proof of the token
+/// instead of the token (issue #40). Free in eMule, eMuleQt, aMule and
+/// eNode-go.
+pub(crate) const ST_NATT_PROOF: u8 = 0xA9;
 /// The server holds a public IPv6 for this session.
 pub(crate) const IPV6ST_HAVE: u8 = 0x01;
 /// That address is treated as reachable and the client is published as a v6

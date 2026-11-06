@@ -114,7 +114,7 @@ const MINOR_CJK: &[&str] = &["少女", "幼女", "幼児", "児童", "儿童", "
 /// Units a child's age is written with, after the number.
 const AGE_UNITS: &[&str] = &[
     "yo", "y", "yrs", "yr", "years", "year", "anos", "años", "anni", "jahre", "ans", "лет",
-    "года", "год", "歳", "岁", "才",
+    "года", "год", "歳", "歲", "岁", "才",
 ];
 
 fn words(lower: &str) -> impl Iterator<Item = &str> {
@@ -320,6 +320,10 @@ pub fn name_visible(sig: &Signals, verdict: Verdict, layer: Layer, kind: Kind) -
     }
     match layer {
         Layer::L3HashBlock => false,
+        // The age rule matched an age next to a sexual word, or an age
+        // notation that stands alone: that is the child signal itself, and
+        // "audio" is only what the extension says (an .ogg can be a film).
+        Layer::L2AgePattern => false,
         // A film, a picture or an archive is never shown, under any rule: a
         // clean-looking name there can still be a studio or series marker
         // with nothing else in it. The false positives that do occur are
@@ -345,7 +349,7 @@ mod tests {
 
     #[test]
     fn ages_are_found_where_they_are_written_as_ages() {
-        for s in ["9yo", "9 yo", "a 12 y.o. b", "13_years", "age 11", "aged 8", "12 anos", "13歳"] {
+        for s in ["9yo", "9 yo", "a 12 y.o. b", "13_years", "age 11", "aged 8", "12 anos", "13歳", "13歲"] {
             assert!(has_age(s), "{s}");
         }
         for s in ["x264", "s01e12", "1080p", "track 12", "21 years", "2 kids", "12 monkeys", "5.1"] {
@@ -386,6 +390,8 @@ mod tests {
         assert!(!name_visible(&dirty, Verdict::Mixed, Layer::L4Extra, Kind::Video));
         // A clean name in a working marker's group stays hidden.
         assert!(!name_visible(&clean, Verdict::Marker, Layer::L4Extra, Kind::Audio));
+        // The age rule hides the name whatever the extension says.
+        assert!(!name_visible(&clean, Verdict::LikelyFalsePositive, Layer::L2AgePattern, Kind::Audio));
         // A second listed term is a second marker.
         let f2 = f.with_extra_terms(vec!["walrus".to_string()]);
         let two = signals(&f2, "elephant walrus.mp4", Layer::L4Extra, "elephant");

@@ -2,6 +2,104 @@
 
 Earlier releases are described in their release commit messages.
 
+## 0.9.88
+
+### Name history on disk
+
+New `[name_db]`: every offered name of every file hash, blocked or not, goes
+into an SQLite file, with the filter's verdict for that name (for a
+whitelisted hash, the verdict without the whitelist), when it was first
+offered, and its independent publishers counted by user hash and by /24
+(IPv6 /48), stored as salted digests. It is the evidence a hash-list or
+whitelist decision needs where today there is one name: a legal film
+published once under an abuse name, or a whitelisted hash other publishers
+name otherwise.
+
+- Low cost by design: the offer path pushes into a bounded queue and never
+  waits (a full queue drops and counts). One writer thread looks each offer
+  up and keeps only changes: a new name, a new publisher of a stored name,
+  a verdict on a clean name. They are written sorted, in one transaction,
+  once `max_pending` (100 000, ~30 MB) have gathered or every `flush_secs`
+  (3600). One table, publishers in the row, names keyed by a 64-bit digest,
+  no last-seen time (it would rewrite every known name daily). SQLite WAL,
+  `synchronous = NORMAL`, 16 MB page cache, no mmap. Measured: about 2.6 KB
+  written per change at 100 000 per write (6.4 KB at 20 000), about 220
+  bytes per name on disk.
+- Status tab row; `GET /api/namedb?hash=` for one hash (flagged names never
+  printed). Pending changes are written on SIGTERM/SIGINT before exit.
+- rusqlite 0.31 with the bundled SQLite, pinned for Rust 1.75.
+
+### NAT-T token's proof (issue #40)
+
+A plain `0x9F` with the token showed the token to anyone on the path, who
+could then move the session's endpoint (and see its peers) for the rest of
+the login. Agreed with aMule and eMuleQt (both send the proof now): next to
+`ST_NATT_TOKEN`, `OP_SERVERIDENT` carries `ST_NATT_PROOF` (`0xA9`, u32 = 1),
+and a `0x9F` that counts from any address is `<user hash 16><counter u32
+LE><mac 16>` (36 bytes), mac = HMAC-SHA256 keyed with the token over user
+hash and counter, first 16 bytes. Only with a counter higher than the last
+accepted one for the session (a replay is ignored); it passes the rule that
+ignores a plain `0x9F` after an obfuscated one. Counters `natt_9f_proof`,
+`natt_9f_proof_other_ip`, `natt_9f_proof_bad`, `natt_9f_proof_replay`.
+
+- **The 0.9.87 token form is dropped.** `<user hash 16><token 16>` now
+  counts as the user hash alone, accepted only from the session's address
+  (`natt_9f_token_form_ignored`); `natt_9f_token`, `natt_9f_token_other_ip`
+  and `natt_9f_bad_token` are gone.
+
+### Obfuscated UDP with the key of a neighbouring exit (issue #40)
+
+A client obfuscates with the key we gave the address its crypt ping came
+from; we decoded with the key of the address the datagram comes from. Where
+an ISP or VPN hands out a different exit per flow the two differ: live, a
+few hundred global source requests in 15 hours, mostly from Cloudflare WARP
+(104.28.x), each keyed by a neighbouring exit's crypt ping, all unanswered.
+An undecodable datagram on portUDPobf (26..512 bytes) now gets, once a
+minute per sender, the keys of nearby addresses: NAT-T sessions and
+crypt-ping sources of the last two hours in its /16. A decoded `0x9F` goes
+to its handler (the token decides); a global query (`0x9A`, `0x94`, `0x98`,
+`0x92`, `0x90`) is answered, encoded with the same key, and the key is cached
+for that sender so the rest of the flow decodes directly. Counted as
+`natt_undecodable_key_of_session_ip` / `_of_crypt_ping_ip`, and
+`_none_nearby` for NAT-T sessions only; matches shown in `/api/natt`.
+
+### server.met from the peer list
+
+New `[server_met]`: every `interval_secs` (600) the server writes a
+`server.met` to `path` (a file, or a folder for `server.met`), as Lugdunum's
+`autoservlist` did. In it: the peers that are verified and whose ServerKey is
+known, except those matching `exclude` (an address, a range or `ip:port`),
+and this server first unless `include_self` is off. All live; off while
+`path` is empty.
+
+- One format for every reader: header `0xE0`, old-style tags with string and
+  u32 values only (servermet.php does not read aMule's short tags), UTF-8
+  with a BOM when not ASCII, exact tag counts (aMule refuses trailing
+  bytes). `ST_PREFERENCE` 0, normal priority, for every server.
+- Written to a temporary file and renamed; nothing is written while no peer
+  qualifies, so a network outage does not empty the list.
+- The peers' max users, file limits, UDP flags, LowID users and obfuscation
+  ports are now kept from their extended `0x97` (the obfuscated handshake's
+  reply included), and the handshake's round trip as their ping. The Peers
+  tab shows max users and, while `path` is set, each peer's standing in
+  server.met (in / excluded / —).
+- **A ServerKey for every listed peer**, not only the seeds. Only the seeds
+  get the gossip handshake; any other peer's key arrived when that peer
+  gossiped with us on its own schedule, so after a restart many stayed
+  "pending", without max users, for hours, and out of server.met. Each
+  minute up to 16 listed peers without a key now get the seeds' OBF ping
+  (TCP+12, from an ephemeral port, answer accepted only from the peer's
+  address); one that does not answer is tried again after 10 minutes.
+
+### Filter audit
+
+- **A name the age rule (L2) blocked is never shown**, in the audit or in
+  `format=audio`, whatever its extension. The age is the child signal
+  itself, and an `.ogg` can be a film: on 02.11.2026 `format=audio` showed
+  the name of a 405 MB `.ogg` the age rule had blocked, because for that
+  rule the age was not counted as a second signal.
+- The traditional form of the CJK age unit is recognised as an age.
+
 ## 0.9.87
 
 From the first 14 hours of 0.9.86 on ed2k-rust (`/api/sizemismatch`).

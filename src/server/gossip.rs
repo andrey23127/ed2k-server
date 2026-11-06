@@ -50,7 +50,7 @@
 
 use crate::proto::opcodes::PROTO_EDONKEY;
 use crate::proto::server_obfuscation;
-use crate::server::obf_ping::{decode_obf_s2s, OBF_PING_PAYLOAD_MAX_PAD};
+use crate::server::obf_ping::{decode_obf_s2s_reply, OBF_PING_PAYLOAD_MAX_PAD};
 use crate::state::ServerState;
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -435,6 +435,7 @@ async fn handshake_with_seed(
 
     let ping_dst = SocketAddrV4::new(*seed.ip(), seed_obfping_port);
     eph_sock.send_to(&ping, ping_dst).await?;
+    let sent_at = std::time::Instant::now();
 
     info!(
         seed = %seed.ip(),
@@ -464,9 +465,13 @@ async fn handshake_with_seed(
 
     info!(seed = %seed.ip(), from = %from, bytes = n, "gossip phase 2: OBF reply received");
 
-    let seed_serverkey = match decode_obf_s2s(&buf[..n], random_part) {
-        Some(k) => {
+    let seed_serverkey = match decode_obf_s2s_reply(&buf[..n], random_part) {
+        Some((k, reply)) => {
             state.seed_server_keys.insert(*seed, k);
+            // The same reply carries the seed's counts and limits (server.met,
+            // Peers tab); the round trip is its ping.
+            let rtt = sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+            state.note_peer_stats(*seed, &reply, Some(rtt));
             info!(seed = %seed.ip(), server_key = format!("0x{:08x}", k),
                   "stored peer ServerKey from obf handshake");
             k

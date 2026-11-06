@@ -642,6 +642,9 @@ pub struct ServerState {
     /// in `OP_SERVERIDENT` (`ST_NATT_TOKEN`). A `0x9F` that carries it is the
     /// session's own from whatever address it comes.
     pub natt_token: DashMap<UserHash, [u8; 16]>,
+    /// The last counter accepted in a proof-form 0x9F, per session (#40,
+    /// server::natt_proof).
+    pub natt_proof_counter: DashMap<UserHash, u32>,
     /// The IPv4 a session's `0x9F` proved with its token, when it is not the
     /// session's own address (a carrier NAT that maps UDP elsewhere, or a
     /// session over IPv6). Handed to peers instead of the session address.
@@ -807,6 +810,12 @@ pub struct ServerState {
     /// Non-hot-reloadable fields (ports, seckey, admin port) are kept here too
     /// but changes to those require restart.
     pub live_cfg: arc_swap::ArcSwap<crate::config::Config>,
+    /// Sources of the crypt pings answered (TCP+12) in the last two hours,
+    /// newest last, at most 8192: whose key a client may be using (#40
+    /// diagnostic, `note_undecodable`).
+    pub crypt_ping_sources: std::sync::Mutex<std::collections::VecDeque<(std::net::Ipv4Addr, Instant)>>,
+    /// Name history (`[name_db]`), when on. Set once at startup.
+    pub name_db: std::sync::OnceLock<crate::name_db::NameDb>,
     /// Per-IP query-rate tracker. Records a sliding 60-second window of UDP
     /// search/sources requests from each client IP. Used by the bot detector.
     ///
@@ -1146,6 +1155,17 @@ pub struct PeerInfo {
     pub files: Option<u32>,
     /// When the user/file counts last arrived.
     pub stats_at: Option<Instant>,
+    /// From the extended `0x97` (a probe with the 0x55AA marker or the
+    /// obfuscated handshake): what server.met carries besides the counts.
+    pub max_users: Option<u32>,
+    pub soft_files: Option<u32>,
+    pub hard_files: Option<u32>,
+    pub udp_flags: Option<u32>,
+    pub lowid_users: Option<u32>,
+    pub obf_udp_port: Option<u16>,
+    pub obf_tcp_port: Option<u16>,
+    /// Round trip of the obfuscated handshake, in ms.
+    pub ping_ms: Option<u32>,
 }
 
 impl PeerInfo {
@@ -1185,6 +1205,68 @@ impl Drop for IpSlot {
 }
 
 impl ServerState {
+    pub fn note_crypt_ping_source(&self, ip: std::net::Ipv4Addr) {
+        const MAX: usize = 8192;
+        const TTL: std::time::Duration = std::time::Duration::from_secs(7200);
+        let Ok(mut q) = self.crypt_ping_sources.lock() else { return };
+        while q.front().is_some_and(|(_, t)| t.elapsed() > TTL) || q.len() >= MAX {
+            q.pop_front();
+        }
+        // The same address again: refresh instead of a second entry.
+        if let Some(pos) = q.iter().rposition(|(a, _)| *a == ip) {
+            q.remove(pos);
+        }
+        q.push_back((ip, Instant::now()));
+    }
+
+    /// Crypt-ping sources of the last two hours in `ip`'s /16, newest first.
+    pub fn crypt_ping_sources_near(&self, ip: std::net::Ipv4Addr) -> Vec<std::net::Ipv4Addr> {
+        let net = u32::from(ip) >> 16;
+        let Ok(q) = self.crypt_ping_sources.lock() else { return Vec::new() };
+        q.iter()
+            .rev()
+            .filter(|(a, t)| u32::from(*a) >> 16 == net && t.elapsed() < std::time::Duration::from_secs(7200))
+            .map(|(a, _)| *a)
+            .take(64)
+            .collect()
+    }
+
+    /// Record a peer server's `0x97` payload (after the opcode: challenge,
+    /// users, files, then in the extended form max users, soft and hard
+    /// file limits, UDP flags, LowID users, the obfuscation ports and the
+    /// key). Only for a server in the peer list; nothing else is kept.
+    pub fn note_peer_stats(&self, server: SocketAddrV4, payload: &[u8], ping_ms: Option<u32>) {
+        if payload.len() < 12 {
+            return;
+        }
+        let u32_at = |o: usize| {
+            payload
+                .get(o..o + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let u16_at = |o: usize| payload.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+        let Some(mut info) = self.peer_info.get_mut(&server) else {
+            return;
+        };
+        info.users = u32_at(4);
+        info.files = u32_at(8);
+        info.stats_at = Some(Instant::now());
+        if payload.len() >= 32 {
+            info.max_users = u32_at(12);
+            info.soft_files = u32_at(16);
+            info.hard_files = u32_at(20);
+            info.udp_flags = u32_at(24);
+            info.lowid_users = u32_at(28);
+        }
+        if payload.len() >= 36 {
+            info.obf_udp_port = u16_at(32).filter(|p| *p != 0);
+            info.obf_tcp_port = u16_at(34).filter(|p| *p != 0);
+        }
+        if ping_ms.is_some() {
+            info.ping_ms = ping_ms;
+        }
+    }
+
     /// Count a new TCP connection from `ip` against `limits.max_clients_per_ip`.
     ///
     /// Returns the slot to hold for the life of the connection, or `None` when
@@ -1637,6 +1719,7 @@ impl ServerState {
             observed_udp_ports: DashMap::new(),
             natt_udp_ports: DashMap::new(),
             natt_token: DashMap::new(),
+            natt_proof_counter: DashMap::new(),
             natt_udp_ip: DashMap::new(),
             lugdunum_natt_seen: DashMap::new(),
             natt_keepalive_seen: DashMap::new(),
@@ -1677,6 +1760,8 @@ impl ServerState {
             csam_blocked_hashes: DashMap::new(),
             obf_decode_cache: DashMap::new(),
             live_cfg: arc_swap::ArcSwap::from(cfg),
+            name_db: std::sync::OnceLock::new(),
+            crypt_ping_sources: std::sync::Mutex::new(std::collections::VecDeque::new()),
             bot_query_log: DashMap::new(),
             bot_detections: DashMap::new(),
             media_offer_stats: MediaOfferStats::default(),

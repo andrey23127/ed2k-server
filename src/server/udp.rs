@@ -36,6 +36,20 @@ const UDP_MAX_SOURCES: usize = 30;
 /// eMule's largest file, 256 GiB. A size above it is not a size.
 const MAX_ED2K_FILE_SIZE: u64 = 256 << 30;
 
+/// The UDP flags word of our `0x97` (and of server.met for this server):
+/// the same as ST_UDPFLAGS at login, plus the IPv6 and NAT-callback bits
+/// the configuration turns on.
+pub fn server_udp_flags(live: &crate::config::Config) -> u32 {
+    let mut f: u32 = crate::proto::opcodes::SERVER_UDP_FLAGS;
+    if live.network.ipv6_publish_sources {
+        f |= crate::server::login::SRV_TCPFLG_IPV6;
+    }
+    if crate::server::lugdunum_natt::foreign_enabled(live) {
+        f |= crate::proto::opcodes::SRVFLG_HOLEPUNCH_EXT;
+    }
+    f
+}
+
 /// True when the 16 bytes at `at` form a hash `known` accepts — i.e. a 0x94
 /// record whose 0 size was not followed by a u64 would resume there.
 fn bad_size_realigns(payload: &[u8], at: usize, known: impl Fn(&[u8; 16]) -> bool) -> bool {
@@ -729,15 +743,34 @@ impl UdpServer {
                         // `on_obfping_port` was computed by the pre-flight above,
                         // which is also what lets a 4..=9 byte frame reach here.
                         let crypt_ping = on_obfping_port && is_crypt_ping(data);
+                        let mut rescued: Option<(Vec<u8>, u32)> = None;
                         if crypt_ping {
                             self.state
                                 .obf_crypt_pings
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            self.state.note_crypt_ping_source(sender_v4);
                         } else {
                             self.state
                                 .obf_decode_failed
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            self.note_undecodable(peer, data.len(), local_port);
+                            rescued = self.note_undecodable(peer, data, local_port);
+                        }
+                        // Obfuscated with the key of a neighbouring address
+                        // (see note_undecodable): a 0x9F, whose token is what
+                        // the handler trusts, or a global query, answered
+                        // with the same key. The key is cached for the
+                        // sender, so the rest of its flow decodes directly.
+                        if let Some((inner, key)) = rescued {
+                            self.state
+                                .obf_decode_cache
+                                .insert(sender_sock_of(peer), (key, 2, self.state.file_slab.now_secs()));
+                            decoded_buf = inner;
+                            opcode = decoded_buf[1];
+                            payload = &decoded_buf[2..];
+                            if let Err(e) = self.dispatch(opcode, payload, peer, Some((key, 2))).await {
+                                debug!(ip = %peer.ip(), error = %e, "rescued datagram: handler error");
+                            }
+                            continue;
                         }
                         if crypt_ping {
                             // Extract peer's random_part (first 4 bytes, LE).
@@ -1020,16 +1053,29 @@ impl UdpServer {
                         // address: a user hash is no secret, and a keepalive
                         // from elsewhere would send the client's peers there.
                         let same_ip = canon_ip(h.ip) == canon_ip(peer.ip());
-                        // Unless it carries the session's NAT-T token (issue
-                        // #40): <user hash 16><token 16>. The token went to
+                        // Unless it proves the session's NAT-T token (issue
+                        // #40, server::natt_proof, 36 bytes): the token went to
                         // this session alone, so the datagram is its own from
-                        // whatever address, and that address is where its
-                        // UDP is. A wrong token is no keepalive at all.
-                        let token = (payload.len() >= 32).then(|| &payload[16..32]);
-                        let token_ok = token.is_some_and(|t| {
-                            self.state.natt_token.get(&uh).is_some_and(|k| k.as_slice() == t)
+                        // whatever address, and that address is where its UDP
+                        // is. The token itself stays off the wire, and a
+                        // counter stops an old datagram being replayed. A
+                        // wrong proof is no keepalive at all.
+                        let proof = (payload.len() == crate::server::natt_proof::LEN).then(|| {
+                            let tok = self.state.natt_token.get(&uh).map(|t| *t);
+                            let last = self.state.natt_proof_counter.get(&uh).map_or(0, |c| *c);
+                            crate::server::natt_proof::check(payload, tok.as_ref(), last)
                         });
-                        let token_bad = token.is_some() && !token_ok;
+                        //
+                        // The 0.9.87 form, <user hash 16><token 16>, is no
+                        // credential any more: sent plain it showed the token
+                        // to anyone on the path. Both clients that sent it
+                        // send the proof now. Such a datagram counts as the
+                        // user hash alone, from the session's address only.
+                        if proof.is_none() && payload.len() >= 32 {
+                            crate::server::holepunch::count(&self.state, "natt_9f_token_form_ignored");
+                        }
+                        let token_ok = matches!(proof, Some(crate::server::natt_proof::Verdict::Ok(_)));
+                        let token_bad = proof.is_some() && !token_ok;
                         // Issue #39: on a server offering the extension, once
                         // a session has sent an obfuscated 0x9F its plain
                         // ones are ignored. Only the server key makes one,
@@ -1051,12 +1097,16 @@ impl UdpServer {
                                 .or_insert(0) += 1;
                         }
                         // Accepted from the session's own address, or with
-                        // the token from any.
+                        // the token's proof from any.
                         let accepted = !token_bad && (same_ip || token_ok);
-                        kind = if token_bad {
-                            "natt_9f_bad_token"
-                        } else if token_ok && !same_ip {
-                            "natt_9f_token_other_ip"
+                        kind = if let Some(v) = proof.filter(|_| token_bad) {
+                            if v == crate::server::natt_proof::Verdict::Replay {
+                                "natt_9f_proof_replay"
+                            } else {
+                                "natt_9f_proof_bad"
+                            }
+                        } else if proof.is_some() && !same_ip {
+                            "natt_9f_proof_other_ip"
                         } else if !same_ip {
                             "natt_9f_wrong_ip"
                         } else if plain_refused {
@@ -1067,8 +1117,9 @@ impl UdpServer {
                             "natt_9f_plain"
                         };
                         if accepted && !plain_refused {
-                            if token_ok {
-                                crate::server::holepunch::count(&self.state, "natt_9f_token");
+                            if let Some(crate::server::natt_proof::Verdict::Ok(n)) = proof {
+                                self.state.natt_proof_counter.insert(uh, n);
+                                crate::server::holepunch::count(&self.state, "natt_9f_proof");
                             }
                             // Where peers must punch to: the proven address
                             // when it is not the session's (issue #40).
@@ -1771,43 +1822,146 @@ impl UdpServer {
     /// (the client's IP changed since its last status ping) is unreadable,
     /// and looks exactly like one never sent. Counted each time; who it was
     /// goes to /api/natt "recent", once a minute per address at most.
-    fn note_undecodable(&self, peer: SocketAddr, len: usize, local_port: u16) {
+    /// An obfuscated datagram no key decoded. Counted when it comes from a
+    /// logged-in client's address, and for a NAT-T client recorded once a
+    /// minute per address.
+    ///
+    /// Issue #40: a client obfuscates with the key we handed to the address
+    /// its crypt ping came from, and we decode with the key for the address
+    /// this datagram comes from. Behind a VPN or ISP that hands out a
+    /// different exit per flow (Cloudflare WARP, seen live) the two differ.
+    /// For a datagram on portUDPobf the keys of nearby addresses are tried:
+    /// NAT-T sessions and recent crypt-ping sources in the sender's /16. What
+    /// matched is counted, and a decoded 0x9F (whose token the handler
+    /// checks) or global query is returned, with its key, to be handled and
+    /// answered.
+    fn note_undecodable(&self, peer: SocketAddr, data: &[u8], local_port: u16) -> Option<(Vec<u8>, u32)> {
+        let len = data.len();
         let ip = canon_ip(peer.ip());
-        if !self.state.conn_per_ip.contains_key(&ip) {
-            return;
+        // A 0x9F is 26 or 42 bytes (up to 15 more padded); global queries
+        // run longer. Anything a client sends to portUDPobf qualifies.
+        let natt_sized = local_port == self.cfg.network.tcp_port.wrapping_add(14) && (26..=512).contains(&len);
+        let from_session = self.state.conn_per_ip.contains_key(&ip);
+        if !from_session && !natt_sized {
+            return None;
         }
-        crate::server::holepunch::count(&self.state, "natt_udp_undecodable_from_session");
+        if from_session {
+            crate::server::holepunch::count(&self.state, "natt_udp_undecodable_from_session");
+        }
         let first = self
             .state
             .undecodable_from_session_seen
             .insert(ip, std::time::Instant::now())
             .map_or(true, |t| t.elapsed() > std::time::Duration::from_secs(60));
         if !first {
-            return;
+            return None;
         }
         // Rare by construction (once a minute per such address), so a walk
         // of the client map is affordable here.
-        let natt = self
-            .state
-            .clients
-            .iter()
-            .find(|c| {
-                c.ip == ip && c.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0
-            })
-            .map(|c| c.clone());
-        if let Some(c) = natt {
+        let natt = if from_session {
+            self.state
+                .clients
+                .iter()
+                .find(|c| {
+                    c.ip == ip && c.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0
+                })
+                .map(|c| c.clone())
+        } else {
+            None
+        };
+        if natt.is_none() && !natt_sized {
+            return None;
+        }
+        if natt.is_some() {
             crate::server::holepunch::count(&self.state, "natt_undecodable_from_natt_client");
-            let outcome = format!("undecodable, {len} bytes to port {local_port}");
+        }
+        let rescue = if natt_sized { self.try_nearby_keys(peer, data, natt.is_some()) } else { None };
+        let outcome = match &rescue {
+            Some((src, key_ip, op, _, _)) => format!(
+                "{len} bytes to port {local_port}: decoded with the key of {key_ip} ({src}), opcode 0x{op:02x}"
+            ),
+            None if natt_sized => format!("undecodable, {len} bytes to port {local_port}; no nearby key fits"),
+            None => format!("undecodable, {len} bytes to port {local_port}"),
+        };
+        if natt.is_some() || rescue.is_some() {
             crate::server::holepunch::note_event_from(
                 &self.state,
                 "UDP undecodable",
-                Some(&c),
+                natt.as_ref(),
                 None,
                 0,
                 &outcome,
                 Some(peer),
             );
         }
+        match rescue {
+            Some((_, _, op, inner, key))
+                if matches!(
+                    op,
+                    OP_SERVER_NATT_KEEPALIVE
+                        | OP_GLOB_GETSOURCES
+                        | OP_GLOB_GETSOURCES2
+                        | OP_GLOB_SEARCHREQ
+                        | OP_GLOB_SEARCHREQ2
+                        | OP_GLOB_SEARCHREQ3
+                ) =>
+            {
+                Some((inner, key))
+            }
+            _ => None,
+        }
+    }
+
+    /// The keys of addresses near `peer` (its /16): IPv4 sessions of NAT-T
+    /// clients and crypt-ping sources of the last two hours. Returns where the
+    /// key that decoded came from, its address, the opcode and the datagram.
+    fn try_nearby_keys(
+        &self,
+        peer: SocketAddr,
+        data: &[u8],
+        from_natt_client: bool,
+    ) -> Option<(&'static str, std::net::Ipv4Addr, u8, Vec<u8>, u32)> {
+        use crate::proto::server_obfuscation::{decode_with_obfbyte, ip_obfuscate};
+        let std::net::IpAddr::V4(sender) = canon_ip(peer.ip()) else {
+            return None;
+        };
+        let net16 = |a: std::net::Ipv4Addr| u32::from(a) >> 16;
+        const MAX_TRIES: usize = 96;
+        let mut cands: Vec<(&'static str, std::net::Ipv4Addr)> = Vec::new();
+        for c in self.state.clients.iter() {
+            if let std::net::IpAddr::V4(v4) = c.ip {
+                if v4 != sender
+                    && net16(v4) == net16(sender)
+                    && c.server_flags & crate::server::lugdunum_natt::SRVCAP_NATTRAVERSAL != 0
+                    && !cands.iter().any(|(_, a)| *a == v4)
+                {
+                    cands.push(("session", v4));
+                }
+            }
+        }
+        for a in self.state.crypt_ping_sources_near(sender) {
+            if a != sender && !cands.iter().any(|(_, x)| *x == a) {
+                cands.push(("crypt ping", a));
+            }
+        }
+        cands.truncate(MAX_TRIES);
+        let found = cands.into_iter().find_map(|(src, a)| {
+            let key = ip_obfuscate(&self.seckey, u32::from_le_bytes(a.octets()));
+            let inner = decode_with_obfbyte(data, key, 0x6b)?;
+            (inner.len() >= 2 && inner[0] == PROTO_EDONKEY).then(|| (src, a, inner[1], inner, key))
+        });
+        // Without a match the datagram may be anything from anyone; only a
+        // NAT-T session's miss says something.
+        let key = match found {
+            Some(("session", ..)) => Some("natt_undecodable_key_of_session_ip"),
+            Some(_) => Some("natt_undecodable_key_of_crypt_ping_ip"),
+            None if from_natt_client => Some("natt_undecodable_key_none_nearby"),
+            None => None,
+        };
+        if let Some(k) = key {
+            crate::server::holepunch::count(&self.state, k);
+        }
+        found
     }
 
     async fn reply_to_obf_ping(&self, peer: SocketAddr, random_part: u32) -> Result<()> {
@@ -1937,16 +2091,10 @@ impl UdpServer {
                     std::net::SocketAddrV4::new(v4, tcp),
                     std::time::Instant::now(),
                 );
-                // Users and files for the Peers tab, for a peer we asked.
-                if let Some(mut info) = self
-                    .state
-                    .peer_info
-                    .get_mut(&std::net::SocketAddrV4::new(v4, tcp))
-                {
-                    info.users = Some(users);
-                    info.files = Some(files);
-                    info.stats_at = Some(std::time::Instant::now());
-                }
+                // Counts (and, in the extended form, limits and ports) for
+                // the Peers tab and server.met, for a listed peer.
+                self.state
+                    .note_peer_stats(std::net::SocketAddrV4::new(v4, tcp), payload, None);
             }
         }
 
@@ -2710,6 +2858,14 @@ const OP_SERVER_NATT_KEEPALIVE: u8 = 0x9F;
 
 /// An IPv4-mapped IPv6 address as the IPv4 one, so a dual-stack socket's view
 /// of a client compares equal to the TCP session's.
+/// The decode-cache key of a sender (address and port).
+fn sender_sock_of(peer: SocketAddr) -> std::net::SocketAddrV4 {
+    match canon_ip(peer.ip()) {
+        std::net::IpAddr::V4(v4) => std::net::SocketAddrV4::new(v4, peer.port()),
+        _ => std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, peer.port()),
+    }
+}
+
 fn canon_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
         std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
@@ -3029,6 +3185,126 @@ mod registration_tests {
                 .unwrap(),
         );
         UdpServer { cfg, state, socket, seckey: [0; 16] }
+    }
+
+    /// A proof-form 0x9F (#40): accepted from any address with the right
+    /// mac and a growing counter; a replay or a wrong mac moves nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keepalive_proof_is_accepted_once_from_anywhere() {
+        use crate::server::natt_proof::mac;
+        let srv = tokio::task::spawn_blocking(server).await.unwrap();
+        let uh = [0x42u8; 16];
+        let token = [9u8; 16];
+        srv.state.clients.insert(
+            uh,
+            crate::state::ClientHandle {
+                user_hash: uh,
+                assigned_id: 1234,
+                ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 0, 0, 10)),
+                port: 4662,
+                udp_port: 0,
+                natt_capable: true,
+                nick: "t".into(),
+                server_flags: 0x100000,
+                ipv6_capable: false,
+                ipv6: None,
+                is_high_id: false,
+                connected_at: std::time::Instant::now(),
+                country: "??".into(),
+                software: "test".into(),
+                software_detail: "test".into(),
+                login_fp: String::new(),
+                csam_attempts: 0,
+                soft_limit_warned: false,
+                offer_policy: None,
+                slot: Default::default(),
+                tx: None,
+                last_activity_ms: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            },
+        );
+        srv.state.natt_token.insert(uh, token);
+        let proof = |n: u32, m: [u8; 16]| {
+            let mut p = uh.to_vec();
+            p.extend_from_slice(&n.to_le_bytes());
+            p.extend_from_slice(&m);
+            p
+        };
+        let elsewhere = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(5, 6, 7, 8)), 40000);
+        let count = |k: &str| srv.state.block_stats.get(k).map_or(0, |v| *v);
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &proof(1, mac(&token, &uh, 1)), elsewhere, None).await.unwrap();
+        assert_eq!(count("natt_9f_proof"), 1);
+        assert_eq!(count("natt_9f_proof_other_ip"), 1);
+        assert_eq!(srv.state.natt_udp_ip.get(&uh).map(|a| *a), Some(elsewhere.ip()));
+        // The same datagram again, from yet another address: a replay.
+        let third = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9)), 1);
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &proof(1, mac(&token, &uh, 1)), third, None).await.unwrap();
+        assert_eq!(count("natt_9f_proof_replay"), 1);
+        assert_eq!(srv.state.natt_udp_ip.get(&uh).map(|a| *a), Some(elsewhere.ip()));
+        // A wrong mac.
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &proof(2, [0; 16]), third, None).await.unwrap();
+        assert_eq!(count("natt_9f_proof_bad"), 1);
+        // The next counter is good again; the old token form still works.
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &proof(2, mac(&token, &uh, 2)), third, None).await.unwrap();
+        assert_eq!(count("natt_9f_proof"), 2);
+        // The 0.9.87 token form is no credential: from another address it
+        // moves nothing.
+        let mut old = uh.to_vec();
+        old.extend_from_slice(&token);
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &old, elsewhere, None).await.unwrap();
+        assert_eq!(count("natt_9f_token_form_ignored"), 1);
+        assert_eq!(count("natt_9f_wrong_ip"), 1);
+        assert_eq!(srv.state.natt_udp_ip.get(&uh).map(|a| *a), Some(third.ip()));
+        // After an obfuscated 0x9F, with the extension on, a plain one is
+        // ignored unless it proves the token (issue #39 rule): a plain proof
+        // still gets through.
+        let mut cfg = (**srv.state.live_cfg.load()).clone();
+        cfg.network.holepunch_extension = true;
+        cfg.network.lugdunum_natt = true;
+        srv.state.live_cfg.store(Arc::new(cfg));
+        srv.state.natt_keepalive_seen.insert(uh, true);
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &uh, elsewhere, None).await.unwrap();
+        srv.dispatch(OP_SERVER_NATT_KEEPALIVE, &proof(3, mac(&token, &uh, 3)), third, None).await.unwrap();
+        assert_eq!(count("natt_9f_proof"), 3);
+        assert_eq!(srv.state.natt_udp_ip.get(&uh).map(|a| *a), Some(third.ip()));
+    }
+
+    /// A 0x9F obfuscated with the key of the address the client's crypt
+    /// ping came from, arriving from another address in the same /16, is
+    /// decoded with that key and handed on; one from elsewhere is not.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_keepalive_with_the_key_of_a_nearby_crypt_ping_is_decoded() {
+        let srv = tokio::task::spawn_blocking(server).await.unwrap();
+        let ping_ip = std::net::Ipv4Addr::new(172, 94, 19, 35);
+        srv.state.note_crypt_ping_source(ping_ip);
+        let mut inner = vec![PROTO_EDONKEY, 0x9F];
+        inner.extend_from_slice(&[7u8; 32]);
+        let key = crate::proto::server_obfuscation::ip_obfuscate(&srv.seckey, u32::from_le_bytes(ping_ip.octets()));
+        let wire = crate::proto::server_obfuscation::encode_with_obfbyte(&inner, key, 12345, 0x6b);
+        assert!((42..=57).contains(&wire.len()));
+        let port = srv.cfg.network.tcp_port.wrapping_add(14);
+        let near = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 94, 19, 73)), 48041);
+        let (got, k) = srv.note_undecodable(near, &wire, port).expect("decoded");
+        assert_eq!(&got[..2], &[PROTO_EDONKEY, 0x9F]);
+        assert_eq!(k, key);
+        let far = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 2, 3)), 48041);
+        assert!(srv.note_undecodable(far, &wire, port).is_none());
+        // Once a minute per address: the second datagram is not looked at.
+        assert!(srv.note_undecodable(near, &wire, port).is_none());
+
+        // A global source request from a client of another server, keyed by
+        // the crypt ping of its other exit, is handed on too; anything else
+        // decoded that way is not.
+        let mut q = vec![PROTO_EDONKEY, OP_GLOB_GETSOURCES2];
+        q.extend_from_slice(&[9u8; 20]);
+        let wire = crate::proto::server_obfuscation::encode_with_obfbyte(&q, key, 777, 0x6b);
+        let other = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 94, 19, 99)), 5000);
+        let (got, _) = srv.note_undecodable(other, &wire, port).expect("source request");
+        assert_eq!(got[1], OP_GLOB_GETSOURCES2);
+        let mut odd = vec![PROTO_EDONKEY, 0x01];
+        odd.extend_from_slice(&[9u8; 20]);
+        let wire = crate::proto::server_obfuscation::encode_with_obfbyte(&odd, key, 778, 0x6b);
+        let another = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(172, 94, 19, 98)), 5000);
+        assert!(srv.note_undecodable(another, &wire, port).is_none());
     }
 
     /// A server registering with 0xA0 is listed only once its 0x97 echoes

@@ -675,6 +675,7 @@ pub(crate) fn end_session(state: &ServerState, c: &ClientHandle) {
         state.natt_udp_ports.remove(&c.user_hash);
         state.natt_keepalive_seen.remove(&c.user_hash);
         state.natt_token.remove(&c.user_hash);
+        state.natt_proof_counter.remove(&c.user_hash);
         state.natt_udp_ip.remove(&c.user_hash);
         // Retract the id→user mapping. Guarded inside by user hash.
         state.unindex_client_id(c.assigned_id, &c.user_hash);
@@ -952,7 +953,9 @@ async fn dispatch(
             // A new session proves its 0x9F handling afresh (issue #39).
             state.natt_keepalive_seen.remove(&new_client.user_hash);
             state.natt_udp_ip.remove(&new_client.user_hash);
-            // And gets a fresh token for its 0x9F (issue #40), if it does NAT-T.
+            // And gets a fresh token for its 0x9F (issue #40), if it does
+            // NAT-T; proof counters start again with it.
+            state.natt_proof_counter.remove(&new_client.user_hash);
             if crate::server::holepunch::wants_natt_token(&new_client) {
                 let mut t = [0u8; 16];
                 t.copy_from_slice(&crate::proto::obfuscation::random_bytes(16));

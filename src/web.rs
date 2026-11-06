@@ -629,6 +629,7 @@ pub fn spawn_admin(state: WebState, admin: crate::config::AdminConfig) {
             .route("/api/clients/search", get(api_clients_search))
             .route("/assets/flags.woff2", get(asset_flags_font))
             .route("/api/peers", get(api_peers))
+            .route("/api/namedb", get(api_namedb))
             .route("/api/reload", post(api_reload))
             .route("/api/client_stats", get(api_client_stats))
             .route("/api/country_stats", get(api_country_stats))
@@ -765,6 +766,8 @@ struct StatusResp {
     /// target here, and answers sent to the requester.
     natcb_foreign: u64,
     natcb_foreign_answered: u64,
+    /// Name history ([name_db]); null when off.
+    name_db: Option<serde_json::Value>,
 }
 
 async fn api_status(
@@ -875,7 +878,60 @@ async fn api_status(
             .iter()
             .map(|k| s.server.block_stats.get(*k).map_or(0, |v| *v))
             .sum(),
+        name_db: s.server.name_db.get().map(name_db_status),
     })
+}
+
+fn name_db_status(db: &crate::name_db::NameDb) -> serde_json::Value {
+    use std::sync::atomic::Ordering::Relaxed;
+    let st = &db.stats;
+    serde_json::json!({
+        "files": st.files.load(Relaxed),
+        "names": st.names.load(Relaxed),
+        "publishers": st.publishers.load(Relaxed),
+        "pending": st.pending.load(Relaxed),
+        "seen": st.seen.load(Relaxed),
+        "dropped": st.dropped.load(Relaxed),
+        "capped": st.capped.load(Relaxed),
+        "errors": st.errors.load(Relaxed),
+        "flushes": st.flushes.load(Relaxed),
+        "last_flush_unix": st.last_flush_unix.load(Relaxed),
+        "last_flush_ms": st.last_flush_ms.load(Relaxed),
+        "last_flush_changes": st.last_flush_changes.load(Relaxed),
+        "disk_bytes": db.disk_bytes(),
+    })
+}
+
+/// `GET /api/namedb?hash=<32 hex>`: everything the name history holds for
+/// one hash. Names the filter matched are never printed, and a clean name
+/// only under the audit's rule for names outside the blocked set.
+/// Without `hash`: the status.
+async fn api_namedb(State(s): State<WebState>, uri: axum::http::Uri) -> impl IntoResponse {
+    let Some(db) = s.server.name_db.get() else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "name history is off ([name_db] path)"})))
+            .into_response();
+    };
+    let qs = uri.query().unwrap_or("");
+    let hash = qs.split('&').find_map(|kv| kv.strip_prefix("hash=")).map(|h| h.trim().to_ascii_lowercase());
+    let Some(hash) = hash else {
+        return Json(name_db_status(db)).into_response();
+    };
+    let mut hb = [0u8; 16];
+    if hex::decode_to_slice(&hash, &mut hb).is_err() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "hash: 32 hex digits"}))).into_response();
+    }
+    let path = db.path.clone();
+    let filter = std::sync::Arc::clone(&s.server.filter);
+    let rep = tokio::task::spawn_blocking(move || {
+        let conn = crate::name_db::open_ro(&path)?;
+        crate::name_db::report(&conn, &hb, |n| crate::server::review_audit::plain_name_visible(&filter, n))
+    })
+    .await;
+    match rep {
+        Ok(Ok(r)) => Json(r).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
 }
 
 #[derive(Serialize)]
@@ -1478,11 +1534,20 @@ struct PeerRow {
     /// We have asked it at least once (name/desc missing after that = it does
     /// not answer plain UDP on TCP+4).
     asked: bool,
+    /// From the extended 0x97, when it has come.
+    max_users: Option<u32>,
+    /// "in", "excluded" or "" (not verified or no ServerKey), for the
+    /// server.met this server writes; null when `[server_met] path` is unset.
+    server_met: Option<&'static str>,
 }
 
 async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
+    use crate::server::server_met::{self, Standing};
     let list = s.server.server_list.read().await;
     let geo = s.server.country_db.read().await;
+    let cfg = s.server.live_cfg.load_full();
+    let writing = !cfg.server_met.path.trim().is_empty();
+    let (excludes, _) = server_met::parse_excludes(&cfg.server_met.exclude);
     let rows: Vec<PeerRow> = list
         .iter()
         .map(|addr| {
@@ -1504,6 +1569,12 @@ async fn api_peers(State(s): State<WebState>) -> Json<Vec<PeerRow>> {
                 users: info.users,
                 files: info.files,
                 asked: info.asked_at.is_some(),
+                max_users: info.max_users,
+                server_met: writing.then(|| match server_met::standing(&s.server, *addr, &excludes) {
+                    Standing::In => "in",
+                    Standing::Excluded => "excluded",
+                    Standing::NotQualified => "",
+                }),
             }
         })
         .collect();
@@ -3165,7 +3236,7 @@ fn audit_report(
         let mut out = format!(
             "# ed2k-server blocked audio files, {window_desc}: {} files. Almost always a\n\
              # song or book title that carries a term. Names with a child signal (an age,\n\
-             # a child word, a second listed term) are withheld.\n\
+             # a child word, a second listed term, the age rule) are withheld.\n\
              # hash | layer | rule | MB | name\n",
             aud.len()
         );
@@ -3175,7 +3246,8 @@ fn audit_report(
             } else {
                 e.sig
             };
-            let name = if sig.strong() {
+            // The age rule is a child signal of its own (see name_visible).
+            let name = if sig.strong() || e.layer == Layer::L2AgePattern {
                 "[withheld: child signal]".to_string()
             } else {
                 e.name.chars().take(160).collect::<String>()
@@ -4825,6 +4897,7 @@ async function refreshStatus() {
      <tr><td>Hole punch extension</td><td>${fmt(st.hpext_started)} started · ${fmt(st.hpext_fresh)} with a fresh 0x9F · ${fmt(st.hpext_timeout)} after the 3 s wait · ${fmt(st.hpext_clients)} clients · ${fmt(st.hp_bridged)} bridged <span style="color:#6b7280;font-size:.75rem">0x60 between two clients with 0x100000; bridged = 0x37 to a Lugdunum-only target</span></td></tr>
      <tr><td>Cross-server NAT callbacks</td><td>${fmt(st.natcb_foreign)} forwarded · ${fmt(st.natcb_foreign_answered)} answered <span style="color:#6b7280;font-size:.75rem">0xA6 from clients logged in elsewhere (requester id 0); answered = 0xA7 to the requester from a target with the extension; refusals in the Blocks tab (natcb_foreign_* and the natcb_* target reasons)</span></td></tr>
      <tr><td>Obfuscated UDP</td><td>${fmt(st.obf_decode_hits)} by the cached key · ${fmt(st.obf_decode_cold)} cold decodes · ${fmt(st.obf_crypt_pings)} crypt pings answered · ${fmt(st.obf_decode_failed)} undecodable · ${fmt(st.obf_decode_cache_entries)} cached senders <span style="color:#6b7280;font-size:.75rem">a cold decode first tries the client key for the sender's IP (one attempt), then the peer-server keys; most cold senders are clients of other servers sending one global query; senders stay cached 30 min (cap 262k)</span></td></tr>
+     ${st.name_db ? `<tr><td>Name history</td><td>${fmt(st.name_db.files)} files · ${fmt(st.name_db.names)} names · ${fmt(st.name_db.publishers)} publishers · ${(st.name_db.disk_bytes/1048576).toFixed(0)} MB · last write ${st.name_db.last_flush_unix ? new Date(st.name_db.last_flush_unix*1000).toLocaleTimeString() + ' (' + fmt(st.name_db.last_flush_changes) + ' changes, ' + fmt(st.name_db.last_flush_ms) + ' ms)' : 'not yet'} · ${fmt(st.name_db.pending)} changes waiting of ${fmt(st.name_db.seen)} offers since · ${fmt(st.name_db.dropped)} dropped${st.name_db.errors ? ' · <span style="color:#ef4444">' + fmt(st.name_db.errors) + ' write errors</span>' : ''} <span style="color:#6b7280;font-size:.75rem">every offered name, blocked or not, on disk ([name_db]); one hash: /api/namedb?hash=…</span></td></tr>` : ''}
      <tr><td>seed_challenges</td><td>${fmt(st.incoming_seed_challenges_entries)} <span style="color:#6b7280;font-size:.75rem">entries (capped at 2048)</span></td></tr>
      </table>`;
 }
@@ -4933,16 +5006,19 @@ async function refreshPeers() {
   const num = v => v == null ? '<span class="sub">—</span>' : v.toLocaleString();
   document.getElementById('peers-table').innerHTML = r.length === 0
     ? '<div class="empty">No peer servers known yet.</div>'
-    : '<table><thead><tr><th>Server</th><th>Address</th><th>Country</th><th>Users</th><th>Files</th><th>Version</th><th>Verified</th><th>ServerKey</th></tr></thead><tbody>'
+    : '<table><thead><tr><th>Server</th><th>Address</th><th>Country</th><th>Users</th><th>Max users</th><th>Files</th><th>Version</th><th>Verified</th><th>ServerKey</th>'
+      + (r.some(p => p.server_met != null) ? '<th>server.met</th>' : '') + '</tr></thead><tbody>'
       + r.map(p => `<tr><td>${p.name ? escapeHtml(p.name) : `<span class="sub">${p.asked ? 'no answer' : 'not asked yet'}</span>`}`
                + `${p.desc ? `<br><span class="sub">${escapeHtml(p.desc)}</span>` : ''}</td>`
                + `<td><code style="font-size:11px">${escapeHtml(p.ip)}:${p.port}</code></td>`
                + `<td>${p.country ? countryFlag(p.country) + ' ' + escapeHtml(p.country) : ''}`
                + `${p.provider ? `<br><span class="sub">${escapeHtml(p.provider)}</span>` : ''}</td>`
-               + `<td>${num(p.users)}</td><td>${num(p.files)}</td>`
+               + `<td>${num(p.users)}</td><td>${num(p.max_users)}</td><td>${num(p.files)}</td>`
                + `<td>${p.version ? escapeHtml(p.version) : ''}</td>`
                + `<td><span class="badge ${p.verified?'yes':'no'}">${p.verified?'yes':'no'}</span></td>`
-               + `<td><span class="badge ${p.has_server_key?'yes':'no'}">${p.has_server_key?'✓ known':'pending'}</span></td></tr>`).join('')
+               + `<td><span class="badge ${p.has_server_key?'yes':'no'}">${p.has_server_key?'✓ known':'pending'}</span></td>`
+               + (p.server_met == null ? '' : `<td>${p.server_met === 'in' ? '<span class="badge yes">in</span>' : p.server_met === 'excluded' ? '<span class="badge no">excluded</span>' : '<span class="sub">—</span>'}</td>`)
+               + '</tr>').join('')
       + '</tbody></table>';
 }
 

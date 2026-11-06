@@ -328,6 +328,28 @@ hash_banlist = "https://ed2k.emule-security.org/files/hash_banlist.txt"
 hash_filter = "https://ed2k.emule-security.org/files/hash_filter.txt"
 whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"
 
+[name_db]
+# Name history on disk: every offered name of every file, blocked or not, with
+# its publishers (salted digests, never addresses) and the filter's verdict.
+# The evidence for hash-list and whitelist decisions. Restart-only. README,
+# [name_db]. The file holds the blocked names too: keep it private.
+path = ""                      # e.g. "/var/lib/ed2k-server/names.db"; "" = off
+# max_pending = 100000         # write once this many changes wait (~30 MB)...
+# flush_secs = 3600            # ...or at least this often
+# queue = 200000               # offers queued for the writer; more are dropped
+# cache_mb = 16                # SQLite page cache
+# names_per_hash = 256
+# publishers_per_name = 8
+
+[server_met]
+# A server.met written from the Peers tab every interval_secs (Lugdunum's
+# autoservlist): verified peers with a known ServerKey, minus exclude, and
+# this server first. All live. README, [server_met].
+path = ""                      # file, or folder for server.met; "" = off
+# interval_secs = 600
+# include_self = true
+# exclude = ["1.2.3.4", "5.6.7.0/24", "8.9.10.11:4661"]
+
 [bots]
 # UDP bot detection (README, [bots]). All optional; these are the defaults.
 # min_span_secs = 10             # judge a source only over this long a window

@@ -6,6 +6,7 @@ pub mod admission;
 pub mod config;
 pub mod filter;
 pub mod health;
+pub mod name_db;
 pub mod proto;
 pub mod server;
 pub mod state;

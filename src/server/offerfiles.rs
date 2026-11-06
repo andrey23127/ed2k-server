@@ -206,7 +206,24 @@ pub fn handle_offerfiles(
         );
 
         // §7.6: mandatory content filter. Always runs, cannot be skipped.
-        match state.filter.check(&file.hash, &file.filename) {
+        let result = state.filter.check(&file.hash, &file.filename);
+        // Name history: every offer, blocked or not (a queue push; the
+        // writer thread does the rest).
+        if let Some(db) = state.name_db.get() {
+            let (layer, rule, whitelisted) =
+                crate::name_db::verdict(&state.filter, &file.hash, &file.filename, &result);
+            db.note(crate::name_db::NameEvent {
+                hash: file.hash,
+                size: file.size,
+                name: file.filename.clone(),
+                layer,
+                rule,
+                whitelisted,
+                user_hash: client.user_hash,
+                net: crate::name_db::net_of(client.ip),
+            });
+        }
+        match result {
             FilterResult::Block(layer, reason) => {
                 blocked += 1;
                 // Does this block say anything about the PUBLISHER?

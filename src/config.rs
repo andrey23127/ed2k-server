@@ -68,6 +68,109 @@ pub struct Config {
     pub admission: AdmissionConfig,
     #[serde(default)]
     pub bots: BotsConfig,
+    #[serde(default)]
+    pub server_met: ServerMetConfig,
+    #[serde(default)]
+    pub name_db: NameDbConfig,
+}
+
+/// Name history on disk (`[name_db]`). Restart-only.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct NameDbConfig {
+    /// The SQLite file. Empty = off.
+    #[serde(default)]
+    pub path: String,
+    /// Write the changes gathered at least this often, in seconds.
+    #[serde(default = "default_ndb_flush")]
+    pub flush_secs: u64,
+    /// ... or sooner, once this many changes (a new name, a new publisher of
+    /// a stored name, a new verdict) wait. Larger = fewer, cheaper writes
+    /// and more memory (~300 bytes per change).
+    #[serde(default = "default_ndb_pending")]
+    pub max_pending: usize,
+    /// Offers queued between the offer path and the writer; beyond it they
+    /// are dropped and counted.
+    #[serde(default = "default_ndb_queue")]
+    pub queue: usize,
+    /// SQLite page cache, MB.
+    #[serde(default = "default_ndb_cache")]
+    pub cache_mb: u32,
+    #[serde(default = "default_ndb_names")]
+    pub names_per_hash: u32,
+    #[serde(default = "default_ndb_pubs")]
+    pub publishers_per_name: u32,
+}
+
+fn default_ndb_flush() -> u64 {
+    3600
+}
+fn default_ndb_pending() -> usize {
+    100_000
+}
+fn default_ndb_queue() -> usize {
+    200_000
+}
+fn default_ndb_cache() -> u32 {
+    16
+}
+fn default_ndb_names() -> u32 {
+    256
+}
+fn default_ndb_pubs() -> u32 {
+    8
+}
+
+impl Default for NameDbConfig {
+    fn default() -> Self {
+        NameDbConfig {
+            path: String::new(),
+            flush_secs: default_ndb_flush(),
+            max_pending: default_ndb_pending(),
+            queue: default_ndb_queue(),
+            cache_mb: default_ndb_cache(),
+            names_per_hash: default_ndb_names(),
+            publishers_per_name: default_ndb_pubs(),
+        }
+    }
+}
+
+/// A server.met written from the peer list (`[server_met]`), as Lugdunum's
+/// `autoservlist` did. Live: read on every write.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+pub struct ServerMetConfig {
+    /// The file to write, or a folder to write `server.met` into. Empty =
+    /// off.
+    #[serde(default)]
+    pub path: String,
+    /// How often, in seconds. At least 60.
+    #[serde(default = "default_server_met_interval")]
+    pub interval_secs: u64,
+    /// Put this server first in the file (only when `server.public`).
+    #[serde(default = "default_true_sm")]
+    pub include_self: bool,
+    /// Peers never written: an address ("1.2.3.4"), a range ("1.2.3.0/24")
+    /// or one server ("1.2.3.4:4661").
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+fn default_server_met_interval() -> u64 {
+    600
+}
+
+fn default_true_sm() -> bool {
+    true
+}
+
+impl Default for ServerMetConfig {
+    fn default() -> Self {
+        ServerMetConfig {
+            path: String::new(),
+            interval_secs: default_server_met_interval(),
+            include_self: true,
+            exclude: Vec::new(),
+        }
+    }
 }
 
 /// Server-wide work admission (issue #25). Restart-only. No value accepts 0

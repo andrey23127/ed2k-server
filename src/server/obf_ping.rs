@@ -87,6 +87,7 @@ pub async fn ping_and_handshake(
 
     let dst = SocketAddrV4::new(peer_tcp_ip, peer_tcp_port.wrapping_add(12));
     socket.send_to(&payload, dst).await?;
+    let sent_at = std::time::Instant::now();
 
     debug!(
         peer_ip = %peer_tcp_ip,
@@ -106,11 +107,13 @@ pub async fn ping_and_handshake(
             return Err(e);
         }
         Err(_) => {
-            warn!(peer_ip = %peer_tcp_ip, "obf ping: no reply within timeout (3s)");
+            debug!(peer_ip = %peer_tcp_ip, "obf ping: no reply within timeout");
             return Ok(HandshakeResult {
                 peer_ip: peer_tcp_ip,
                 random_part,
                 server_key: None,
+                reply: None,
+                rtt_ms: None,
             });
         }
     };
@@ -122,13 +125,29 @@ pub async fn ping_and_handshake(
         "obf ping: got reply"
     );
 
+    // Only the peer itself: anyone can send to an ephemeral port.
+    if from.ip() != std::net::IpAddr::V4(peer_tcp_ip) {
+        return Ok(HandshakeResult {
+            peer_ip: peer_tcp_ip,
+            random_part,
+            server_key: None,
+            reply: None,
+            rtt_ms: None,
+        });
+    }
+    let rtt_ms = sent_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
     // Decode the obfuscated reply. The key is our random_part.
-    let result = decode_obf_s2s(&buf[..n], random_part);
+    let (server_key, reply) = match decode_obf_s2s_reply(&buf[..n], random_part) {
+        Some((k, r)) => (Some(k), Some(r)),
+        None => (None, None),
+    };
 
     Ok(HandshakeResult {
         peer_ip: peer_tcp_ip,
         random_part,
-        server_key: result,
+        server_key,
+        reply,
+        rtt_ms: Some(rtt_ms),
     })
 }
 
@@ -141,6 +160,13 @@ pub async fn ping_and_handshake(
 /// derivation), so we discover which the remote Lugdunum version uses.
 /// Logs diagnostic hex so production logs reveal the exact failure mode.
 pub fn decode_obf_s2s(packet: &[u8], session_key: u32) -> Option<u32> {
+    decode_obf_s2s_reply(packet, session_key).map(|(key, _)| key)
+}
+
+/// [`decode_obf_s2s`], also returning the decoded `0x97` payload (after
+/// the opcode): the peer's counts and limits for the Peers tab and
+/// server.met.
+pub fn decode_obf_s2s_reply(packet: &[u8], session_key: u32) -> Option<(u32, Vec<u8>)> {
     use crate::proto::server_obfuscation::decode_with_obfbyte;
 
     if packet.len() < 10 {
@@ -175,7 +201,7 @@ pub fn decode_obf_s2s(packet: &[u8], session_key: u32) -> Option<u32> {
             "obf decode: magic OK with 0xa5"
         );
         if let Some(key) = extract_server_key(&msg) {
-            return Some(key);
+            return Some((key, msg[2..].to_vec()));
         }
     } else {
         info!("obf decode: magic FAILED with obf_byte=0xa5, trying 0x00");
@@ -191,7 +217,7 @@ pub fn decode_obf_s2s(packet: &[u8], session_key: u32) -> Option<u32> {
             "obf decode: magic OK with 0x00"
         );
         if let Some(key) = extract_server_key(&msg) {
-            return Some(key);
+            return Some((key, msg[2..].to_vec()));
         }
     } else {
         warn!("obf decode: magic FAILED with both 0xa5 and 0x00 — wrong session_key?");
@@ -253,6 +279,9 @@ pub struct HandshakeResult {
     pub peer_ip: Ipv4Addr,
     pub random_part: u32,
     pub server_key: Option<u32>,
+    /// The decoded `0x97` payload (after the opcode), with the key.
+    pub reply: Option<Vec<u8>>,
+    pub rtt_ms: Option<u32>,
 }
 
 /// Background task: periodically perform OBF ping handshakes with seeds.

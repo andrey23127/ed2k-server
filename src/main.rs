@@ -484,6 +484,58 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(ServerState::new(Arc::new(filter), Arc::clone(&cfg)));
+    // Name history on disk ([name_db]).
+    if !cfg.name_db.path.trim().is_empty() {
+        let n = &cfg.name_db;
+        let settings = ed2k_server::name_db::Settings {
+            flush_secs: n.flush_secs,
+            max_pending: n.max_pending.max(1000),
+            queue: n.queue,
+            cache_mb: n.cache_mb,
+            names_per_hash: n.names_per_hash.max(1),
+            publishers_per_name: n.publishers_per_name.max(1),
+        };
+        let path = std::path::PathBuf::from(n.path.trim());
+        match ed2k_server::name_db::NameDb::open(&path, settings) {
+            Ok(db) => {
+                tracing::info!(
+                    path = %path.display(),
+                    files = db.stats.files.load(std::sync::atomic::Ordering::Relaxed),
+                    names = db.stats.names.load(std::sync::atomic::Ordering::Relaxed),
+                    flush_secs = n.flush_secs,
+                    "name history open"
+                );
+                let _ = state.name_db.set(db);
+            }
+            Err(e) => tracing::warn!(path = %path.display(), error = %e,
+                "name history: cannot open the database; running without it"),
+        }
+        // What has gathered since the last write is written on SIGTERM or
+        // SIGINT before the process ends (at most 20 s).
+        let state_sig = Arc::clone(&state);
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (Ok(mut term), Ok(mut int)) =
+                (signal(SignalKind::terminate()), signal(SignalKind::interrupt()))
+            else {
+                return;
+            };
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+            }
+            if state_sig.name_db.get().is_some() {
+                tracing::info!("shutting down: writing the name history");
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Some(db) = state_sig.name_db.get() {
+                        db.flush_and_wait(std::time::Duration::from_secs(20));
+                    }
+                })
+                .await;
+            }
+            std::process::exit(0);
+        });
+    }
     // The IPv6 dial-back (#43) needs a route to dial with.
     let v6_route = ed2k_server::server::ipv6_probe::detect_route();
     state.ipv6_route.store(v6_route, std::sync::atomic::Ordering::Relaxed);
@@ -1632,6 +1684,104 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     let _ = sock_pi.send_to(&ping, dst).await;
                 }
                 tick.tick().await;
+            }
+        });
+    }
+
+    // ServerKey for every listed peer, not only the seeds. The gossip
+    // handshake runs with the configured seeds; any other peer's key used to
+    // arrive only when that peer gossiped with us on its own schedule, so
+    // after a restart many stayed "pending" (and without max users) for
+    // hours. Each minute, up to 16 listed peers without a key get the same
+    // OBF ping the seeds get (to TCP+12, from an ephemeral port); one that
+    // does not answer is tried again after 10 minutes. The reply carries the
+    // key and the peer's limits; the round trip is its ping.
+    {
+        let state_k = Arc::clone(&state);
+        tokio::spawn(async move {
+            const BATCH: usize = 16;
+            const RETRY: std::time::Duration = std::time::Duration::from_secs(600);
+            let mut tried: std::collections::HashMap<std::net::SocketAddrV4, std::time::Instant> =
+                std::collections::HashMap::new();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let list: Vec<std::net::SocketAddrV4> =
+                    state_k.server_list.read().await.iter().copied().collect();
+                tried.retain(|a, t| t.elapsed() < RETRY && list.contains(a));
+                let due: Vec<std::net::SocketAddrV4> = list
+                    .into_iter()
+                    .filter(|a| !state_k.seed_server_keys.contains_key(a) && !tried.contains_key(a))
+                    .take(BATCH)
+                    .collect();
+                let mut jobs = tokio::task::JoinSet::new();
+                for addr in due {
+                    tried.insert(addr, std::time::Instant::now());
+                    jobs.spawn(async move {
+                        let r = ed2k_server::server::obf_ping::ping_and_handshake(
+                            *addr.ip(),
+                            addr.port(),
+                            std::time::Duration::from_secs(5),
+                        )
+                        .await;
+                        (addr, r)
+                    });
+                }
+                while let Some(done) = jobs.join_next().await {
+                    let Ok((addr, Ok(r))) = done else { continue };
+                    if let Some(key) = r.server_key {
+                        if state_k.seed_server_keys.insert(addr, key).is_none() {
+                            info!(peer = %addr, server_key = format!("0x{key:08x}"),
+                                  "learned peer ServerKey (OBF ping)");
+                        }
+                        state_k
+                            .verified_sockets
+                            .insert(addr, std::time::Instant::now());
+                        if let Some(reply) = &r.reply {
+                            state_k.note_peer_stats(addr, reply, r.rtt_ms);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // server.met from the peer list ([server_met], issue: Lugdunum's
+    // autoservlist). Verified peers with a known ServerKey, minus the
+    // configured exclusions, this server first. The first file is written
+    // ten minutes after start, once the gossip handshakes have run.
+    {
+        let state_sm = Arc::clone(&state);
+        tokio::spawn(async move {
+            use ed2k_server::server::server_met;
+            let mut warned_excludes: Option<Vec<String>> = None;
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            loop {
+                let cfg = state_sm.live_cfg.load_full();
+                let sm = &cfg.server_met;
+                if !sm.path.trim().is_empty() {
+                    let (_, bad) = server_met::parse_excludes(&sm.exclude);
+                    if !bad.is_empty() && warned_excludes.as_ref() != Some(&sm.exclude) {
+                        warn!(entries = ?bad, "server_met.exclude: entries that are not an address, a range or ip:port are ignored");
+                    }
+                    warned_excludes = Some(sm.exclude.clone());
+                    match server_met::collect(&state_sm).await {
+                        None => warn!("server.met not written: no peer is verified with a known ServerKey; the previous file stays"),
+                        Some(entries) => {
+                            let bytes = server_met::build(&entries);
+                            let dest = server_met::target(&sm.path);
+                            let d2 = dest.clone();
+                            match tokio::task::spawn_blocking(move || server_met::write_atomic(&d2, &bytes)).await {
+                                Ok(Ok(())) => info!(path = %dest.display(), servers = entries.len(), "server.met written"),
+                                Ok(Err(e)) => warn!(path = %dest.display(), error = %e, "server.met write failed"),
+                                Err(e) => warn!(error = %e, "server.met write task failed"),
+                            }
+                        }
+                    }
+                }
+                let every = cfg.server_met.interval_secs.max(60);
+                tokio::time::sleep(std::time::Duration::from_secs(every)).await;
             }
         });
     }
