@@ -311,6 +311,10 @@ pub fn handle_holepunch_request(
     // Each side also gets the server ID of the peer described (issue #38):
     // the requester its 0x60 target id, so it can tell which of several
     // requests in flight this answers; the target the requester's id.
+    // And, after the peer, each side's own UDP endpoint as this server saw
+    // it in its last accepted 0x9F (issue #40), when there is one: a client
+    // whose UDP leaves from another public IPv4 than its TCP keys its
+    // client UDP obfuscation toward the peer with that address.
     let to_requester = build_info(
         t_ip,
         t_tcp,
@@ -319,6 +323,7 @@ pub fn handle_holepunch_request(
         if requester_is_initiator { 0 } else { 1 },
         target_id,
         crypt_of_target,
+        own_udp_endpoint(state, requester_user_hash, requester_ip),
     );
     let to_target = build_info(
         requester_ip,
@@ -328,6 +333,7 @@ pub fn handle_holepunch_request(
         if requester_is_initiator { 1 } else { 0 },
         requester_id,
         crypt_of_requester,
+        own_udp_endpoint(state, &t_hash, t_ip),
     );
 
     // Both lookups below take fresh short-lived guards (the earlier target guard
@@ -824,13 +830,29 @@ fn bridge(state: &ServerState, requester_user_hash: &[u8; 16], requester_ip: IpA
     count(state, &format!("hp_bridged_sw:{}", sw_family(state, &target.user_hash)));
 }
 
-/// OP_LOWID_HOLEPUNCH_INFO payload, 30 bytes (29 + peer_crypt):
+/// The UDP endpoint the server last accepted a 0x9F from for this session,
+/// if fresh: `natt_ip` (the session's own, or the address a proof came from)
+/// and the 0x9F's source port. None without such a 0x9F, or for an address
+/// that is not IPv4.
+pub(crate) fn own_udp_endpoint(state: &ServerState, user_hash: &[u8; 16], natt_ip: IpAddr) -> Option<(Ipv4Addr, u16)> {
+    let (port, seen) = *state.natt_udp_ports.get(user_hash)?;
+    if port == 0 || seen.elapsed() >= OBSERVED_UDP_FRESH {
+        return None;
+    }
+    Some((session_v4(natt_ip)?, port))
+}
+
+/// OP_LOWID_HOLEPUNCH_INFO payload, 30 bytes (29 + peer_crypt), 36 with the
+/// recipient's own UDP endpoint appended (issue #40):
 ///   peer_ip(4 LE) + peer_tcp_port(2 LE) + peer_udp_port(2 LE)
 ///   + peer_user_hash(16) + role(1) + peer_id(4 LE)
 /// `peer_id` (issue #38) is the server ID of the peer described; a client
 /// reads it only from a payload of 29 bytes or more (it was 25 before).
 /// For a pair using the extension, 30: + peer_crypt(1), the peer's
 /// `(CT_SERVER_FLAGS >> 9) & 7` (support, request, require), as in 0x37.
+/// Then, when the server has it, 36: + own_ip(4, as peer_ip) + own_udp_port
+/// (2 LE), the recipient's own UDP endpoint from its last accepted 0x9F.
+#[allow(clippy::too_many_arguments)]
 fn build_info(
     ip: IpAddr,
     tcp_port: u16,
@@ -839,6 +861,7 @@ fn build_info(
     role: u8,
     peer_id: u32,
     peer_crypt: Option<u8>,
+    own: Option<(Ipv4Addr, u16)>,
 ) -> Frame {
     let mut p = BytesMut::with_capacity(INFO_EXT_LEN);
     match ip {
@@ -853,6 +876,11 @@ fn build_info(
     p.put_u32_le(peer_id);
     if let Some(c) = peer_crypt {
         p.put_u8(c);
+        // Only after the crypt byte, so its offset (30) never moves.
+        if let Some((own_ip, own_port)) = own {
+            p.put_u32_le(u32::from_le_bytes(own_ip.octets()));
+            p.put_u16_le(own_port);
+        }
     }
     Frame::new(OP_LOWID_HOLEPUNCH_INFO, p.to_vec())
 }
@@ -915,7 +943,8 @@ mod tests {
     }
 
     /// Issue #39, the extension: 0x37 wakes the target, nothing else goes out
-    /// until its 0x9F, then 0x61 (30 bytes) with that fresh port.
+    /// until its 0x9F, then 0x61 (30 bytes, 36 to the side the server has a
+    /// 0x9F from) with that fresh port.
     #[tokio::test]
     async fn an_extension_pair_waits_for_the_targets_keepalive() {
         let s = Arc::new(ServerState::for_test());
@@ -935,9 +964,12 @@ mod tests {
         assert_eq!(opcodes(&to_a), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
         assert_eq!(&to_a[0].payload[6..8], &50000u16.to_le_bytes());
         assert_eq!(to_a[0].payload[29], 0x03, "B supports and requests");
+        // B sent a 0x9F, so its 0x61 also carries B's own UDP endpoint as
+        // the server saw it (issue #40); A sent none, so A's stays 30.
         let to_b = drain(&mut b);
-        assert_eq!(opcodes(&to_b), vec![(OP_LOWID_HOLEPUNCH_INFO, 30)]);
+        assert_eq!(opcodes(&to_b), vec![(OP_LOWID_HOLEPUNCH_INFO, 36)]);
         assert_eq!(to_b[0].payload[29], 0x01, "A supports");
+        assert_eq!(&to_b[0].payload[34..36], &50000u16.to_le_bytes());
         assert_eq!(s.block_stats.get("holepunch_ext_fresh").map(|v| *v), Some(1));
     }
 
@@ -1038,7 +1070,7 @@ mod tests {
     #[test]
     fn info_payload_format() {
         let hash = [7u8; 16];
-        let frame = build_info(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0, 0x0102_0304, None);
+        let frame = build_info(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0, 0x0102_0304, None, None);
         assert_eq!(frame.opcode, OP_LOWID_HOLEPUNCH_INFO);
         assert_eq!(frame.payload.len(), 29);
         assert_eq!(&frame.payload[0..4], &[1, 2, 3, 4]); // ip
@@ -1047,6 +1079,13 @@ mod tests {
         assert_eq!(&frame.payload[8..24], &hash); // user hash
         assert_eq!(frame.payload[24], 0); // role
         assert_eq!(&frame.payload[25..29], &[4, 3, 2, 1]); // peer id LE
+        // With the crypt byte and the recipient's own endpoint (issue #40).
+        let own = Some((Ipv4Addr::new(9, 8, 7, 6), 0x1234));
+        let frame = build_info(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 4662, 4672, &hash, 0, 1, Some(3), own);
+        assert_eq!(frame.payload.len(), 36);
+        assert_eq!(frame.payload[29], 3);
+        assert_eq!(&frame.payload[30..34], &[9, 8, 7, 6]);
+        assert_eq!(&frame.payload[34..36], &[0x34, 0x12]);
     }
 
     fn info_of(rx: &mut tokio::sync::mpsc::Receiver<Frame>) -> (u16, u16, [u8; 16], u32) {

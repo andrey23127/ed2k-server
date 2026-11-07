@@ -964,7 +964,7 @@ else the port you announced (`0xF9`, or the one in your `0x60`).
 | Opcode | Value | Direction | Payload |
 |---|---|---|---|
 | `OP_LOWID_HOLEPUNCH_REQUEST` | `0x60` | client → server (TCP) | `<target_id 4><our_udp_port 2>` |
-| `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4><peer_crypt 1>` |
+| `OP_LOWID_HOLEPUNCH_INFO` | `0x61` | server → both (TCP) | `<peer_ip 4><tcp 2><udp 2><userhash 16><role 1><peer_id 4><peer_crypt 1>[<own_ip 4><own_udp 2>]` |
 | `OP_LOWID_HOLEPUNCH_FAIL` | `0x62` | server → client (TCP) | `<target_id 4><reason 1>` |
 | `OP_SERVER_NATT_KEEPALIVE` | `0x9F` | client → server (UDP) | `<userhash 16>`, or the token's proof `<userhash 16><counter 4><mac 16>` |
 | `OP_SERVERIDENT` tag `ST_NATT_TOKEN` | `0xAC`, 16 bytes | server → client (TCP) | the session's NAT-T token (since 0.9.87) |
@@ -989,6 +989,15 @@ is appended, the peer's `(CT_SERVER_FLAGS >> 9) & 7` (supports / requests /
 requires the crypt layer). With the user hash at bytes 8–23 it lets the
 dialler obfuscate from its first datagram, so a peer that requires the crypt
 layer accepts the stream. Read it only from 30 bytes or more.
+Since 0.9.88 a `0x61` is 36 bytes when the server has accepted a `0x9F` from
+the recipient (issue #40): `own_ip(4)` (same encoding as `peer_ip`) and
+`own_udp_port(2 LE)` are appended, the recipient's own UDP endpoint as the
+server saw it, from the session's address or, with the token's proof, from
+another one. A client whose UDP leaves from another public IPv4 than its TCP
+uses `own_ip` in the key of its client UDP obfuscation toward the peers it
+punches in that login (not as its public IP); a peer's own report of the
+address, where clients exchange one, replaces it for that peer. Without such
+a `0x9F` the frame stays 30 bytes. Read `own_*` only from 36 bytes or more.
 **The NAT-T token and its proof (issue #40).** A `0x9F` is believed only from
 the session's own address, since a user hash is no secret. That leaves out a
 client whose carrier NAT or VPN sends its UDP out of another public IPv4 than

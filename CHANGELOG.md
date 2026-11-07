@@ -42,6 +42,13 @@ accepted one for the session (a replay is ignored); it passes the rule that
 ignores a plain `0x9F` after an obfuscated one. Counters `natt_9f_proof`,
 `natt_9f_proof_other_ip`, `natt_9f_proof_bad`, `natt_9f_proof_replay`.
 
+- **`0x61` carries the recipient's own UDP endpoint** when the server has
+  accepted a `0x9F` from it: `own_ip(4) own_udp_port(2)` appended after the
+  crypt byte, 36 bytes. A client whose UDP leaves from another public IPv4
+  than its TCP keys its client UDP obfuscation toward the punched peer with
+  it (found by aMule: in that case the transfer after the punch only worked
+  with client UDP obfuscation off). Covers both peers split, which a peer's
+  echo cannot. 30 bytes as before without such a `0x9F`.
 - **The 0.9.87 token form is dropped.** `<user hash 16><token 16>` now
   counts as the user hash alone, accepted only from the session's address
   (`natt_9f_token_form_ignored`); `natt_9f_token`, `natt_9f_token_other_ip`
