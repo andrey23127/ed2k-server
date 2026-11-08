@@ -1282,7 +1282,8 @@ async fn dispatch(
                     }
                     (None, _) => {
                         state.client_ipv6.remove(&c.user_hash);
-                        state.ipv6_probe.remove(&c.user_hash);
+                        // Not a remove: the dial count lasts the session (#53).
+                        crate::server::ipv6_probe::withdraw(state, c.user_hash);
                     }
                 }
                 if let Some(mut h) = state.clients.get_mut(&c.user_hash) {

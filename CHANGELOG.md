@@ -29,6 +29,14 @@ name otherwise.
   printed). Pending changes are written on SIGTERM/SIGINT before exit.
 - rusqlite 0.31 with the bundled SQLite, pinned for Rust 1.75.
 
+### IPv6 dial-back: a withdraw no longer resets the dial count (issue #53)
+
+`OP_IPV6_UPDATE` with the zero address removed the session's probe entry,
+and with it the count of dial-backs, so alternating withdraw and a new
+address got past the cap of 4 per session and had the server dial every
+address the client named. A withdraw now keeps the entry (address cleared,
+verdict settled so the sweep leaves it alone); the count lasts the session.
+
 ### NAT-T token's proof (issue #40)
 
 A plain `0x9F` with the token showed the token to anyone on the path, who

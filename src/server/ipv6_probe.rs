@@ -117,6 +117,17 @@ pub fn mark_pending(state: &ServerState, user_hash: UserHash, addr: Ipv6Addr) ->
     true
 }
 
+/// The client withdrew its IPv6 (`OP_IPV6_UPDATE` with the zero address).
+/// The entry stays, so its dial count lasts the session (issue #53): only
+/// the address goes, and a settled verdict keeps the minute's sweep from
+/// retrying it. The next address starts from the same count.
+pub fn withdraw(state: &ServerState, user_hash: UserHash) {
+    if let Some(mut p) = state.ipv6_probe.get_mut(&user_hash) {
+        p.addr = Ipv6Addr::UNSPECIFIED;
+        p.verdict = Some(false);
+    }
+}
+
 /// Dial `[addr]:port` and expect `user_hash`; `mark_pending` first. On the
 /// verdict, publish (or not) and send the session a fresh `OP_SERVERIDENT`.
 /// Left unpublished when the server-wide probe ceiling is full or the
@@ -300,5 +311,32 @@ mod tests {
         assert_eq!(status_bits(&s, &h, Some(b)), 0x01);
         assert!(mark_pending(&s, h, b), "a new address is dialled");
         assert!(s.client_ipv6.get(&h).is_none());
+    }
+
+    /// Issue #53: a withdraw between addresses does not reset the session's
+    /// dials. Login address, then withdraw + new address, again and again:
+    /// the fifth dial is skipped.
+    #[tokio::test]
+    async fn a_withdraw_keeps_the_dial_count() {
+        let s = Arc::new(ServerState::for_test());
+        on(&s);
+        let h = [9u8; 16];
+        let _rx = s.register_test_client_at(h, 5, false, 0, "10.0.0.9".parse().unwrap());
+        // The dials themselves go nowhere (documentation prefix, 1 ms).
+        let mut cfg = (**s.live_cfg.load()).clone();
+        cfg.network.login_timeout_ms = 1;
+        s.live_cfg.store(Arc::new(cfg));
+        for i in 1..=6u16 {
+            let a = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i);
+            s.clients.get_mut(&h).unwrap().ipv6 = Some(a);
+            assert!(mark_pending(&s, h, a));
+            start(&s, h, a, 1, 0);
+            withdraw(&s, h);
+            s.clients.get_mut(&h).unwrap().ipv6 = None;
+        }
+        assert_eq!(s.ipv6_probe.get(&h).map(|p| p.dials), Some(MAX_DIALS));
+        assert_eq!(s.block_stats.get("ipv6_probe_skipped_limit").map(|v| *v), Some(2));
+        // The withdrawn entry is settled: the sweep does not dial it.
+        assert_eq!(s.ipv6_probe.get(&h).map(|p| (p.addr, p.verdict)), Some((Ipv6Addr::UNSPECIFIED, Some(false))));
     }
 }
