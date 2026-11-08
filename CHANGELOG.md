@@ -65,8 +65,9 @@ An undecodable datagram on portUDPobf (26..512 bytes) now gets, once a
 minute per sender, the keys of nearby addresses: NAT-T sessions and
 crypt-ping sources of the last two hours in its /16. A decoded `0x9F` goes
 to its handler (the token decides); a global query (`0x9A`, `0x94`, `0x98`,
-`0x92`, `0x90`) is answered, encoded with the same key, and the key is cached
-for that sender so the rest of the flow decodes directly. Counted as
+`0x92`, `0x90`) is answered, encoded with the same key, and the key is kept
+for that sender's address (30 min), since a per-flow exit sends every
+datagram from a new port (`udp_decoded_by_neighbour_key`). Counted as
 `natt_undecodable_key_of_session_ip` / `_of_crypt_ping_ip`, and
 `_none_nearby` for NAT-T sessions only; matches shown in `/api/natt`.
 

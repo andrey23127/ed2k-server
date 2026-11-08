@@ -1092,6 +1092,9 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                         state_clean.obf_decode_cache.clear();
                         info!(cleared = n, "obf_decode_cache over cap, cleared");
                     }
+                    state_clean
+                        .rescued_obf_keys
+                        .retain(|_, e| e.1.elapsed() < std::time::Duration::from_secs(1800));
                 }
                 if state_clean.incoming_seed_challenges.len() > SEED_CHAL_CAP {
                     let n = state_clean.incoming_seed_challenges.len();

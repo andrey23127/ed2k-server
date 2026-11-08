@@ -814,6 +814,10 @@ pub struct ServerState {
     /// newest last, at most 8192: whose key a client may be using (#40
     /// diagnostic, `note_undecodable`).
     pub crypt_ping_sources: std::sync::Mutex<std::collections::VecDeque<(std::net::Ipv4Addr, Instant)>>,
+    /// Per sender address, the key of a neighbouring address that decoded
+    /// its obfuscated UDP (issue #40), for 30 minutes; pruned with the decode
+    /// cache.
+    pub rescued_obf_keys: DashMap<std::net::Ipv4Addr, (u32, Instant)>,
     /// Name history (`[name_db]`), when on. Set once at startup.
     pub name_db: std::sync::OnceLock<crate::name_db::NameDb>,
     /// Per-IP query-rate tracker. Records a sliding 60-second window of UDP
@@ -1761,6 +1765,7 @@ impl ServerState {
             obf_decode_cache: DashMap::new(),
             live_cfg: arc_swap::ArcSwap::from(cfg),
             name_db: std::sync::OnceLock::new(),
+            rescued_obf_keys: DashMap::new(),
             crypt_ping_sources: std::sync::Mutex::new(std::collections::VecDeque::new()),
             bot_query_log: DashMap::new(),
             bot_detections: DashMap::new(),

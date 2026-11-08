@@ -643,6 +643,28 @@ impl UdpServer {
                         }
                     }
                 }
+                // A sender whose key was found at a neighbouring address
+                // (note_undecodable, issue #40): behind a per-flow exit every
+                // datagram comes from a new port, so the per-socket cache
+                // above never hits; the key is kept per address instead.
+                if decoded_opt.is_none() {
+                    let rescued = self
+                        .state
+                        .rescued_obf_keys
+                        .get(&sender_v4)
+                        .filter(|e| e.1.elapsed() < std::time::Duration::from_secs(1800))
+                        .map(|e| e.0);
+                    if let Some(k) = rescued {
+                        if let Some(inner) = try_decode(data, k, Formula::Obf6B) {
+                            decoded_opt = Some(inner);
+                            self.state.obf_decode_cache.insert(
+                                sender_sock,
+                                (k, 2, self.state.file_slab.now_secs()),
+                            );
+                            crate::server::holepunch::count(&self.state, "udp_decoded_by_neighbour_key");
+                        }
+                    }
+                }
                 if decoded_opt.is_none() {
                     let ip_obf_key = ip_obfuscate(&self.seckey, sender_ip_le);
                     let mut keys_to_try: Vec<u32> = self
@@ -764,6 +786,9 @@ impl UdpServer {
                             self.state
                                 .obf_decode_cache
                                 .insert(sender_sock_of(peer), (key, 2, self.state.file_slab.now_secs()));
+                            self.state
+                                .rescued_obf_keys
+                                .insert(sender_v4, (key, std::time::Instant::now()));
                             decoded_buf = inner;
                             opcode = decoded_buf[1];
                             payload = &decoded_buf[2..];
