@@ -561,6 +561,8 @@ pub struct ServerState {
     /// Bounds how many OFFERFILES batches are processed at once off the
     /// runtime (see the OFFERFILES arm in server::connection).
     pub offer_lane: Arc<tokio::sync::Semaphore>,
+    /// Bytes of OFFERFILES frames waiting for an `offer_lane` slot (#56).
+    pub offer_wait_bytes: std::sync::atomic::AtomicUsize,
     /// IPv6 address of a publisher, keyed by user hash.
     ///
     /// ⚠ A SIDE TABLE, not a field on `Source`, and the reason is arithmetic.
@@ -1713,6 +1715,7 @@ impl ServerState {
             ipv6_route: std::sync::atomic::AtomicBool::new(false),
             smart_sources: SmartSourcesCache::new(),
             offer_lane: Arc::new(tokio::sync::Semaphore::new(OFFER_JOBS)),
+            offer_wait_bytes: std::sync::atomic::AtomicUsize::new(0),
             filter,
             next_low_id: AtomicU32::new(1),
             total_sessions: AtomicU32::new(0),

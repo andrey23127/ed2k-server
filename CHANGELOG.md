@@ -2,6 +2,61 @@
 
 Earlier releases are described in their release commit messages.
 
+## 0.9.89
+
+Four findings from an audit of 0.9.88 by itlezy.
+
+### NAT-T token from the OS random source (issue #57)
+
+The session's NAT-T token keys the HMAC of its `0x9F` proofs, and it came
+from the obfuscation helper: a clock-and-counter seed expanded by a linear
+congruential generator, not fit for a key. It now comes from `getrandom`.
+If the OS source fails the session gets no token, and its `0x9F` is then
+accepted from its own address only; there is no fallback to predictable
+bytes. Wire format, length and the proof are unchanged. The same source now
+also gives the obfuscation handshake's DH private exponent (falling back to
+the old generator only if the OS source fails, as that is obfuscation, not
+authentication) and the per-process salt of the anonymised exports.
+
+### Search tree: node and text budget (issue #54)
+
+The parser bounded depth (24) but not size: a balanced tree 12 deep could
+hold 8,191 nodes, each a heap allocation, all made before the search waited
+for its lane, and over UDP on the receive task. A tree now has at most 256
+nodes and 4,096 bytes of text (terms, meta values, tag names), taken from
+the budget before each node or string is allocated. A tree over either is
+refused before admission: an empty result over TCP, nothing over UDP,
+counted as `search_tree_over_budget`. eMule's own searches stay around 30
+nodes even with every advanced field.
+
+### Bounded candidate lookup for every query shape (issue #55)
+
+Only a query of one plain word had its candidate list cut to what the
+ranking examines; two words, an OR group or a repeated word built their
+whole answer first, decoding, allocating and sorting postings far past
+`search_rank_scan`. Now every shape returns the first ids in id order, as
+the ranking reads them, with two bounds: the seed (the rarest group) is a
+prefix of at most 262,144 ids, and at most 4,000,000 ids are decoded from
+the other groups' postings. Within them the answer is exactly the first ids
+of the old one; past them it is partial, never wrong (the caller checks
+every file against the whole query). Repeated words and groups collapse
+first, so `[[a], [a]]` takes the one-word path. Cut answers are counted as
+`search_candidates_seed_cut` and `search_candidates_visits_cut`.
+
+### Large OFFERFILES never runs on the runtime because the lane is full (issue #56)
+
+A batch above 8 records went to one of the 4 offer slots on the blocking
+pool, but with all four busy it ran inline on the runtime, which at the
+default single thread stopped all networking exactly in the reconnect
+storms the lane is for. It now waits for a slot, serving frames pushed at
+the client meanwhile and reading nothing more from it, so TCP holds the
+client back. A waiting batch holds only its frame as read, parsed once a
+slot is free, and waiting frames are bounded to 64 MB in all; past that a
+batch still runs inline, as a last resort. Counted as `offer_lane_waited`
+and `offer_inline_overload`. The slot is held by the job itself and released
+when the batch is done, on a panic too, whether or not its connection is
+still there.
+
 ## 0.9.88
 
 ### Name history on disk

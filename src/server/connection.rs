@@ -12,6 +12,42 @@ use crate::server::get_sources::{handle_get_sources, GetSourcesRequest};
 use crate::server::login::{handle_login, LoginRequest};
 /// OFFERFILES batches of up to this many records are handled on the runtime.
 const OFFER_INLINE_MAX: usize = 8;
+/// Bytes of OFFERFILES frames that may wait for an offer slot at once
+/// (issue #56). A reconnect storm's batches average a few KB, so this is
+/// thousands of them; past it a batch runs inline as it used to.
+const OFFER_WAIT_BYTES: usize = 64 << 20;
+
+/// A batch waiting for an offer slot, counted in `offer_wait_bytes` until
+/// dropped.
+struct OfferWait<'a> {
+    state: &'a ServerState,
+    bytes: usize,
+}
+
+impl<'a> OfferWait<'a> {
+    fn enter(state: &'a ServerState, bytes: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering::Relaxed;
+        state
+            .offer_wait_bytes
+            .fetch_update(Relaxed, Relaxed, |w| {
+                w.checked_add(bytes).filter(|t| *t <= OFFER_WAIT_BYTES)
+            })
+            .ok()?;
+        Some(Self { state, bytes })
+    }
+}
+
+impl Drop for OfferWait<'_> {
+    fn drop(&mut self) {
+        self.state
+            .offer_wait_bytes
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn bump(state: &ServerState, key: &str) {
+    *state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+}
 
 use crate::server::offerfiles::{
     declared_count, handle_offerfiles, over_hard_limit, parse_offerfiles, soft_limit_message,
@@ -162,6 +198,15 @@ async fn old_session_gone(state: &ServerState, prev: &ClientHandle) -> bool {
 /// produces — three logins from three proxies would turn any user's hash
 /// into a shared one (got3nks). The address count is only reported, in
 /// `/api/takeover`.
+/// A fresh NAT-T proof token (issue #40) from the operating system's random
+/// source (issue #57), or `None` when that source fails.
+pub(crate) fn new_natt_token() -> Option<[u8; 16]> {
+    let b = crate::proto::obfuscation::os_random_bytes(16)?;
+    let mut t = [0u8; 16];
+    t.copy_from_slice(&b);
+    Some(t)
+}
+
 pub(crate) fn is_shared_hash(state: &ServerState, h: &crate::state::UserHash) -> bool {
     if h.iter().filter(|b| **b == 0).count() >= 12 {
         return true;
@@ -956,12 +1001,19 @@ async fn dispatch(
             // And gets a fresh token for its 0x9F (issue #40), if it does
             // NAT-T; proof counters start again with it.
             state.natt_proof_counter.remove(&new_client.user_hash);
-            if crate::server::holepunch::wants_natt_token(&new_client) {
-                let mut t = [0u8; 16];
-                t.copy_from_slice(&crate::proto::obfuscation::random_bytes(16));
-                state.natt_token.insert(new_client.user_hash, t);
-            } else {
-                state.natt_token.remove(&new_client.user_hash);
+            // The token keys the proof's HMAC, so it comes from the OS
+            // random source (issue #57). If that fails the session gets no
+            // token: its 0x9F is then accepted from its own address only.
+            let token = crate::server::holepunch::wants_natt_token(&new_client)
+                .then(new_natt_token)
+                .flatten();
+            match token {
+                Some(t) => {
+                    state.natt_token.insert(new_client.user_hash, t);
+                }
+                None => {
+                    state.natt_token.remove(&new_client.user_hash);
+                }
             }
             let prev = state
                 .clients
@@ -1112,34 +1164,73 @@ async fn dispatch(
                     state.offer_v1.records.fetch_add(n as u64, Relaxed);
                 }
             }
-            let files = parse_offerfiles(&frame.payload)?;
             let warned_before = c.soft_limit_warned;
             // A batch is a content-filter check per record, up to hundreds of
             // records — at the default single runtime thread, all networking
             // stopped while one ran, and a reconnect storm after a restart is
-            // tens of thousands of them back to back. A large batch goes to
-            // the blocking pool when one of OFFER_JOBS slots is free; this
-            // connection waits for its own result (a session's records stay in
-            // order) while every other one keeps being served.
+            // tens of thousands of them back to back. A large batch runs on
+            // the blocking pool, in one of OFFER_JOBS slots; this connection
+            // waits for its own result (a session's records stay in order)
+            // while every other one keeps being served.
             //
-            // With no slot free it runs inline, as it always did. It must not
-            // WAIT for a slot: every waiting connection would hold its parsed
-            // batch, and in a reconnect storm that is tens of thousands of
-            // batches in memory at once. Inline, the runtime is busy and other
-            // connections are not reading theirs — the same bound as before.
+            // With every slot busy it waits for one (issue #56); it used to
+            // run inline, on the runtime, exactly when that hurt most. The
+            // wait holds only the frame already read, not yet parsed, so a
+            // waiting batch costs its wire size and no more. What may wait is
+            // bounded in bytes (OFFER_WAIT_BYTES): past it the batch runs
+            // inline as before, a last resort that is counted. While waiting
+            // the connection reads nothing more, so its client is held back
+            // by TCP, and frames pushed at it keep flowing.
+            //
             // Small batches (the incremental offers of a running eMule) are
             // cheaper inline anyway.
-            let permit = if files.len() > OFFER_INLINE_MAX {
-                Arc::clone(&state.offer_lane).try_acquire_owned().ok()
+            let count = frame
+                .payload
+                .get(..4)
+                .map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+            let permit = if count > OFFER_INLINE_MAX {
+                match Arc::clone(&state.offer_lane).try_acquire_owned() {
+                    Ok(p) => Some(p),
+                    Err(_) => match OfferWait::enter(state, frame.payload.len()) {
+                        Some(waiting) => {
+                            bump(state, "offer_lane_waited");
+                            let p = serve_pushes_while(
+                                Arc::clone(&state.offer_lane).acquire_owned(),
+                                rx,
+                                framed,
+                            )
+                            .await?
+                            .ok();
+                            drop(waiting);
+                            // Replaced while it waited: not indexed under
+                            // this session's id (see the v1 wait above).
+                            let current = state
+                                .clients
+                                .get(&c.user_hash)
+                                .is_some_and(|e| e.same_session(c));
+                            if !current {
+                                return Ok(());
+                            }
+                            p
+                        }
+                        None => {
+                            bump(state, "offer_inline_overload");
+                            None
+                        }
+                    },
+                }
             } else {
                 None
             };
+            let files = parse_offerfiles(&frame.payload)?;
             if let Some(permit) = permit {
                 let st = Arc::clone(state_arc);
                 let mut handle = c.clone();
+                // The permit lives in the job: released when the batch is
+                // done, or on a panic, even if this connection is gone.
                 let handle = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
                     handle_offerfiles(&st, &mut handle, files);
-                    drop(permit);
                     handle
                 })
                 .await
@@ -1200,7 +1291,16 @@ async fn dispatch(
                         .await?;
                 }
                 Err(e) => {
-                    warn!(ip = %peer.ip(), error = %e, "search parse failed");
+                    if crate::proto::search::is_over_budget(&e) {
+                        // Refused before the search lane (issue #54).
+                        *state
+                            .block_stats
+                            .entry("search_tree_over_budget".to_string())
+                            .or_insert(0) += 1;
+                        debug!(ip = %peer.ip(), error = %e, "search tree over budget");
+                    } else {
+                        warn!(ip = %peer.ip(), error = %e, "search parse failed");
+                    }
                     pending_search.clear();
                     let mut p = BytesMut::new();
                     p.put_u32_le(0u32);
@@ -1685,5 +1785,19 @@ mod takeover_tests {
         // The default list holds DLP's community hashes.
         let cb: [u8; 16] = hex::decode("cb42f563ee0ea7907395420cac146ff5").unwrap().try_into().unwrap();
         assert!(is_shared_hash(&ServerState::for_test(), &cb));
+    }
+}
+#[cfg(test)]
+mod natt_token_tests {
+    // Issue #57: each token comes from the OS source, so two are never alike
+    // and none is the all-zero key a failed fill would leave.
+    #[test]
+    fn tokens_are_fresh_per_login() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let t = super::new_natt_token().expect("OS random source");
+            assert_ne!(t, [0u8; 16]);
+            assert!(seen.insert(t));
+        }
     }
 }

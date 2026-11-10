@@ -30,6 +30,57 @@ const CMP_NE: u8 = 0x05;
 
 const MAX_DEPTH: u32 = 24;
 
+/// Nodes one search tree may have (issue #54). The depth limit alone let a
+/// balanced tree stay 12 deep with 8k nodes, each a heap allocation made
+/// before the search waits for its turn. eMule's own searches stay far
+/// below this: a query of a few words plus every advanced field is around
+/// 30 nodes.
+pub const MAX_NODES: u32 = 256;
+/// Bytes of text (terms, meta values, tag names) one tree may copy out.
+pub const MAX_STRING_BYTES: usize = 4096;
+
+/// The error for a tree over `MAX_NODES` or `MAX_STRING_BYTES`, so callers
+/// can count those apart from malformed ones.
+#[derive(Debug)]
+pub struct OverBudget(&'static str);
+
+impl std::fmt::Display for OverBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for OverBudget {}
+
+/// Was this parse refused for size (issue #54) rather than for its format?
+pub fn is_over_budget(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<OverBudget>().is_some()
+}
+
+/// What one parse may still use. Taken before each node or string is
+/// allocated, so a tree over budget is refused having cost at most that.
+struct Budget {
+    nodes: u32,
+    bytes: usize,
+}
+
+impl Budget {
+    fn node(&mut self) -> Result<()> {
+        if self.nodes == 0 {
+            return Err(OverBudget("search tree has too many nodes").into());
+        }
+        self.nodes -= 1;
+        Ok(())
+    }
+    fn bytes(&mut self, n: usize) -> Result<()> {
+        if n > self.bytes {
+            return Err(OverBudget("search tree text too long").into());
+        }
+        self.bytes -= n;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoolOp {
     And,
@@ -169,7 +220,11 @@ pub fn ed2k_file_search(tree: &SearchNode) -> Option<([u8; 16], u64)> {
 
 pub fn parse(payload: &[u8]) -> Result<SearchNode> {
     let mut slice = payload;
-    let node = parse_node(&mut slice, 0)?;
+    let mut budget = Budget {
+        nodes: MAX_NODES,
+        bytes: MAX_STRING_BYTES,
+    };
+    let node = parse_node(&mut slice, 0, &mut budget)?;
     if !slice.is_empty() {
         // Trailing bytes - some clients send them; warn but accept
         tracing::debug!(
@@ -180,10 +235,11 @@ pub fn parse(payload: &[u8]) -> Result<SearchNode> {
     Ok(node)
 }
 
-fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
+fn parse_node(buf: &mut &[u8], depth: u32, budget: &mut Budget) -> Result<SearchNode> {
     if depth > MAX_DEPTH {
         bail!("search tree too deep (>{MAX_DEPTH})");
     }
+    budget.node()?;
     if buf.is_empty() {
         bail!("empty buffer at node start");
     }
@@ -204,18 +260,18 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
                 OP_NOT => BoolOp::Not,
                 other => bail!("unknown bool op 0x{other:02x}"),
             };
-            let left = parse_node(buf, depth + 1)?;
-            let right = parse_node(buf, depth + 1)?;
+            let left = parse_node(buf, depth + 1, budget)?;
+            let right = parse_node(buf, depth + 1, budget)?;
             Ok(SearchNode::Bool(op, Box::new(left), Box::new(right)))
         }
         NODE_STRING => {
-            let s = read_short_string(buf)?;
+            let s = read_short_string(buf, budget)?;
             Ok(SearchNode::Term(s))
         }
         NODE_META => {
             // value (string), then tag_name (string)
-            let value = read_short_string(buf)?;
-            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
+            let value = read_short_string(buf, budget)?;
+            let tag_name = SearchTag::from_bytes(read_tag_name(buf, budget)?);
             Ok(SearchNode::Meta { tag_name, value })
         }
         NODE_NUMERIC32 => {
@@ -225,7 +281,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
             let value = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
             *buf = &buf[4..];
             let op = read_cmp_op(buf)?;
-            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
+            let tag_name = SearchTag::from_bytes(read_tag_name(buf, budget)?);
             Ok(SearchNode::Numeric {
                 tag_name,
                 op,
@@ -241,7 +297,7 @@ fn parse_node(buf: &mut &[u8], depth: u32) -> Result<SearchNode> {
             let value = u64::from_le_bytes(arr);
             *buf = &buf[8..];
             let op = read_cmp_op(buf)?;
-            let tag_name = SearchTag::from_bytes(read_short_bytes(buf)?);
+            let tag_name = SearchTag::from_bytes(read_tag_name(buf, budget)?);
             Ok(SearchNode::Numeric {
                 tag_name,
                 op,
@@ -269,8 +325,18 @@ fn read_short_bytes<'a>(buf: &mut &'a [u8]) -> Result<&'a [u8]> {
 /// A search term or meta value. Decoded lossily: one bad byte from an old or
 /// odd client turns into U+FFFD — that word then matches nothing — instead of
 /// failing the whole request.
-fn read_short_string(buf: &mut &[u8]) -> Result<String> {
-    Ok(String::from_utf8_lossy(read_short_bytes(buf)?).into_owned())
+fn read_short_string(buf: &mut &[u8], budget: &mut Budget) -> Result<String> {
+    let b = read_short_bytes(buf)?;
+    budget.bytes(b.len())?;
+    Ok(String::from_utf8_lossy(b).into_owned())
+}
+
+/// A tag name: counted against the same text budget, since a long one is
+/// copied into a `String` as well.
+fn read_tag_name<'a>(buf: &mut &'a [u8], budget: &mut Budget) -> Result<&'a [u8]> {
+    let b = read_short_bytes(buf)?;
+    budget.bytes(b.len())?;
+    Ok(b)
 }
 
 fn read_cmp_op(buf: &mut &[u8]) -> Result<CmpOp> {
@@ -1800,5 +1866,96 @@ mod markers_are_per_word {
         p.extend_from_slice(b"ed2k::193C85BB48D1F49B859BA1D744BD4D46");
         let tree = parse(&p).unwrap();
         assert!(ed2k_file_search(&tree).is_some());
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    fn term(out: &mut Vec<u8>, t: &[u8]) {
+        out.push(NODE_STRING);
+        out.extend_from_slice(&(t.len() as u16).to_le_bytes());
+        out.extend_from_slice(t);
+    }
+
+    /// A balanced AND tree of `leaves` copies of `t` (a power of two).
+    fn balanced(out: &mut Vec<u8>, leaves: u32, t: &[u8]) {
+        if leaves == 1 {
+            term(out, t);
+        } else {
+            out.extend_from_slice(&[NODE_BOOL, OP_AND]);
+            balanced(out, leaves / 2, t);
+            balanced(out, leaves / 2, t);
+        }
+    }
+
+    #[test]
+    fn ordinary_query_parses() {
+        // "alpha beta" AND type=Video AND size > 1 MB.
+        let mut p = vec![NODE_BOOL, OP_AND, NODE_BOOL, OP_AND];
+        term(&mut p, b"alpha");
+        term(&mut p, b"beta");
+        p.extend_from_slice(&[NODE_BOOL, OP_AND, NODE_META]);
+        p.extend_from_slice(&5u16.to_le_bytes());
+        p.extend_from_slice(b"Video");
+        p.extend_from_slice(&[1, 0, 0x03]);
+        p.extend_from_slice(&[NODE_NUMERIC32]);
+        p.extend_from_slice(&(1u32 << 20).to_le_bytes());
+        p.extend_from_slice(&[CMP_GT, 1, 0, 0x02]);
+        assert!(parse(&p).is_ok());
+    }
+
+    #[test]
+    fn shallow_wide_tree_is_refused() {
+        // Issue #54's example: 4,096 leaves, depth 12, 8,191 nodes.
+        let mut p = Vec::new();
+        balanced(&mut p, 4096, b"alpha");
+        assert_eq!(p.len(), 40_958);
+        let e = parse(&p).unwrap_err();
+        assert!(is_over_budget(&e), "{e}");
+    }
+
+    #[test]
+    fn node_budget_boundary() {
+        // A binary tree's node count is odd, so the boundary is 255 / 257.
+        // AND(T64, T64) = 1 + 127 + 127 = 255 nodes: accepted.
+        let mut ok = vec![NODE_BOOL, OP_AND];
+        balanced(&mut ok, 64, b"a");
+        balanced(&mut ok, 64, b"a");
+        assert!(parse(&ok).is_ok());
+        // AND(that, a) = 257 nodes: refused.
+        let mut over = vec![NODE_BOOL, OP_AND];
+        over.extend_from_slice(&ok);
+        term(&mut over, b"a");
+        assert!(is_over_budget(&parse(&over).unwrap_err()));
+    }
+
+    #[test]
+    fn string_byte_budget_boundary() {
+        let at = vec![b'x'; MAX_STRING_BYTES];
+        let mut p = Vec::new();
+        term(&mut p, &at);
+        assert!(parse(&p).is_ok());
+        let over = vec![b'x'; MAX_STRING_BYTES + 1];
+        let mut p = Vec::new();
+        term(&mut p, &over);
+        assert!(is_over_budget(&parse(&p).unwrap_err()));
+        // Shared across the tree, tag names included.
+        let half = vec![b'x'; MAX_STRING_BYTES / 2];
+        let mut p = vec![NODE_BOOL, OP_AND];
+        term(&mut p, &half);
+        p.push(NODE_META);
+        p.extend_from_slice(&(half.len() as u16).to_le_bytes());
+        p.extend_from_slice(&half);
+        p.extend_from_slice(&1u16.to_le_bytes());
+        p.push(0x03);
+        assert!(is_over_budget(&parse(&p).unwrap_err()));
+    }
+
+    #[test]
+    fn malformed_is_not_over_budget() {
+        let e = parse(&[NODE_BOOL, 0x09]).unwrap_err();
+        assert!(!is_over_budget(&e));
     }
 }

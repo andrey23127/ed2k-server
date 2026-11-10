@@ -4243,7 +4243,9 @@ async fn api_highid_mismatches(
     // calls so two exports from one run can be compared, useless after restart.
     static SALT: once_cell::sync::Lazy<[u8; 16]> = once_cell::sync::Lazy::new(|| {
         let mut b = [0u8; 16];
-        b.copy_from_slice(&crate::proto::obfuscation::random_bytes(16)[..16]);
+        // OS source (issue #57): a guessable salt would let anyone holding
+        // an export brute-force the IPv4 space back out of the pseudonyms.
+        b.copy_from_slice(&crate::admin_auth::random_bytes::<16>());
         b
     });
     let show_ip = |ip: std::net::IpAddr| -> serde_json::Value {

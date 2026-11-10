@@ -2613,6 +2613,14 @@ impl UdpServer {
         let tree = match parse_search(payload) {
             Ok(t) => t,
             Err(e) => {
+                if crate::proto::search::is_over_budget(&e) {
+                    // Refused before admission (issue #54).
+                    *self
+                        .state
+                        .block_stats
+                        .entry("search_tree_over_budget".to_string())
+                        .or_insert(0) += 1;
+                }
                 debug!(ip = %peer.ip(), error = %e, "UDP search parse failed");
                 return Ok(());
             }
@@ -2713,9 +2721,11 @@ fn udp_search_ranked(
     // examined, plus one to tell that the cap was hit.
     let scan_budget = (state.live_cfg.load().limits.search_rank_scan as usize)
         .max(UDP_MAX_SEARCH_RESULTS);
-    let candidate_ids = state
-        .keyword_index
-        .find_grouped_capped(&groups, scan_budget.saturating_mul(2).saturating_add(1));
+    let candidate_ids = crate::server::search::candidates(
+        state,
+        &groups,
+        scan_budget.saturating_mul(2).saturating_add(1),
+    );
 
     // Ranked by source count, exactly as the TCP path does.
     //

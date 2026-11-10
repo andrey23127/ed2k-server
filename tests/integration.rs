@@ -949,3 +949,112 @@ async fn a_replaced_session_of_a_shared_hash_keeps_working() {
     assert!(next.is_err() || matches!(next, Ok(Some(Ok(_)))), "still open");
     assert!(state.block_stats.get("replaced_session_frame_refused").is_none());
 }
+
+/// A large OFFERFILES batch with every offer slot busy waits for one off the
+/// runtime instead of running on it (issue #56). The test runtime has one
+/// thread, so a ticker that keeps running during the wait shows the runtime
+/// stayed free; the batch is indexed once a slot opens.
+#[tokio::test]
+async fn a_large_batch_waits_for_an_offer_slot_off_the_runtime() {
+    let (port, state) = spawn_test_server().await;
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut f = Framed::new(stream, Ed2kCodec::new(1_000_000));
+    f.send(Frame::new(OP_LOGINREQUEST, build_login([0x56; 16], 4662, "big")))
+        .await
+        .unwrap();
+    while let Ok(Some(Ok(_))) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), f.next()).await
+    {}
+
+    // Every slot taken.
+    let slots = Arc::clone(&state.offer_lane)
+        .acquire_many_owned(ed2k_server::state::OFFER_JOBS as u32)
+        .await
+        .unwrap();
+    let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let t = Arc::clone(&ticks);
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
+    let n = 40u8;
+    let mut p = BytesMut::new();
+    p.put_u32_le(n as u32);
+    for i in 0..n {
+        let one = build_offerfiles([0x60 + i; 16], &format!("batchfile{i}.bin"), 1000 + i as u64);
+        p.put_slice(&one[4..]);
+    }
+    f.send(Frame::new(OP_OFFERFILES, p.to_vec())).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(ticks.load(std::sync::atomic::Ordering::Relaxed) >= 10, "runtime kept running");
+    assert_eq!(state.block_stats.get("offer_lane_waited").map(|v| *v), Some(1));
+    assert!(state.block_stats.get("offer_inline_overload").is_none());
+    assert!(state.file_slab.get_by_hash(&[0x60; 16]).is_none(), "still waiting");
+    assert!(state.offer_wait_bytes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    drop(slots);
+    let mut indexed = false;
+    for _ in 0..100 {
+        if state.file_slab.get_by_hash(&[0x60 + n - 1; 16]).is_some() {
+            indexed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(indexed, "indexed once a slot opened");
+    assert_eq!(state.offer_wait_bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // Every slot is back once the job is done.
+    for _ in 0..100 {
+        if state.offer_lane.available_permits() == ed2k_server::state::OFFER_JOBS {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(state.offer_lane.available_permits(), ed2k_server::state::OFFER_JOBS);
+    ticker.abort();
+}
+
+/// A shallow but wide search tree is refused while parsing, before it is
+/// queued for the search lane (issue #54): an empty result, and counted.
+#[tokio::test]
+async fn a_wide_search_tree_is_refused_before_the_search_lane() {
+    let (port, state) = spawn_test_server().await;
+    let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut f = Framed::new(stream, Ed2kCodec::new(1_000_000));
+    f.send(Frame::new(OP_LOGINREQUEST, build_login([0x54; 16], 4662, "wide")))
+        .await
+        .unwrap();
+    while let Ok(Some(Ok(_))) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), f.next()).await
+    {}
+    // 4,096 copies of "alpha" under ANDs: depth 12, 8,191 nodes.
+    fn tree(out: &mut Vec<u8>, leaves: u32) {
+        if leaves == 1 {
+            out.extend_from_slice(&[0x01, 5, 0]);
+            out.extend_from_slice(b"alpha");
+        } else {
+            out.extend_from_slice(&[0x00, 0x00]);
+            tree(out, leaves / 2);
+            tree(out, leaves / 2);
+        }
+    }
+    let mut p = Vec::new();
+    tree(&mut p, 4096);
+    f.send(Frame::new(OP_SEARCHREQUEST, p)).await.unwrap();
+    let reply = loop {
+        let fr = tokio::time::timeout(std::time::Duration::from_secs(2), f.next())
+            .await
+            .expect("a reply")
+            .unwrap()
+            .unwrap();
+        if fr.opcode == OP_SEARCHRESULT {
+            break fr;
+        }
+    };
+    assert_eq!(&reply.payload[..4], &[0, 0, 0, 0], "no results");
+    assert_eq!(state.block_stats.get("search_tree_over_budget").map(|v| *v), Some(1));
+}

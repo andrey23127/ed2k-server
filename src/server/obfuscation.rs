@@ -237,7 +237,9 @@ impl TcpObfuscation {
         // Skip padding (optional trailing bytes)
 
         // Generate server private exponent (16 random bytes)
-        let b_priv = random_bytes(DH_PRIVATE_SIZE);
+        // OS source first (issue #57); obfuscation only, so it may fall back.
+        let b_priv = crate::proto::obfuscation::os_random_bytes(DH_PRIVATE_SIZE)
+            .unwrap_or_else(|| random_bytes(DH_PRIVATE_SIZE));
         let b_pub = dh_pow_mod(&b_priv);
         let shared = dh_shared(a_pub, &b_priv);
 

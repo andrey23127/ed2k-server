@@ -246,7 +246,10 @@ impl TcpObfuscation {
         // Skip padding (optional trailing bytes)
 
         // Generate server private exponent (16 random bytes)
-        let b_priv = random_bytes(DH_PRIVATE_SIZE);
+        // The DH private exponent from the OS source (issue #57): with the
+        // clock-seeded generator an observer could narrow it down and read
+        // the stream. Obfuscation only, so a failing source falls back.
+        let b_priv = os_random_bytes(DH_PRIVATE_SIZE).unwrap_or_else(|| random_bytes(DH_PRIVATE_SIZE));
         let b_pub = dh_pow_mod(&b_priv);
         let shared = dh_shared(a_pub, &b_priv);
 
@@ -333,6 +336,16 @@ impl TcpObfuscation {
 }
 
 // ─── Platform PRNG helpers ────────────────────────────────────────────────────
+
+/// `n` bytes from the operating system's random source, or `None` if it
+/// fails. For anything whose output must not be guessable: keys, tokens,
+/// salts (issue #57). There is no fallback to `random_bytes`: a caller that
+/// gets `None` goes without, it does not get predictable bytes instead.
+pub(crate) fn os_random_bytes(n: usize) -> Option<Vec<u8>> {
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).ok()?;
+    Some(b)
+}
 
 pub(crate) fn random_bytes(n: usize) -> Vec<u8> {
     use std::collections::hash_map::DefaultHasher;

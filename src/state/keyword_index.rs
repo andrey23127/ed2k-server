@@ -416,6 +416,22 @@ fn tokenize_into<F: FnMut(&str)>(filename: &str, mut visit: F) {
     }
 }
 
+/// Ids one search's seed may hold before narrowing (issue #55): 1 MB.
+pub const SEED_LIMIT: usize = 256 * 1024;
+/// Ids one search may decode from the other groups' postings (issue #55).
+/// A few milliseconds of varint decoding; an ordinary query uses a fraction.
+pub const VISIT_BUDGET: usize = 4_000_000;
+
+/// Which bound of `find_grouped_bounded` cut its answer short, if any.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Bounded {
+    /// The seed was a prefix: files above its last id are missing.
+    pub seed_cut: bool,
+    /// The visit budget ran out: the tail was dropped and the last group
+    /// did not narrow what was kept.
+    pub visits_cut: bool,
+}
+
 /// Inverted index: token-hash -> SORTED, DEDUPED list of FileIds.
 ///
 /// Key is a 32-bit FNV-1a hash of the lowercase token (see `token_hash`), not
@@ -722,23 +738,180 @@ impl KeywordIndex {
         result
     }
 
-    /// `find_grouped`, but a query of ONE plain word returns only its first
-    /// `cap` ids (ascending) instead of the whole posting.
+    /// The first `cap` ids (ascending) of `find_grouped`'s answer, built with
+    /// bounded work (issue #55).
     ///
     /// The search paths examine candidates in id order and stop after
-    /// `search_rank_scan` of them, so for a single common word ("mp3", "avi")
-    /// every id past that point was decoded and allocated for nothing — a
-    /// posting of millions per query. Here the cold blob is walked with a
-    /// cursor and merged with the hot tier only up to `cap`. Callers pass a
-    /// cap with headroom over their scan budget, so what they examine is
-    /// unchanged. Any other query shape is answered by `find_grouped` in full.
+    /// `search_rank_scan` of them, so ids past the first `cap` were decoded,
+    /// allocated and sorted for nothing. One plain word was already walked
+    /// with a cursor up to `cap`; every other shape built its full answer.
+    /// Now every shape is bounded twice:
+    ///
+    /// - The seed (the rarest group) is taken as a prefix of at most
+    ///   `SEED_LIMIT` ids, split among an OR group's words. Every later step
+    ///   only narrows it, so this bounds what is allocated.
+    /// - Ids decoded from the other groups' postings count against
+    ///   `VISIT_BUDGET`. A sparse intersection of two common words can walk
+    ///   far through a posting while keeping few ids; this bounds that.
+    ///
+    /// Within those bounds the answer is exact: the seed prefix ends at a
+    /// known id, and every file below it is checked against every group.
+    /// Past them it is partial, and errs one way only. A seed cut short
+    /// loses files above its last id (fewer results, never wrong ones). A
+    /// spent visit budget keeps the ids checked so far and stops narrowing:
+    /// some may fail a group, and the caller's check of each file against
+    /// the whole query drops those, as it does hash collisions.
     pub fn find_grouped_capped(&self, groups: &[Vec<String>], cap: usize) -> Vec<FileId> {
-        if let [g] = groups {
-            if let [t] = g.as_slice() {
-                return self.materialize_prefix(token_hash(t), cap);
+        self.find_grouped_bounded(groups, cap, SEED_LIMIT, VISIT_BUDGET).0
+    }
+
+    /// `find_grouped_capped` with explicit limits, also saying whether one of
+    /// them cut the answer short.
+    pub fn find_grouped_bounded(
+        &self,
+        groups: &[Vec<String>],
+        cap: usize,
+        seed_limit: usize,
+        visit_budget: usize,
+    ) -> (Vec<FileId>, Bounded) {
+        let mut bounded = Bounded::default();
+        if groups.is_empty() || cap == 0 {
+            return (Vec::new(), bounded);
+        }
+        // Hash, dedup within each group, then drop repeated groups:
+        // `[[a], [a]]` is `[[a]]`. A word no file holds is no alternative, so
+        // it leaves its OR group; a group left with none empties the answer.
+        let mut gs: Vec<Vec<TokenHash>> = Vec::with_capacity(groups.len());
+        for g in groups {
+            let mut hs: Vec<TokenHash> = g.iter().map(|t| token_hash(t)).collect();
+            hs.sort_unstable();
+            hs.dedup();
+            hs.retain(|h| self.approx_len(*h) > 0);
+            if hs.is_empty() {
+                return (Vec::new(), bounded);
+            }
+            if !gs.contains(&hs) {
+                gs.push(hs);
             }
         }
-        self.find_grouped(groups)
+        // One word: the cursor walk to `cap`, no budget needed.
+        if let [g] = gs.as_slice() {
+            if let [h] = g.as_slice() {
+                return (self.materialize_prefix(*h, cap), bounded);
+            }
+        }
+        // Rarest group first: the seed, then the others narrowing it, the
+        // smallest ones first so the set shrinks soonest.
+        let size = |g: &Vec<TokenHash>| -> usize {
+            g.iter().map(|h| self.approx_len(*h)).fold(0usize, usize::saturating_add)
+        };
+        gs.sort_by_cached_key(size);
+
+        // The seed: a prefix of each word's posting, `seed_limit` split among
+        // them. Where a word was cut, ids above its last one may be missing
+        // from the union, so the union stops there.
+        let seed_group = &gs[0];
+        let per_word = (seed_limit / seed_group.len()).max(1);
+        let mut result: Vec<FileId> = Vec::new();
+        let mut boundary: Option<FileId> = None;
+        for h in seed_group {
+            let part = self.materialize_prefix(*h, per_word);
+            // Full, and the posting holds more: cut at its last id.
+            if part.len() >= per_word && self.approx_len(*h) > part.len() {
+                if let Some(&last) = part.last() {
+                    boundary = Some(boundary.map_or(last, |b: FileId| b.min(last)));
+                }
+            }
+            result.extend_from_slice(&part);
+        }
+        if seed_group.len() > 1 {
+            result.sort_unstable();
+            result.dedup();
+        }
+        if let Some(b) = boundary {
+            result.retain(|id| *id <= b);
+            bounded.seed_cut = true;
+        }
+
+        // Narrow by each other group. Membership is tested with each word's
+        // guards held alone, in the usual cold → hot → pending order.
+        let mut visits = 0usize;
+        'groups: for g in &gs[1..] {
+            if result.is_empty() {
+                break;
+            }
+            let mut hit = vec![false; result.len()];
+            for h in g {
+                let (stop, used) = self.mark_members(*h, &result, &mut hit, visit_budget.saturating_sub(visits));
+                visits = visits.saturating_add(used);
+                if let Some(i) = stop {
+                    // Budget spent at `result[i]`: keep what was checked so
+                    // far, unnarrowed by this group.
+                    result.truncate(i);
+                    bounded.visits_cut = true;
+                    break 'groups;
+                }
+            }
+            let mut k = 0;
+            result.retain(|_| {
+                let keep = hit[k];
+                k += 1;
+                keep
+            });
+        }
+        // A cut seed only matters if it left the answer short of `cap`.
+        bounded.seed_cut &= result.len() < cap;
+        result.truncate(cap);
+        (result, bounded)
+    }
+
+    /// Set `hit[i]` for every `ids[i]` the word `th` holds. `ids` ascending.
+    /// Stops once more than `budget` ids were decoded from its cold blob and
+    /// returns the index it stopped at, with the number decoded.
+    fn mark_members(
+        &self,
+        th: TokenHash,
+        ids: &[FileId],
+        hit: &mut [bool],
+        budget: usize,
+    ) -> (Option<usize>, usize) {
+        let cold_ref = self.cold.get(th);
+        let hot_ref = self.hot.get(&th);
+        if cold_ref.is_none() && hot_ref.is_none() {
+            return (None, 0);
+        }
+        let pend_ref = self.pending_removals.get(&th);
+        let pv: &[FileId] = pend_ref.as_ref().map_or(&[], |p| p.value().as_slice());
+        let hv: &[FileId] = hot_ref.as_ref().map_or(&[], |h| h.value().as_slice());
+        let mut cursor = cold_ref
+            .as_ref()
+            .and_then(|c| posting_codec::PostingCursor::new(c.value()));
+        // Decoded ids are counted step by step: one far-off target can walk
+        // a whole posting, so a check between targets would not bound it.
+        let mut used = 0usize;
+        for (i, id) in ids.iter().enumerate() {
+            if hit[i] {
+                continue;
+            }
+            let mut in_cold = false;
+            if let Some(c) = cursor.as_mut() {
+                while let Some(head) = c.peek() {
+                    if head.0 >= id.0 {
+                        in_cold = head == *id;
+                        break;
+                    }
+                    if used >= budget {
+                        return (Some(i), used);
+                    }
+                    c.bump();
+                    used += 1;
+                }
+            }
+            if (in_cold && pv.binary_search(id).is_err()) || hv.binary_search(id).is_ok() {
+                hit[i] = true;
+            }
+        }
+        (None, used)
     }
 
     /// The first `cap` ids of merge(cold − pending, hot), ascending, deduped.
@@ -1468,9 +1641,9 @@ mod tests {
             let got = idx.find_grouped_capped(&groups, cap);
             assert_eq!(got, full[..cap.min(full.len())].to_vec(), "cap {cap}");
         }
-        // Not a single word: the full answer.
+        // Not a single word: a prefix of the full answer as well (#55).
         let two = vec![vec!["delta".to_string()], vec!["bin".to_string()]];
-        assert_eq!(idx.find_grouped_capped(&two, 3), idx.find_grouped(&two));
+        assert_eq!(idx.find_grouped_capped(&two, 3), idx.find_grouped(&two)[..3].to_vec());
     }
 
     #[test]
@@ -1915,5 +2088,122 @@ mod tests {
         // would intersect four postings, three enormous, for the same answer.
         assert_eq!(tokenize_search_term("S01E08"), vec!["s01e08"]);
         assert_eq!(tokenize_search_term("1080p"), vec!["1080p"]);
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use crate::state::file_id::FileId;
+
+    fn g(groups: &[&[&str]]) -> Vec<Vec<String>> {
+        groups
+            .iter()
+            .map(|g| g.iter().map(|t| t.to_string()).collect())
+            .collect()
+    }
+
+    /// 1,000 files hold "alpha"; every 3rd "beta", every 5th "gamma", every
+    /// 7th "delta"; file 999 alone "omega". Half compacted, so both tiers
+    /// and pending removals are in play.
+    fn index() -> KeywordIndex {
+        let idx = KeywordIndex::new();
+        let name = |i: u32| {
+            let mut n = String::from("alpha");
+            for (k, w) in [(3, "beta"), (5, "gamma"), (7, "delta")] {
+                if i % k == 0 {
+                    n.push(' ');
+                    n.push_str(w);
+                }
+            }
+            if i == 999 {
+                n.push_str(" omega");
+            }
+            n
+        };
+        for i in 0..600u32 {
+            idx.add_file(FileId(i), &name(i));
+        }
+        idx.compact();
+        for i in 600..1000u32 {
+            idx.add_file(FileId(i), &name(i));
+        }
+        for i in (0..600u32).step_by(50) {
+            idx.remove_file(FileId(i), &name(i));
+        }
+        idx
+    }
+
+    #[test]
+    fn repeated_word_takes_the_single_word_path() {
+        // Issue #55's example: [[alpha], [alpha]] with cap 32.
+        let idx = index();
+        let (got, b) = idx.find_grouped_bounded(&g(&[&["alpha"], &["alpha"]]), 32, 8, 8);
+        assert_eq!(got, idx.find_grouped(&g(&[&["alpha"]]))[..32].to_vec());
+        assert_eq!(b, Bounded::default());
+    }
+
+    #[test]
+    fn prefix_of_the_reference_within_budget() {
+        let idx = index();
+        let shapes = [
+            g(&[&["alpha"]]),
+            g(&[&["alpha"], &["beta"]]),
+            g(&[&["beta"], &["gamma"]]),
+            g(&[&["alpha"], &["beta", "gamma"]]),
+            g(&[&["beta", "gamma"], &["delta", "omega"]]),
+            g(&[&["alpha"], &["beta"], &["gamma"], &["delta"]]),
+            g(&[&["alpha"], &["omega"]]),
+            g(&[&["alpha"], &["nosuchword"]]),
+            g(&[&["beta", "nosuchword"]]),
+        ];
+        for s in &shapes {
+            let full = idx.find_grouped(s);
+            for cap in [1usize, 5, 32, 10_000] {
+                let (got, b) = idx.find_grouped_bounded(s, cap, SEED_LIMIT, VISIT_BUDGET);
+                assert_eq!(got, full[..cap.min(full.len())].to_vec(), "{s:?} cap {cap}");
+                assert_eq!(b, Bounded::default(), "{s:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn seed_limit_bounds_the_seed_and_stays_exact_below_it() {
+        let idx = index();
+        let s = g(&[&["beta"], &["gamma"]]);
+        let full = idx.find_grouped(&s);
+        // A 40-id seed of "beta" (or "gamma") ends near id 120: what comes
+        // back is exactly the reference's ids up to there.
+        let (got, b) = idx.find_grouped_bounded(&s, 10_000, 40, VISIT_BUDGET);
+        assert!(b.seed_cut);
+        assert!(got.len() < full.len());
+        assert_eq!(got, full[..got.len()].to_vec());
+        // With enough answers inside the seed, nothing is reported cut.
+        let (got, b) = idx.find_grouped_bounded(&s, 3, 40, VISIT_BUDGET);
+        assert_eq!(got, full[..3].to_vec());
+        assert!(!b.seed_cut);
+    }
+
+    #[test]
+    fn visit_budget_bounds_decoding_and_never_loses_a_match_it_kept() {
+        let idx = index();
+        // "omega" is the rarest; "alpha" must be walked all the way to 999.
+        let s = g(&[&["omega"], &["alpha"]]);
+        let (got, b) = idx.find_grouped_bounded(&s, 32, SEED_LIMIT, 0);
+        assert!(b.visits_cut);
+        // Whatever was kept is a subset of the seed, in order.
+        assert!(got.iter().all(|id| *id == FileId(999)));
+        // And a common pair with a tiny budget returns a superset of the
+        // true answer's prefix, never ids outside the seed.
+        let s = g(&[&["beta"], &["alpha"], &["gamma"]]);
+        let beta = idx.find_grouped(&g(&[&["beta"]]));
+        let (got, b) = idx.find_grouped_bounded(&s, 10_000, SEED_LIMIT, 300);
+        assert!(b.visits_cut);
+        assert!(got.iter().all(|id| beta.binary_search(id).is_ok()));
+        let full = idx.find_grouped(&s);
+        let last = got.last().copied().unwrap_or(FileId(0));
+        for id in full.iter().filter(|id| **id < last) {
+            assert!(got.contains(id), "lost {id:?}");
+        }
     }
 }

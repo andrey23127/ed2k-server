@@ -378,9 +378,7 @@ pub fn handle_search(
     if keyword_filtered {
         // Headroom over the scan budget: a tombstoned id is skipped without
         // being counted, so a few more than rank_scan are taken.
-        let ids = state
-            .keyword_index
-            .find_grouped_capped(&groups, rank_scan.saturating_mul(2).saturating_add(1));
+        let ids = crate::server::search::candidates(state, &groups, rank_scan.saturating_mul(2).saturating_add(1));
         n_candidates = ids.len();
         for fid in ids {
             // A tombstoned id yields None and is skipped — it can't be a live
@@ -555,6 +553,28 @@ pub fn build_search_result_page(
     payload.put_u8(if has_more { 1 } else { 0 });
 
     Frame::new(OP_SEARCHRESULT, payload.to_vec())
+}
+
+/// The candidate ids for a keyword search, the first `cap` in id order,
+/// with bounded work (issue #55). A cut answer is counted.
+pub(crate) fn candidates(
+    state: &ServerState,
+    groups: &[Vec<String>],
+    cap: usize,
+) -> Vec<crate::state::file_id::FileId> {
+    use crate::state::keyword_index::{SEED_LIMIT, VISIT_BUDGET};
+    let (ids, b) = state
+        .keyword_index
+        .find_grouped_bounded(groups, cap, SEED_LIMIT, VISIT_BUDGET);
+    for (cut, key) in [
+        (b.seed_cut, "search_candidates_seed_cut"),
+        (b.visits_cut, "search_candidates_visits_cut"),
+    ] {
+        if cut {
+            *state.block_stats.entry(key.to_string()).or_insert(0) += 1;
+        }
+    }
+    ids
 }
 
 #[cfg(test)]
