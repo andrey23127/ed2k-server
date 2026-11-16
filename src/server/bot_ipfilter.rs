@@ -16,6 +16,13 @@
 //! guarding.p2p whole). So every address added is also recorded in
 //! `bot-ipfilter.txt` next to the config, and put back into the filter file
 //! before each load of it: at startup and on every reload.
+//!
+//! Off by default since 0.9.89 (`bots.ipfilter_min_dropped = 0`). Most of
+//! the addresses it caught were phones on mobile carriers and CGNAT: dynamic,
+//! shared by many users, and only throttled for a buggy client. With it off,
+//! the lines this module wrote are taken out of the filter file again (only
+//! those: the exact `bot` line of an address in the list), and the list is
+//! set aside as `bot-ipfilter.txt.old`, so turning it on later starts empty.
 
 use crate::state::ServerState;
 use std::io::Write;
@@ -98,6 +105,71 @@ pub fn reassert(filter: &Path, list: &Path) -> usize {
         }
     }
     n
+}
+
+/// Take the lines this module wrote out of the filter file: the exact `bot`
+/// line of each address in `list`, nothing else. Returns how many went.
+pub fn withdraw(filter: &Path, list: &Path) -> std::io::Result<usize> {
+    let Ok(text) = std::fs::read_to_string(list) else { return Ok(0) };
+    let ours: std::collections::HashSet<String> = text
+        .lines()
+        .filter_map(|l| l.split_whitespace().next()?.parse::<Ipv4Addr>().ok())
+        .map(format_line)
+        .collect();
+    if ours.is_empty() {
+        return Ok(0);
+    }
+    let content = match std::fs::read(filter) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut removed = 0;
+    let mut out = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        if ours.contains(line.trim_end_matches(['\r', '\n'])) {
+            removed += 1;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if removed > 0 {
+        // Written beside and renamed over: a reader sees the old file or the
+        // new one, never half of it.
+        let tmp = filter.with_extension("p2p.botwithdraw");
+        std::fs::write(&tmp, out)?;
+        std::fs::rename(&tmp, filter)?;
+    }
+    Ok(removed)
+}
+
+/// Before each load of the filter file: put the recorded bots back when the
+/// feature is on, take them out (once) when it is off. Returns (added,
+/// removed).
+pub fn sync(filter: &Path, list: &Path, enabled: bool) -> (usize, usize) {
+    if enabled {
+        return (reassert(filter, list), 0);
+    }
+    if !list.exists() {
+        return (0, 0);
+    }
+    match withdraw(filter, list) {
+        Ok(n) => {
+            let mut old = list.as_os_str().to_owned();
+            old.push(".old");
+            if let Err(e) = std::fs::rename(list, PathBuf::from(old)) {
+                tracing::warn!(path = %list.display(), error = %e, "bot ipfilter: cannot set the list aside");
+            }
+            if n > 0 {
+                tracing::info!(n, "bot ipfilter is off: its lines were taken out of the IP filter file");
+            }
+            (0, n)
+        }
+        Err(e) => {
+            tracing::warn!(path = %filter.display(), error = %e, "bot ipfilter: cannot withdraw");
+            (0, 0)
+        }
+    }
 }
 
 /// Add `ip` to the IP filter and reload it, off the caller's thread. A no-op
@@ -186,6 +258,36 @@ mod tests {
         assert_eq!(reassert(&f, &list), 1);
         assert_eq!(reassert(&f, &list), 0);
         assert!(crate::filter::ipfilter::IpFilter::load(&f).is_blocked(ip));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turned_off_it_takes_out_only_its_own_lines_once() {
+        let dir = std::env::temp_dir().join(format!("botipf-off-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("guarding.p2p");
+        let list = dir.join("bot-ipfilter.txt");
+        let a: Ipv4Addr = "39.190.12.106".parse().unwrap();
+        let b: Ipv4Addr = "101.71.39.135".parse().unwrap();
+        // An operator's single-address line with another description stays.
+        let theirs = "009.009.009.009 - 009.009.009.009 , 000 , operator";
+        std::fs::write(
+            &f,
+            format!("001.000.000.000 - 001.000.000.255 , 000 , range\r\n{}\r\n{theirs}\r\n{}\r\n", format_line(a), format_line(b)),
+        )
+        .unwrap();
+        remember(&list, a).unwrap();
+        remember(&list, b).unwrap();
+        assert_eq!(sync(&f, &list, false), (0, 2));
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(text, format!("001.000.000.000 - 001.000.000.255 , 000 , range\r\n{theirs}\r\n"));
+        assert!(!crate::filter::ipfilter::IpFilter::load(&f).is_blocked(a));
+        // The list is set aside: nothing more to do, and turning it on again
+        // does not bring the old addresses back.
+        assert!(!list.exists());
+        assert!(dir.join("bot-ipfilter.txt.old").exists());
+        assert_eq!(sync(&f, &list, false), (0, 0));
+        assert_eq!(sync(&f, &list, true), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

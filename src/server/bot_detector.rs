@@ -501,10 +501,12 @@ pub fn note_banned(state: &Arc<ServerState>, ip: IpAddr, datagram: &[u8]) {
         }
     }
     // Kept sending into silence long enough: into the IP filter for good.
-    // Exactly at the threshold, so it is tried once per source.
+    // Exactly at the threshold, so it is tried once per source. Banned
+    // sources only: a throttled one is a client that asks too often, nearly
+    // always a phone on a shared, dynamic carrier address, and is still
+    // answered at `throttle_qpm`.
     let min = state.live_cfg.load().bots.ipfilter_min_dropped;
-    let need = if d.throttled { min.saturating_mul(10) } else { min };
-    if min > 0 && !d.ipfilter_added && d.dropped_after_ban >= need {
+    if min > 0 && !d.throttled && !d.ipfilter_added && d.dropped_after_ban >= min {
         if let IpAddr::V4(v4) = key {
             d.ipfilter_added = true;
             let entry = ledger_entry("ipfilter_added", key, &d);
@@ -911,6 +913,27 @@ mod scan_rule_tests {
     }
 
     #[test]
+    fn a_throttled_source_never_goes_to_the_ipfilter_and_none_by_default() {
+        // Off by default since 0.9.89.
+        assert_eq!(crate::config::BotsConfig::default().ipfilter_min_dropped, 0);
+        let s = st();
+        let mut cfg = (**s.live_cfg.load()).clone();
+        cfg.bots.ipfilter_min_dropped = 3;
+        s.live_cfg.store(Arc::new(cfg));
+        let ip: IpAddr = "198.51.100.42".parse().unwrap();
+        for i in 0..3000u32 {
+            record_sources(&s, ip, &[h(i % 2)], true);
+        }
+        assert!(s.bot_detections.get(&ip).unwrap().throttled);
+        for _ in 0..1000 {
+            note_banned(&s, ip, &[0x4F]);
+        }
+        let d = s.bot_detections.get(&ip).unwrap();
+        assert!(d.dropped_after_ban >= 1000);
+        assert!(!d.ipfilter_added);
+    }
+
+    #[test]
     fn many_files_asked_a_few_times_each_is_neither() {
         // 2 500 requests over 500 files: too few different files for a
         // scanner, too few requests for a hammer.
@@ -951,11 +974,11 @@ mod scan_rule_tests {
 
     #[test]
     fn files_asked_again_and_again_are_not_a_scan() {
-        // jdonkey with 1 000 downloads, ten minutes in: each asked about ten
+        // jdonkey with 1 000 downloads, half an hour in: each asked about ten
         // times. Built up with the rule off, then judged on the next request.
         let s = st();
         let ip: IpAddr = "198.51.100.38".parse().unwrap();
-        s.scan_windows.insert(ip, ScanWindow::started_ago(Duration::from_secs(11 * 60)));
+        s.scan_windows.insert(ip, ScanWindow::started_ago(Duration::from_secs(31 * 60)));
         let set = |n: u64| {
             let mut cfg = (**s.live_cfg.load()).clone();
             cfg.bots.scan_min_files = n;
@@ -973,11 +996,25 @@ mod scan_rule_tests {
         assert!(!s.is_bot_banned(ip));
         // The same volume, each file once: a scan.
         let ip2: IpAddr = "198.51.100.40".parse().unwrap();
-        s.scan_windows.insert(ip2, ScanWindow::started_ago(Duration::from_secs(11 * 60)));
+        s.scan_windows.insert(ip2, ScanWindow::started_ago(Duration::from_secs(31 * 60)));
         for i in 0..2000 {
             record_sources(&s, ip2, &[h(10_000 + i)], true);
         }
         assert!(s.is_bot_banned(ip2));
+        // An eMule with 1 000 downloads asks its server again about every 13
+        // minutes: at half an hour, each about twice (seen 15.11 as 1.7-1.8x
+        // at 25 min, banned by the old 3x rule). Not a scan.
+        let ip3: IpAddr = "198.51.100.41".parse().unwrap();
+        s.scan_windows.insert(ip3, ScanWindow::started_ago(Duration::from_secs(31 * 60)));
+        set(u64::MAX);
+        for _ in 0..2 {
+            for i in 0..1000 {
+                record_sources(&s, ip3, &[h(20_000 + i)], true);
+            }
+        }
+        set(2000);
+        record_sources(&s, ip3, &[h(20_000)], true);
+        assert!(!s.is_bot_banned(ip3));
     }
 
     #[test]

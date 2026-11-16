@@ -497,7 +497,27 @@ impl ContentFilter {
     }
 
     pub fn check(&self, file_hash: &[u8; 16], filename: &str) -> FilterResult {
-        self.check_inner(file_hash, filename, true)
+        self.check_inner(file_hash, filename, true, true)
+    }
+
+    /// Is this hash on the blocklist (`hash_banlist`, L3)?
+    pub fn is_banlisted(&self, file_hash: &[u8; 16]) -> bool {
+        self.hash_blocklist.load().contains(file_hash)
+    }
+
+    /// Is this hash on the poisoned-index list (`hash_filter`, L5)?
+    pub fn is_hash_filtered(&self, file_hash: &[u8; 16]) -> bool {
+        self.hash_filter_set.load().contains(file_hash)
+    }
+
+    /// What the term layers (L1, L2, L4) say about a NAME, with every hash
+    /// list set aside: the whitelist, the blocklist and the poisoned-index
+    /// list. For the name history, whose evidence must not depend on the
+    /// lists it is meant to rebuild (a hash on the blocklist otherwise gets
+    /// only "L3 hash", whatever its names say); never for a publish
+    /// decision.
+    pub fn check_terms(&self, filename: &str) -> FilterResult {
+        self.check_inner(&[0u8; 16], filename, false, false)
     }
 
     /// Is this hash on the false-positive whitelist?
@@ -509,10 +529,16 @@ impl ContentFilter {
     /// a whitelisted file next to the layer it would otherwise trip
     /// (`/api/indexcheck`); never for a publish decision.
     pub fn check_ignoring_whitelist(&self, file_hash: &[u8; 16], filename: &str) -> FilterResult {
-        self.check_inner(file_hash, filename, false)
+        self.check_inner(file_hash, filename, false, true)
     }
 
-    fn check_inner(&self, file_hash: &[u8; 16], filename: &str, whitelist: bool) -> FilterResult {
+    fn check_inner(
+        &self,
+        file_hash: &[u8; 16],
+        filename: &str,
+        whitelist: bool,
+        hash_lists: bool,
+    ) -> FilterResult {
         // Whitelist first, and it now overrides EVERY layer rather than only the
         // hash lists.
         //
@@ -533,7 +559,7 @@ impl ContentFilter {
         }
 
         // Hash checks — O(1), fastest rejection.
-        if self.hash_blocklist.load().contains(file_hash) {
+        if hash_lists && self.hash_blocklist.load().contains(file_hash) {
             return FilterResult::Block(Layer::L3HashBlock, "hash".to_string());
         }
 
@@ -542,7 +568,7 @@ impl ContentFilter {
         // spam name stuffed with porn tags that L1/L4 would fire on. Letting a
         // term layer win would re-attach the CSAM accusation the poison list
         // exists to detach, and would count an ordinary downloader toward a ban.
-        if self.hash_filter_set.load().contains(file_hash) {
+        if hash_lists && self.hash_filter_set.load().contains(file_hash) {
             return FilterResult::Block(Layer::L5Poison, "poison".to_string());
         }
 

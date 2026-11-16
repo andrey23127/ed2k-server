@@ -210,7 +210,7 @@ pub fn handle_offerfiles(
         // Name history: every offer, blocked or not (a queue push; the
         // writer thread does the rest).
         if let Some(db) = state.name_db.get() {
-            let (layer, rule, whitelisted) =
+            let (layer, rule, listed) =
                 crate::name_db::verdict(&state.filter, &file.hash, &file.filename, &result);
             db.note(crate::name_db::NameEvent {
                 hash: file.hash,
@@ -218,7 +218,7 @@ pub fn handle_offerfiles(
                 name: file.filename.clone(),
                 layer,
                 rule,
-                whitelisted,
+                listed,
                 user_hash: client.user_hash,
                 net: crate::name_db::net_of(client.ip),
             });

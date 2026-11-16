@@ -330,9 +330,11 @@ whitelist_hashes = "https://ed2k.emule-security.org/files/whitelist_hashes.txt"
 
 [name_db]
 # Name history on disk: every offered name of every file, blocked or not, with
-# its publishers (salted digests, never addresses) and the filter's verdict.
-# The evidence for hash-list and whitelist decisions. Restart-only. README,
-# [name_db]. The file holds the blocked names too: keep it private.
+# its publishers (salted digests, never addresses), the term layers' verdict
+# on the name (hash lists set aside) and the lists the hash was on. The
+# evidence for hash-list and whitelist decisions. Restart-only. After an
+# upgrade from 0.9.88 or a dictionary change: ed2k-server --namedb-recheck.
+# README, [name_db]. The file holds the blocked names too: keep it private.
 path = ""                      # e.g. "/var/lib/ed2k-server/names.db"; "" = off
 # max_pending = 100000         # write once this many changes wait (~30 MB)...
 # flush_secs = 3600            # ...or at least this often
@@ -355,12 +357,13 @@ path = ""                      # file, or folder for server.met; "" = off
 # min_span_secs = 10             # judge a source only over this long a window
 # uniform_action = "throttle"    # "uniform timing" sources: "throttle" or "ban"
 # throttle_qpm = 60              # what a throttled source still gets per minute
-# ipfilter_min_dropped = 10000   # into storage.ipfilter_path after this many
-#                                # datagrams sent into a ban; 0 = never
+# ipfilter_min_dropped = 0       # into storage.ipfilter_path after this many
+#                                # datagrams sent into a ban (banned sources
+#                                # only); 0 = never, and earlier lines removed
 # scan_min_files = 2000          # scanner: files asked for sources in an hour
 # scan_min_distinct = 1000       #   ... of which this many different
-# scan_min_minutes = 10          #   ... judged no sooner than this
-# scan_max_repeats = 3           #   ... each asked at most this often
+# scan_min_minutes = 30          #   ... judged no sooner than this
+# scan_max_repeats = 1.3         #   ... each asked at most this often
 # scan_action = "ban"            #   "ban", "throttle" or "log"
 # hammer_min_files = 3000        # hammer: files asked in an hour
 # hammer_min_rate = 5            #   ... each file this many times a minute

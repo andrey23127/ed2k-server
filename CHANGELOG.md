@@ -4,7 +4,9 @@ Earlier releases are described in their release commit messages.
 
 ## 0.9.89
 
-Four findings from an audit of 0.9.88 by itlezy.
+Four findings from an audit of 0.9.88 by itlezy, two search fixes, the bot
+rules retuned, and the name history's verdicts made independent of the hash
+lists.
 
 ### NAT-T token from the OS random source (issue #57)
 
@@ -42,6 +44,71 @@ of the old one; past them it is partial, never wrong (the caller checks
 every file against the whole query). Repeated words and groups collapse
 first, so `[[a], [a]]` takes the one-word path. Cut answers are counted as
 `search_candidates_seed_cut` and `search_candidates_visits_cut`.
+
+### Name history: the name's own verdict, the hash lists apart (issue #51)
+
+A publish is decided by the first hash list that holds the hash, before any
+term layer, so the name history stored every name of a banlisted file as
+"L3 hash" (a poisoned-index one as "L5 poison"). That evidence only repeated
+the list it was meant to check, and a banlist rebuilt from it would either
+keep its own entries by circular reasoning or lose the files whose names
+were only ever seen while they were listed.
+
+- `layer` and `rule` are now always what the term layers (L1, L2, L4) say
+  about the name, with the whitelist, the blocklist and the poisoned-index
+  list all set aside. A second check runs only for a hash on a list.
+- New column `listed`: the lists the hash was on at the offer (bits 1
+  whitelist, 2 `hash_banlist`, 4 `hash_filter`); a re-offer adds a list it
+  lacked. `whitelisted` stays, as bit 1.
+- `/api/namedb` shows the lists per name.
+- Upgrading needs no new database: the column is added at startup (no
+  rewrite). Rows written by 0.9.88 keep `layer` 3/5 until their name is
+  offered again, or until `ed2k-server --namedb-recheck`, which judges every
+  stored name with the config's term lists, sets `listed` from the old
+  values, prints what changed and exits. It is also how the history follows
+  a dictionary change. Safe on the live file; it refuses to run with a
+  configured term list unreadable. Measured: 500 000 names in 3 s.
+
+### Search: type and size filters (issue #58)
+
+- Dropping unknown words checked only that the rewritten query was not
+  empty. Clients send a type or size filter with the words, so when every
+  word was unknown the filter was left alone, and a filter-only search
+  scans the whole index and returns its best-sourced files of that type,
+  which look random. A rewrite must now leave a word to search for (words
+  on the excluded side of a NOT do not count); otherwise the query is kept
+  as sent.
+- `ed2k::HASH` (and the other hash forms) was recognised only as the whole
+  query. With a type or size filter beside it, it was looked up as a word
+  and then dropped as unknown. Now an AND of one hash and tag filters is a
+  hash search, and the filters apply to the file it names. Another word
+  next to the hash still makes it an ordinary search.
+
+Reported by ModderMule.
+
+### Bots: no more IP filter for throttled clients, scanner rule retuned
+
+From the bot report of 15-16.11: nearly every source detected was a phone
+running a jed2k-based client ("cDonkey v1.0.1 (jed2k)") on a mobile carrier
+or CGNAT in China and Hong Kong, asking for the sources of one to eight
+files 5 to 600 times a minute. Throttled, as they should be; but the ones
+that kept at it past 100 000 dropped requests went into the IP filter for
+good, on addresses that are dynamic and shared by many users.
+
+- `bots.ipfilter_min_dropped` defaults to 0: no source goes into the IP
+  filter. With it off, the lines the feature wrote earlier are taken out
+  of `storage.ipfilter_path` at the next load (only the exact `bot` line of
+  each address in `bot-ipfilter.txt`), and the list is kept as
+  `bot-ipfilter.txt.old`. The 24-hour ban for floods and scanners and the
+  throttle for hammers stay.
+- Set above 0, it applies to banned sources only; a throttled one never
+  goes into the IP filter (before: at ten times the threshold).
+- Scanner rule: judged at 30 minutes instead of 10, and at most 1.3 asks
+  per file instead of 3. Of the three sources banned as scanners, two were
+  clients with about 1 000 downloads (eMule 0.50a, a jed2k client) that had
+  asked each file 1.7-1.8 times in 25 minutes; eMule asks its server again
+  about every 13 minutes. The real scanner asked 2 179 different files in
+  10 minutes, each once, and still matches.
 
 ### Large OFFERFILES never runs on the runtime because the lane is full (issue #56)
 

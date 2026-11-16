@@ -210,11 +210,47 @@ pub fn ed2k_file_ref(s: &str) -> Option<([u8; 16], u64)> {
     Some((h, size))
 }
 
-/// The file a search names by its hash: the whole tree is one such string.
-pub fn ed2k_file_search(tree: &SearchNode) -> Option<([u8; 16], u64)> {
-    match tree {
-        SearchNode::Term(s) => ed2k_file_ref(s),
-        _ => None,
+/// The file a search names by its hash, and the filters to apply to it.
+///
+/// Either the whole tree is one such string, or it is an AND of exactly one
+/// such string and type, size or other tag filters, which is what a client
+/// sends for `ed2k::HASH` with a file type or a size chosen in its search
+/// window (issue #58). The filters come back as their own tree. Any other
+/// word next to the hash makes it an ordinary search.
+pub fn ed2k_file_search(tree: &SearchNode) -> Option<([u8; 16], u64, Option<SearchNode>)> {
+    if let SearchNode::Term(s) = tree {
+        return ed2k_file_ref(s).map(|(h, n)| (h, n, None));
+    }
+    let mut parts = Vec::new();
+    flatten_and(tree, &mut parts);
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut found = None;
+    let mut filters: Option<SearchNode> = None;
+    for p in parts {
+        match p {
+            SearchNode::Term(s) if found.is_none() => found = Some(ed2k_file_ref(s)?),
+            SearchNode::Meta { .. } | SearchNode::Numeric { .. } => {
+                filters = Some(match filters {
+                    None => p.clone(),
+                    Some(f) => SearchNode::Bool(BoolOp::And, Box::new(f), Box::new(p.clone())),
+                });
+            }
+            _ => return None,
+        }
+    }
+    let (h, n) = found?;
+    Some((h, n, filters))
+}
+
+fn flatten_and<'a>(node: &'a SearchNode, out: &mut Vec<&'a SearchNode>) {
+    match node {
+        SearchNode::Bool(BoolOp::And, l, r) => {
+            flatten_and(l, out);
+            flatten_and(r, out);
+        }
+        other => out.push(other),
     }
 }
 
@@ -422,9 +458,25 @@ pub fn drop_unknown_words(
 ) -> (SearchNode, Vec<String>) {
     let mut dropped = Vec::new();
     match rewrite_conjunction(node, is_known, &mut dropped) {
-        Some(tree) if !dropped.is_empty() => (tree, dropped),
-        // Nothing dropped, or EVERYTHING was: keep the query as sent.
+        // A rewrite must leave a word to search for. Checking only for an
+        // empty tree missed the usual case (issue #58): clients send a type
+        // or size filter with the words, so dropping every word left the
+        // filters alone, and a filter-only search scans the whole index and
+        // returns its best-sourced files of that type, which look random.
+        Some(tree) if !dropped.is_empty() && has_search_word(&tree) => (tree, dropped),
+        // Nothing dropped, or every word was: keep the query as sent.
         _ => (node.clone(), Vec::new()),
+    }
+}
+
+/// Does the tree still ask for a word? Words on the excluded side of a NOT
+/// do not count: they only take files away.
+fn has_search_word(node: &SearchNode) -> bool {
+    match node {
+        SearchNode::Term(_) => true,
+        SearchNode::Bool(BoolOp::Not, l, _) => has_search_word(l),
+        SearchNode::Bool(_, l, r) => has_search_word(l) || has_search_word(r),
+        SearchNode::Meta { .. } | SearchNode::Numeric { .. } => false,
     }
 }
 
@@ -1866,6 +1918,63 @@ mod markers_are_per_word {
         p.extend_from_slice(b"ed2k::193C85BB48D1F49B859BA1D744BD4D46");
         let tree = parse(&p).unwrap();
         assert!(ed2k_file_search(&tree).is_some());
+    }
+
+    fn term(s: &str) -> SearchNode {
+        SearchNode::Term(s.to_string())
+    }
+    fn and(l: SearchNode, r: SearchNode) -> SearchNode {
+        SearchNode::Bool(BoolOp::And, Box::new(l), Box::new(r))
+    }
+
+    #[test]
+    fn a_hash_search_with_filters_is_still_a_hash_search() {
+        // Issue #58: "ed2k::HASH" AND type=Video AND size > 1 MB.
+        let h = "193C85BB48D1F49B859BA1D744BD4D46";
+        let hash = term(&format!("ed2k::{h}"));
+        let video = SearchNode::Meta { tag_name: SearchTag::Id(0x03), value: "Video".into() };
+        let big = SearchNode::Numeric { tag_name: SearchTag::Id(0x02), op: CmpOp::Gt, value: 1 << 20 };
+        let q = and(and(hash.clone(), video.clone()), big.clone());
+        let (_, size, filters) = ed2k_file_search(&q).unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(filters, Some(and(video.clone(), big)));
+        // The filter first, the hash second: the same.
+        assert!(ed2k_file_search(&and(video.clone(), hash.clone())).is_some());
+        // Alone: no filters.
+        assert_eq!(ed2k_file_search(&hash).unwrap().2, None);
+        // Another word next to it, an OR, a NOT or a second hash: an ordinary search.
+        assert!(ed2k_file_search(&and(hash.clone(), term("alpha"))).is_none());
+        assert!(ed2k_file_search(&SearchNode::Bool(BoolOp::Or, Box::new(hash.clone()), Box::new(video.clone()))).is_none());
+        assert!(ed2k_file_search(&SearchNode::Bool(BoolOp::Not, Box::new(hash.clone()), Box::new(video.clone()))).is_none());
+        assert!(ed2k_file_search(&and(hash.clone(), hash)).is_none());
+        // Filters alone are no hash search.
+        assert!(ed2k_file_search(&video).is_none());
+    }
+
+    #[test]
+    fn dropping_every_word_keeps_the_query_even_with_filters() {
+        // Issue #58: every word unknown, a type filter beside them. Dropping
+        // the words left the filter alone, a whole-index scan.
+        let known = |t: &str| t == "alpha";
+        let video = SearchNode::Meta { tag_name: SearchTag::Id(0x03), value: "Video".into() };
+        let q = and(term("zzznope qqqnope"), video.clone());
+        let (t, dropped) = drop_unknown_words(&q, &known);
+        assert_eq!(t, q);
+        assert!(dropped.is_empty());
+        // A hash with a filter is a word too: nothing is dropped.
+        let hq = and(term("ed2k::193C85BB48D1F49B859BA1D744BD4D46"), video.clone());
+        assert_eq!(drop_unknown_words(&hq, &known).0, hq);
+        // One known word left: the unknown one goes, the filter stays.
+        let q = and(term("alpha zzznope"), video.clone());
+        let (t, dropped) = drop_unknown_words(&q, &known);
+        assert_eq!(t, and(term("alpha"), video.clone()));
+        assert_eq!(dropped, vec!["zzznope".to_string()]);
+        // Only the excluded side of a NOT left: no word to search for.
+        let q = and(
+            term("zzznope"),
+            SearchNode::Bool(BoolOp::Not, Box::new(video.clone()), Box::new(term("alpha"))),
+        );
+        assert_eq!(drop_unknown_words(&q, &known).0, q);
     }
 }
 

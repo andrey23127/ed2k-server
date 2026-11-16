@@ -46,6 +46,15 @@ struct Args {
     /// names the CA may sign for, comma-separated. Loopback is always included.
     #[arg(long, value_name = "LIST", value_delimiter = ',')]
     admin_ca_names: Vec<String>,
+    /// Judge every name in the name history again with the term lists of
+    /// the config (hash lists set aside), print what changed, and exit.
+    /// Takes the database from [name_db] path, or --namedb-file. Safe on
+    /// the live file while the server runs.
+    #[arg(long)]
+    namedb_recheck: bool,
+    /// With --namedb-recheck: this database instead of [name_db] path (a copy).
+    #[arg(long, value_name = "DB")]
+    namedb_file: Option<PathBuf>,
 }
 
 /// Read a line from the terminal without echoing it.
@@ -78,6 +87,73 @@ fn read_secret(prompt: &str) -> Result<String> {
     }
     r.context("reading the password")?;
     Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// `--namedb-recheck`: the term layers of `config`, every list loaded or
+/// the run refused. A recheck with a dictionary missing would mark every
+/// name it holds clean.
+fn namedb_recheck_command(config: &std::path::Path, db: Option<&std::path::Path>) -> Result<()> {
+    use ed2k_server::filter::ContentFilter;
+    let cfg = Config::load_from_file(config).with_context(|| format!("loading {}", config.display()))?;
+    let db = match db {
+        Some(db) => db.to_path_buf(),
+        None => {
+            let p = cfg.name_db.path.trim();
+            if p.is_empty() {
+                anyhow::bail!("no [name_db] path in {}; give the database with --namedb-file", config.display());
+            }
+            PathBuf::from(p)
+        }
+    };
+    if !db.exists() {
+        anyhow::bail!("{} does not exist", db.display());
+    }
+    let cf = &cfg.content_filter;
+    let mut filter = ContentFilter::new();
+    let mut lists = Vec::new();
+    for (what, path) in [("extra_terms_file", &cf.extra_terms_file), ("jargon_terms_file", &cf.jargon_terms_file)] {
+        let Some(path) = path.as_deref().map(str::trim).filter(|p| !p.is_empty()) else { continue };
+        let terms = ContentFilter::load_terms_file(std::path::Path::new(path))
+            .with_context(|| format!("{what} {path}: needed for the recheck"))?;
+        lists.push(format!("{what}: {} terms", terms.len()));
+        filter = if what == "extra_terms_file" {
+            filter.with_extra_terms(terms)
+        } else {
+            filter.with_jargon_terms(terms)
+        };
+    }
+    if let Some(path) = cf.layer2_terms_file.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("layer2_terms_file {path}: needed for the recheck"))?;
+        let terms = ed2k_server::filter::layer2_terms::Layer2Terms::parse(&text)
+            .map_err(|e| anyhow::anyhow!("layer2_terms_file {path}: {e}"))?;
+        lists.push(format!("layer2_terms_file: {} entries", terms.len()));
+        filter = filter.with_layer2_terms(terms);
+    } else {
+        lists.push("layer2: built-in lists".to_string());
+    }
+    eprintln!("Rechecking {} with {}", db.display(), lists.join(", "));
+    let total: i64 = ed2k_server::name_db::open_ro(&db)
+        .and_then(|c| c.query_row("SELECT max(id) FROM names", [], |r| r.get::<_, Option<i64>>(0)))
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let started = std::time::Instant::now();
+    let mut last = std::time::Instant::now();
+    let rep = ed2k_server::name_db::recheck(&db, &filter, 20_000, |n| {
+        if last.elapsed() >= std::time::Duration::from_secs(10) {
+            last = std::time::Instant::now();
+            eprintln!("  {n} of ~{total} names");
+        }
+    })
+    .with_context(|| format!("rechecking {}", db.display()))?;
+    println!("names checked:        {}", rep.rows);
+    println!("rows changed:         {}", rep.changed);
+    println!("hash-list rows judged by name: {} ({} blocked by a term)", rep.legacy, rep.legacy_flagged);
+    println!("clean -> blocked:     {}", rep.now_flagged);
+    println!("blocked -> clean:     {}", rep.now_clean);
+    println!("took {:.0} s", started.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn hash_password_command() -> Result<()> {
@@ -117,6 +193,9 @@ fn main() -> Result<()> {
              [admin] tls = \"self-signed\", tls_ca_cert and tls_ca_key to these files."
         );
         return Ok(());
+    }
+    if args.namedb_recheck {
+        return namedb_recheck_command(&args.config, args.namedb_file.as_deref());
     }
     // Read config synchronously BEFORE starting the runtime so we can choose
     // single-threaded vs multi-threaded based on cfg.log.worker_threads.
@@ -613,7 +692,8 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
         // case the file was replaced meanwhile.
         if !cfg.storage.ipfilter_path.is_empty() {
             if let Some(Some(list)) = state.bot_ipfilter_list.get() {
-                let n = ed2k_server::server::bot_ipfilter::reassert(ipfilter_path, list);
+                let on = cfg.bots.ipfilter_min_dropped > 0;
+                let (n, _) = ed2k_server::server::bot_ipfilter::sync(ipfilter_path, list, on);
                 if n > 0 {
                     info!(n, "bot addresses put back into the IP filter file");
                 }
@@ -1305,9 +1385,10 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     }
                     let p = path.clone();
                     let list = state_ipf.bot_ipfilter_list.get().cloned().flatten();
+                    let on = state_ipf.live_cfg.load().bots.ipfilter_min_dropped > 0;
                     let loaded = tokio::task::spawn_blocking(move || {
                         if let Some(l) = &list {
-                            ed2k_server::server::bot_ipfilter::reassert(&p, l);
+                            ed2k_server::server::bot_ipfilter::sync(&p, l, on);
                         }
                         let m = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
                         (ed2k_server::filter::ipfilter::IpFilter::load(&p), m)
@@ -1975,10 +2056,12 @@ async fn async_main(args: Args, cfg: Config) -> Result<()> {
                     // thousands of ranges); only the swap happens here.
                     let owned = path.to_path_buf();
                     let list = state_reload.bot_ipfilter_list.get().cloned().flatten();
+                    let on = cfg_reload.bots.ipfilter_min_dropped > 0;
                     match tokio::task::spawn_blocking(move || {
-                        // A replaced file (update service) gets the bots back.
+                        // A replaced file (update service) gets the bots back,
+                        // or loses them when the feature is off.
                         if let Some(l) = &list {
-                            ed2k_server::server::bot_ipfilter::reassert(&owned, l);
+                            ed2k_server::server::bot_ipfilter::sync(&owned, l, on);
                         }
                         IpFilter::load(&owned)
                     })

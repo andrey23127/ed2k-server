@@ -268,7 +268,9 @@ pub struct BotsConfig {
     pub throttle_qpm: u32,
     /// Add a banned source to `storage.ipfilter_path` once this many of its
     /// datagrams were dropped during the ban: it kept sending into silence
-    /// for that long. A throttled source needs ten times as many. 0 = never.
+    /// for that long. Throttled sources never. 0 = never (the default since
+    /// 0.9.89: the addresses caught were mostly phones on shared, dynamic
+    /// carrier addresses); with 0 the lines added earlier are taken out.
     #[serde(default = "default_bots_ipfilter_min_dropped")]
     pub ipfilter_min_dropped: u64,
     /// Collect search activity per source for `/api/activity`, to tune the
@@ -387,7 +389,7 @@ fn default_bots_throttle_qpm() -> u32 {
     60
 }
 fn default_bots_ipfilter_min_dropped() -> u64 {
-    10_000
+    0
 }
 fn default_bots_activity_max() -> usize {
     100_000
@@ -408,10 +410,10 @@ fn default_bots_hammer_min_rate() -> f64 {
     5.0
 }
 fn default_bots_scan_min_minutes() -> u64 {
-    10
+    30
 }
 fn default_bots_scan_max_repeats() -> f64 {
-    3.0
+    1.3
 }
 fn default_bots_exempt() -> Vec<String> {
     vec!["178.250.170.0/28".into()]

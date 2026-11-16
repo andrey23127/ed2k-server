@@ -77,12 +77,13 @@ pub struct NameEvent {
     pub hash: [u8; 16],
     pub size: u64,
     pub name: String,
-    /// `layer_code` of the verdict, with the whitelist set aside.
+    /// `layer_code` of what the term layers say about the NAME (L1, L2, L4
+    /// or 0), with every hash list set aside.
     pub layer: u8,
     /// What matched, when something did.
     pub rule: Option<String>,
-    /// The hash is on the whitelist (the record itself was let through).
-    pub whitelisted: bool,
+    /// The hash lists the hash was on at the offer (`LISTED_*` bits).
+    pub listed: u8,
     pub user_hash: [u8; 16],
     /// The publisher's network: /24 for IPv4, /48 for IPv6, folded.
     pub net: u64,
@@ -101,28 +102,53 @@ pub fn net_of(ip: IpAddr) -> u64 {
     }
 }
 
-/// The verdict to store for one offer: the result of `check`, but for a
-/// whitelisted hash what the filter would say without the whitelist, so
-/// the history can show whitelist entries that carry blocked names.
+/// `names.listed` bits: the hash was on this list when the name was offered.
+pub const LISTED_WHITELIST: u8 = 1;
+pub const LISTED_BANLIST: u8 = 2;
+pub const LISTED_HASH_FILTER: u8 = 4;
+
+/// The verdict to store for one offer: what the term layers say about the
+/// NAME, and which hash lists the hash was on.
+///
+/// The two are kept apart because the lists are what this history is meant
+/// to rebuild. `check` stops at the first hash list that holds the hash, so
+/// a banlisted file's names were all stored as "L3 hash": evidence that
+/// only repeated the list. Now the name is judged on its own, and the lists
+/// go in `listed`.
+///
+/// Costs a second check only for a hash on a list: otherwise `result` (the
+/// publish decision) already is the term verdict.
 pub fn verdict(
     filter: &crate::filter::ContentFilter,
     hash: &[u8; 16],
     name: &str,
     result: &FilterResult,
-) -> (u8, Option<String>, bool) {
-    match result {
-        FilterResult::Block(l, r) => (layer_code(Some(*l)), Some(r.to_string()), false),
-        FilterResult::Allow => {
-            if filter.is_whitelisted(hash) {
-                match filter.check_ignoring_whitelist(hash, name) {
-                    FilterResult::Block(l, r) => (layer_code(Some(l)), Some(r.to_string()), true),
-                    FilterResult::Allow => (0, None, true),
-                }
-            } else {
-                (0, None, false)
-            }
-        }
+) -> (u8, Option<String>, u8) {
+    let mut listed = 0;
+    if filter.is_whitelisted(hash) {
+        listed |= LISTED_WHITELIST;
     }
+    if filter.is_banlisted(hash) {
+        listed |= LISTED_BANLIST;
+    }
+    if filter.is_hash_filtered(hash) {
+        listed |= LISTED_HASH_FILTER;
+    }
+    let terms = if listed == 0 {
+        result.clone()
+    } else {
+        filter.check_terms(name)
+    };
+    match terms {
+        FilterResult::Block(l, r) => (layer_code(Some(l)), Some(r), listed),
+        FilterResult::Allow => (0, None, listed),
+    }
+}
+
+/// A stored layer from before 0.9.89: the hash list stopped the check, so
+/// what the name says is unknown until it is checked again.
+pub fn layer_is_legacy(layer: u8) -> bool {
+    layer == 3 || layer == 5
 }
 
 #[derive(Default)]
@@ -235,6 +261,7 @@ CREATE TABLE IF NOT EXISTS names(
     layer INTEGER NOT NULL,
     rule TEXT,
     whitelisted INTEGER NOT NULL DEFAULT 0,
+    listed INTEGER NOT NULL DEFAULT 0,
     first_seen INTEGER NOT NULL,
     npubs INTEGER NOT NULL DEFAULT 0,
     nnets INTEGER NOT NULL DEFAULT 0,
@@ -267,7 +294,24 @@ fn open_rw(path: &Path, cache_mb: u32) -> rusqlite::Result<rusqlite::Connection>
     // A large write leaves a large WAL; truncate it back after the checkpoint.
     conn.pragma_update(None, "journal_size_limit", 64i64 << 20)?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
+}
+
+/// Bring a database from an earlier version up to date. Cheap by design:
+/// adding a column with a default rewrites nothing in SQLite. Rows written
+/// before keep `layer` 3 or 5 where a hash list stopped the check; they are
+/// put right when the name is offered again, or all at once by
+/// `ed2k-server --namedb-recheck`.
+fn migrate(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let has_listed: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('names') WHERE name = 'listed'")?
+        .exists([])?;
+    if !has_listed {
+        conn.execute_batch("ALTER TABLE names ADD COLUMN listed INTEGER NOT NULL DEFAULT 0;")?;
+        tracing::info!("name history: added names.listed (0.9.89); run --namedb-recheck once");
+    }
+    Ok(())
 }
 
 /// Read-only access for the admin page (another connection; WAL lets it read
@@ -363,7 +407,7 @@ enum Change {
         size: u64,
         layer: u8,
         rule: Option<String>,
-        whitelisted: bool,
+        listed: u8,
         pubs: Vec<(u32, u32)>,
         at: i64,
     },
@@ -372,7 +416,11 @@ enum Change {
         /// Everything the row should hold after the write.
         pubs: Vec<(u32, u32)>,
         added_pubs: u32,
-        verdict: Option<(u8, Option<String>, bool)>,
+        /// A term verdict for a row that had none: clean, or a pre-0.9.89
+        /// row whose check a hash list stopped.
+        verdict: Option<(u8, Option<String>)>,
+        /// Lists to add to the row's `listed` (bits it lacked).
+        listed: u8,
     },
 }
 
@@ -451,52 +499,63 @@ impl Writer {
         // Already waiting: fold in.
         if let Some((_, ch)) = self.pending.get_mut(&key) {
             match ch {
-                Change::New { layer, rule, whitelisted, pubs, .. } => {
+                Change::New { layer, rule, listed, pubs, .. } => {
                     if *layer == 0 && e.layer != 0 {
                         *layer = e.layer;
                         *rule = e.rule;
                     }
-                    *whitelisted |= e.whitelisted;
+                    *listed |= e.listed;
                     if pubs.len() < cap && !pubs.iter().any(|p| p.0 == publisher.0) {
                         pubs.push(publisher);
                     }
                 }
-                Change::Update { pubs, added_pubs, verdict, .. } => {
+                Change::Update { pubs, added_pubs, verdict, listed, .. } => {
                     if pubs.len() < cap && !pubs.iter().any(|p| p.0 == publisher.0) {
                         pubs.push(publisher);
                         *added_pubs += 1;
                     }
-                    // Applied only to a row still clean (the UPDATE checks).
-                    if e.layer != 0 && verdict.is_none() {
-                        *verdict = Some((e.layer, e.rule, e.whitelisted));
+                    // Applied only to a row still clean or legacy (the
+                    // UPDATE checks).
+                    if e.layer != 0 && verdict.as_ref().map_or(true, |v| v.0 == 0) {
+                        *verdict = Some((e.layer, e.rule));
                     }
+                    *listed |= e.listed;
                 }
             }
             return Ok(());
         }
 
         // Stored? A read; most offers end here.
-        let row: Option<(i64, u8, Vec<u8>)> = self
+        let row: Option<(i64, u8, u8, Vec<u8>)> = self
             .conn
-            .prepare_cached("SELECT id, layer, pubs FROM names WHERE hash = ?1 AND nkey = ?2")?
+            .prepare_cached("SELECT id, layer, listed, pubs FROM names WHERE hash = ?1 AND nkey = ?2")?
             .query_row(rusqlite::params![&e.hash[..], nkey], |r| {
-                Ok((r.get(0)?, r.get::<_, i64>(1)? as u8, r.get(2)?))
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u8, r.get::<_, i64>(2)? as u8, r.get(3)?))
             })
             .optional()?;
         match row {
-            Some((id, layer, blob)) => {
+            Some((id, layer, listed, blob)) => {
                 let mut pubs = pubs_decode(&blob);
                 let mut added = 0;
                 if pubs.len() < cap && !pubs.iter().any(|p| p.0 == publisher.0) {
                     pubs.push(publisher);
                     added = 1;
                 }
-                let verdict = (layer == 0 && e.layer != 0).then(|| (e.layer, e.rule.take(), e.whitelisted));
-                if added == 0 && verdict.is_none() {
+                // A clean row takes a verdict; a legacy one takes whatever
+                // the name says now, clean included.
+                let verdict = ((layer == 0 && e.layer != 0) || layer_is_legacy(layer))
+                    .then(|| (e.layer, e.rule.take()));
+                let new_bits = e.listed & !listed;
+                if added == 0 && verdict.is_none() && new_bits == 0 {
                     return Ok(());
                 }
-                self.pending
-                    .insert(key, (String::new(), Change::Update { id, pubs, added_pubs: added, verdict }));
+                self.pending.insert(
+                    key,
+                    (
+                        String::new(),
+                        Change::Update { id, pubs, added_pubs: added, verdict, listed: new_bits },
+                    ),
+                );
             }
             None => {
                 let waiting = self.new_per_hash.get(&e.hash).copied().unwrap_or(0);
@@ -518,7 +577,7 @@ impl Writer {
                             size: e.size,
                             layer: e.layer,
                             rule: e.rule.take(),
-                            whitelisted: e.whitelisted,
+                            listed: e.listed,
                             pubs: vec![publisher],
                             at: now_unix(),
                         },
@@ -572,16 +631,21 @@ impl Writer {
             let mut has_hash = tx.prepare_cached("SELECT 1 FROM names WHERE hash = ?1 LIMIT 1")?;
             let mut ins = tx.prepare_cached(
                 "INSERT OR IGNORE INTO names(hash, nkey, name, size, layer, rule, whitelisted,
-                 first_seen, npubs, nnets, pubs) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 listed, first_seen, npubs, nnets, pubs)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             let mut upd_pubs =
                 tx.prepare_cached("UPDATE names SET npubs = ?2, nnets = ?3, pubs = ?4 WHERE id = ?1")?;
             let mut upd_verdict = tx.prepare_cached(
-                "UPDATE names SET layer = ?2, rule = ?3, whitelisted = ?4 WHERE id = ?1 AND layer = 0",
+                "UPDATE names SET layer = ?2, rule = ?3 WHERE id = ?1 AND layer IN (0, 3, 5)",
+            )?;
+            let mut upd_listed = tx.prepare_cached(
+                "UPDATE names SET listed = listed | ?2, whitelisted = whitelisted | (?2 & 1)
+                 WHERE id = ?1",
             )?;
             for ((hash, nkey), (name, ch)) in batch {
                 match ch {
-                    Change::New { size, layer, rule, whitelisted, pubs, at } => {
+                    Change::New { size, layer, rule, listed, pubs, at } => {
                         let known = has_hash.exists([&hash[..]])?;
                         let done = ins.execute(params![
                             &hash[..],
@@ -590,7 +654,8 @@ impl Writer {
                             size as i64,
                             i64::from(layer),
                             rule,
-                            whitelisted as i64,
+                            i64::from(listed & LISTED_WHITELIST),
+                            i64::from(listed),
                             at,
                             pubs.len() as i64,
                             distinct_nets(&pubs) as i64,
@@ -604,7 +669,7 @@ impl Writer {
                             }
                         }
                     }
-                    Change::Update { id, pubs, added_pubs, verdict } => {
+                    Change::Update { id, pubs, added_pubs, verdict, listed } => {
                         if added_pubs > 0 {
                             upd_pubs.execute(params![
                                 id,
@@ -614,8 +679,11 @@ impl Writer {
                             ])?;
                             np += u64::from(added_pubs);
                         }
-                        if let Some((layer, rule, wl)) = verdict {
-                            upd_verdict.execute(params![id, i64::from(layer), rule, wl as i64])?;
+                        if let Some((layer, rule)) = verdict {
+                            upd_verdict.execute(params![id, i64::from(layer), rule])?;
+                        }
+                        if listed != 0 {
+                            upd_listed.execute(params![id, i64::from(listed)])?;
                         }
                     }
                 }
@@ -645,6 +713,9 @@ pub struct NameRow {
     pub layer: &'static str,
     pub rule: Option<String>,
     pub whitelisted: bool,
+    /// The hash lists the hash was on when this name was offered:
+    /// "whitelist", "banlist", "hash_filter".
+    pub listed: Vec<&'static str>,
     pub size: u64,
     pub first_seen: i64,
     pub publishers: i64,
@@ -675,7 +746,7 @@ pub fn report(
     show: impl Fn(&str) -> bool,
 ) -> rusqlite::Result<HashReport> {
     let mut st = conn.prepare(
-        "SELECT name, layer, rule, whitelisted, size, first_seen, npubs, nnets, pubs
+        "SELECT name, layer, rule, whitelisted, size, first_seen, npubs, nnets, pubs, listed
          FROM names WHERE hash = ?1 ORDER BY layer DESC, npubs DESC, first_seen",
     )?;
     let mut rep = HashReport {
@@ -702,10 +773,12 @@ pub fn report(
             r.get::<_, i64>(6)?,
             r.get::<_, i64>(7)?,
             r.get::<_, Vec<u8>>(8)?,
+            r.get::<_, i64>(9)?,
         ))
     })?;
     for row in rows {
-        let (name, layer, rule, wl, size, first, npubs, nnets, blob) = row?;
+        let (name, layer, rule, wl, size, first, npubs, nnets, blob, listed) = row?;
+        let listed = listed as u8 | if layer == 3 { LISTED_BANLIST } else if layer == 5 { LISTED_HASH_FILTER } else { 0 };
         rep.known = true;
         rep.names += 1;
         if layer != 0 {
@@ -725,6 +798,15 @@ pub fn report(
             layer: layer_name(layer as u8),
             rule,
             whitelisted: wl != 0,
+            listed: [
+                (LISTED_WHITELIST, "whitelist"),
+                (LISTED_BANLIST, "banlist"),
+                (LISTED_HASH_FILTER, "hash_filter"),
+            ]
+            .into_iter()
+            .filter(|(b, _)| listed & b != 0)
+            .map(|(_, n)| n)
+            .collect(),
             size: size as u64,
             first_seen: first,
             publishers: npubs,
@@ -740,6 +822,111 @@ pub fn report(
     rep.networks = distinct(all_n);
     rep.flagged_networks = distinct(fl_n);
     rep.clean_networks = distinct(cl_n);
+    Ok(rep)
+}
+
+/// What `recheck` did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RecheckReport {
+    pub rows: u64,
+    /// Rows rewritten (verdict, rule or lists changed).
+    pub changed: u64,
+    /// Pre-0.9.89 rows whose check a hash list had stopped, now judged by
+    /// their name.
+    pub legacy: u64,
+    /// Of those, the ones the term layers block.
+    pub legacy_flagged: u64,
+    /// Rows that were clean and are flagged now (terms added since).
+    pub now_flagged: u64,
+    /// Rows that were flagged by a term and are clean now (terms removed).
+    pub now_clean: u64,
+}
+
+/// Judge every stored name again with `filter`'s term layers, hash lists
+/// set aside, and record in `listed` the lists the old `layer` 3/5 and
+/// `whitelisted` stood for.
+///
+/// For a database from before 0.9.89, once, and after a dictionary change
+/// when the history should reflect it. Works on the live file while the
+/// server runs: it writes in transactions of `batch` rows, each short, and
+/// waits for the server's own writes. `progress` gets the rows done so far.
+pub fn recheck(
+    path: &Path,
+    filter: &crate::filter::ContentFilter,
+    batch: usize,
+    mut progress: impl FnMut(u64),
+) -> rusqlite::Result<RecheckReport> {
+    use rusqlite::params;
+    let mut conn = open_rw(path, 16)?;
+    conn.busy_timeout(Duration::from_secs(120))?;
+    let mut rep = RecheckReport::default();
+    let mut last_id: i64 = 0;
+    loop {
+        let rows: Vec<(i64, String, u8, Option<String>, u8, i64)> = conn
+            .prepare_cached(
+                "SELECT id, name, layer, rule, listed, whitelisted FROM names
+                 WHERE id > ?1 ORDER BY id LIMIT ?2",
+            )?
+            .query_map(params![last_id, batch.max(1) as i64], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, i64>(2)? as u8,
+                    r.get(3)?,
+                    r.get::<_, i64>(4)? as u8,
+                    r.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(last) = rows.last() else { break };
+        last_id = last.0;
+        let tx = conn.transaction()?;
+        {
+            let mut upd = tx.prepare_cached(
+                "UPDATE names SET layer = ?2, rule = ?3, listed = ?4, whitelisted = ?5 WHERE id = ?1",
+            )?;
+            for (id, name, layer, rule, listed, wl) in rows {
+                rep.rows += 1;
+                let mut bits = listed;
+                if wl != 0 {
+                    bits |= LISTED_WHITELIST;
+                }
+                if layer == 3 {
+                    bits |= LISTED_BANLIST;
+                }
+                if layer == 5 {
+                    bits |= LISTED_HASH_FILTER;
+                }
+                let (nl, nr) = match filter.check_terms(&name) {
+                    FilterResult::Block(l, r) => (layer_code(Some(l)), Some(r)),
+                    FilterResult::Allow => (0, None),
+                };
+                if layer_is_legacy(layer) {
+                    rep.legacy += 1;
+                    if nl != 0 {
+                        rep.legacy_flagged += 1;
+                    }
+                } else if layer == 0 && nl != 0 {
+                    rep.now_flagged += 1;
+                } else if layer != 0 && nl == 0 {
+                    rep.now_clean += 1;
+                }
+                if nl != layer || nr != rule || bits != listed {
+                    rep.changed += 1;
+                    upd.execute(params![
+                        id,
+                        i64::from(nl),
+                        nr,
+                        i64::from(bits),
+                        i64::from(bits & LISTED_WHITELIST)
+                    ])?;
+                }
+            }
+        }
+        tx.commit()?;
+        progress(rep.rows);
+    }
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     Ok(rep)
 }
 
@@ -765,7 +952,7 @@ mod tests {
             name: name.into(),
             layer,
             rule: (layer != 0).then(|| "rule".to_string()),
-            whitelisted: false,
+            listed: 0,
             user_hash: [user; 16],
             net,
         }
@@ -840,5 +1027,114 @@ mod tests {
         let y: IpAddr = "2001:db8:1:ffff::1".parse().unwrap();
         assert_eq!(net_of(x), net_of(y));
         assert_ne!(net_of(x), net_of(a));
+    }
+
+    #[test]
+    fn a_listed_hash_keeps_the_names_verdict_and_records_the_list() {
+        use crate::filter::ContentFilter;
+        let f = ContentFilter::new()
+            .with_extra_terms(vec!["badterm".into()])
+            .with_hash_blocklist(vec![[7; 16]])
+            .with_hash_filter(vec![[8; 16]])
+            .with_hash_whitelist(vec![[9; 16]]);
+        let v = |h: u8, name: &str| {
+            let r = f.check(&[h; 16], name);
+            verdict(&f, &[h; 16], name, &r)
+        };
+        // Banlisted: the publish decision is L3, the name speaks for itself.
+        assert!(matches!(f.check(&[7; 16], "x badterm.avi"), FilterResult::Block(Layer::L3HashBlock, _)));
+        let (l, r, listed) = v(7, "x badterm.avi");
+        assert_eq!((l, listed), (4, LISTED_BANLIST));
+        assert!(r.is_some());
+        assert_eq!(v(7, "Holiday.avi"), (0, None, LISTED_BANLIST));
+        assert_eq!(v(8, "Holiday.avi"), (0, None, LISTED_HASH_FILTER));
+        assert_eq!(v(9, "x badterm.avi").0, 4);
+        assert_eq!(v(9, "x badterm.avi").2, LISTED_WHITELIST);
+        // On no list: the publish decision is the verdict.
+        assert_eq!(v(1, "x badterm.avi").2, 0);
+        assert_eq!(v(1, "x badterm.avi").0, 4);
+    }
+
+    #[test]
+    fn an_old_database_is_migrated_and_rechecked() {
+        use crate::filter::ContentFilter;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        // A 0.9.88 database: no `listed`, rows stopped at L3 / L5.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE meta(k TEXT PRIMARY KEY, v) WITHOUT ROWID;
+                 CREATE TABLE names(id INTEGER PRIMARY KEY, hash BLOB NOT NULL, nkey INTEGER NOT NULL,
+                   name TEXT NOT NULL, size INTEGER NOT NULL, layer INTEGER NOT NULL, rule TEXT,
+                   whitelisted INTEGER NOT NULL DEFAULT 0, first_seen INTEGER NOT NULL,
+                   npubs INTEGER NOT NULL DEFAULT 0, nnets INTEGER NOT NULL DEFAULT 0,
+                   pubs BLOB NOT NULL DEFAULT x'', UNIQUE(hash, nkey));",
+            )
+            .unwrap();
+            let ins = |id: i64, h: u8, name: &str, layer: i64, rule: Option<&str>, wl: i64| {
+                c.execute(
+                    "INSERT INTO names(id, hash, nkey, name, size, layer, rule, whitelisted, first_seen)
+                     VALUES(?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, 0)",
+                    rusqlite::params![id, vec![h; 16], name_key(name), name, layer, rule, wl],
+                )
+                .unwrap();
+            };
+            ins(1, 7, "x badterm.avi", 3, Some("hash"), 0); // banlisted, bad name
+            ins(2, 7, "Holiday.avi", 3, Some("hash"), 0); // banlisted, clean name
+            ins(3, 8, "Decoy.avi", 5, Some("poison"), 0);
+            ins(4, 9, "x badterm.avi", 4, Some("badterm"), 1); // whitelisted
+            ins(5, 1, "newterm clip.avi", 0, None, 0); // a term added since
+            ins(6, 2, "oldterm clip.avi", 4, Some("oldterm"), 0); // a term removed since
+        }
+        // Opening it as 0.9.89 adds the column and changes nothing else.
+        drop(NameDb::open(&path, settings()).unwrap());
+        let f = ContentFilter::new().with_extra_terms(vec!["badterm".into(), "newterm".into()]);
+        let mut seen = 0;
+        let rep = recheck(&path, &f, 2, |n| seen = n).unwrap();
+        assert_eq!(seen, 6);
+        assert_eq!(
+            rep,
+            RecheckReport { rows: 6, changed: 6, legacy: 3, legacy_flagged: 1, now_flagged: 1, now_clean: 1 }
+        );
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let row = |id: i64| -> (i64, i64, i64) {
+            c.query_row("SELECT layer, listed, whitelisted FROM names WHERE id = ?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap()
+        };
+        assert_eq!(row(1), (4, i64::from(LISTED_BANLIST), 0));
+        assert_eq!(row(2), (0, i64::from(LISTED_BANLIST), 0));
+        assert_eq!(row(3), (0, i64::from(LISTED_HASH_FILTER), 0));
+        assert_eq!(row(4), (4, i64::from(LISTED_WHITELIST), 1));
+        assert_eq!(row(5).0, 4);
+        assert_eq!(row(6).0, 0);
+        // A second run finds nothing to do.
+        let again = recheck(&path, &f, 100, |_| {}).unwrap();
+        assert_eq!(again.changed, 0);
+    }
+
+    #[test]
+    fn a_reoffer_puts_a_legacy_row_right_and_adds_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("names.db");
+        let db = NameDb::open(&path, settings()).unwrap();
+        db.note(ev(3, "Clip.avi", 0, 1, 10));
+        db.flush_and_wait(Duration::from_secs(10));
+        // Make it look like a pre-0.9.89 row stopped at L3.
+        {
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute("UPDATE names SET layer = 3, rule = 'hash'", []).unwrap();
+        }
+        let mut e = ev(3, "Clip.avi", 0, 1, 10);
+        e.listed = LISTED_BANLIST;
+        db.note(e);
+        db.flush_and_wait(Duration::from_secs(10));
+        let c = rusqlite::Connection::open(&path).unwrap();
+        let (layer, listed): (i64, i64) = c
+            .query_row("SELECT layer, listed FROM names", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((layer, listed), (0, i64::from(LISTED_BANLIST)));
     }
 }

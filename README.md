@@ -495,11 +495,11 @@ keys are read on every request, so the Settings tab changes them at once.
 | `min_span_secs` | 10 | A source is judged only once its queries span this long, so a burst of 30 packets in a few milliseconds is not read as a flood of 100 000 qpm |
 | `uniform_action` | `"throttle"` | What a "uniform timing" source (over 200 qpm, regular intervals, not a flood) gets for 24 h: `"throttle"` (still answered, at `throttle_qpm`) or `"ban"` |
 | `throttle_qpm` | 60 | What a throttled source still gets through, per minute |
-| `ipfilter_min_dropped` | 10000 | A banned source that sends this many datagrams into its ban is added to `storage.ipfilter_path` for good (ten times as many for a throttled one); `0` = never |
+| `ipfilter_min_dropped` | 0 | A banned source that sends this many datagrams into its ban is added to `storage.ipfilter_path` for good; a throttled one never. `0` = never, and the lines added earlier are taken out (see below) |
 | `scan_min_files` | 2000 | **Scanner** rule: a source that asks for sources of this many files within an hour (TCP and UDP, repeats included)… |
 | `scan_min_distinct` | 1000 | …of which at least this many different… |
-| `scan_min_minutes` | 10 | …judged no sooner than this far into the hour… |
-| `scan_max_repeats` | 3 | …each file asked at most this many times on average… |
+| `scan_min_minutes` | 30 | …judged no sooner than this far into the hour… |
+| `scan_max_repeats` | 1.3 | …each file asked at most this many times on average… |
 | `scan_action` | `"ban"` | …gets this for 24 h: `"ban"`, `"throttle"` or `"log"` (ledger and log only) |
 | `hammer_min_files` | 3000 | **Hammer** rule: this many files asked within an hour… |
 | `hammer_min_rate` | 5 | …each file asked at least this many times a minute on average… |
@@ -521,6 +521,15 @@ the filter is reloaded at once. The address is also recorded in
 appended again before it is loaded. To take one out for good, delete its line
 in both files.
 
+Off by default since 0.9.89. Of the addresses it added, nearly all were
+phones running a jed2k-based client on mobile carriers and CGNAT: dynamic,
+shared by many users, and throttled, not banned, for asking too often. A
+line in the IP filter outlives the user it was meant for and locks out the
+next ones. The 24-hour ban and the throttle stay. With `ipfilter_min_dropped
+= 0` the lines this feature wrote are taken out of the filter file at the
+next load (only the exact `bot` line of an address in `bot-ipfilter.txt`),
+and the list is set aside as `bot-ipfilter.txt.old`.
+
 The scanner and hammer rules come from a day's activity of 91 000 sources
 (`/api/activity`, 2026-10-20). An ordinary eMule asks the server it is
 connected to for sources of 15 files every 5 minutes, about 180 files an
@@ -530,7 +539,18 @@ download that has no peer once a minute, so a user with 80 stalled
 downloads sends 4 800 requests an hour, and one who adds 2 000 downloads
 sends 2 000 different files in the first minute. Neither is a scan: a list
 scanner asks thousands of different files an hour, each about once, which is
-what `scan_min_minutes` and `scan_max_repeats` test. A hammer asks the same
+what `scan_min_minutes` and `scan_max_repeats` test.
+
+Retuned in 0.9.89 from the bot report of 15-16.11: the rule then judged at
+10 minutes and allowed 3 asks per file, and of the three sources it banned
+as scanners two were clients with large download lists (an eMule 0.50a and
+a jed2k client, about 1 000 files asked 1.7-1.8 times each in 25 minutes:
+eMule asks its server again about every 13 minutes). The one real scanner
+asked 2 179 different files in 10 minutes, each once. Judged at 30 minutes
+with at most 1.3 asks per file, a client has asked each file twice by then
+and a list walk still about once.
+
+A hammer asks the same
 file or two 5 to 600 times a minute, mostly a program built on jed2k that
 kept its default nick; it is throttled (`throttle_qpm` answers a minute), not
 banned. Each source is judged over an hour from its first request; different
@@ -609,10 +629,17 @@ not, in an SQLite file on disk. The server sees one name, sometimes the only
 copy, of a file the network knows under many; hash-list and whitelist
 decisions made from single names can be poisoned (a legal film published
 once under an abuse name) or simply wrong. The history keeps what they need,
-per name: the filter's verdict (for a whitelisted hash, what the filter says
-without the whitelist), when it was first offered, and its independent
-publishers, by user hash and by /24 (IPv6 /48). Publishers are salted 32-bit
-digests, never addresses. Restart-only.
+per name: what the term layers (L1, L2, L4) say about the name, with every
+hash list set aside; which hash lists the hash was on when it was offered;
+when it was first offered; and its independent publishers, by user hash and
+by /24 (IPv6 /48). Publishers are salted 32-bit digests, never addresses.
+Restart-only.
+
+The name's verdict never depends on the hash lists. A publish is decided by
+the first list that holds the hash, so a banlisted file used to be stored as
+"L3 hash" under every name, evidence that only repeated the list it was
+meant to check (issue #51). Since 0.9.89 the lists go in their own column,
+`listed`, and `layer` is always what the name says.
 
 | Key | Meaning |
 |---|---|
@@ -650,8 +677,26 @@ FROM names GROUP BY hash
 HAVING term_nets > 0 AND clean_nets > term_nets;
 ```
 
-`layer`: 0 clean, 1 L1, 2 L2, 3 L3, 4 L4, 5 L5. `nnets`/`npubs` are per
-name; the same network behind two names counts twice in such a sum.
+`layer`: 0 clean, 1 L1, 2 L2, 4 L4: the term layers, hash lists set aside.
+3 and 5 are left only in rows written before 0.9.89, where the blocklist or
+the poisoned-index list stopped the check; such a row is put right when its
+name is offered again, or all at once with `--namedb-recheck`. `listed`: the
+lists the hash was on at the offer, bits 1 whitelist, 2 `hash_banlist`,
+4 `hash_filter` (`whitelisted` = bit 1, kept for older queries). `rule`: what
+matched. `nnets`/`npubs` are per name; the same network behind two names
+counts twice in such a sum.
+
+**Recheck.** `ed2k-server -c config.toml --namedb-recheck` judges every stored
+name again with the config's term lists, hash lists set aside, records in
+`listed` what an old `layer` 3/5 stood for, prints what changed and exits.
+Run it once after upgrading from 0.9.88, and after a dictionary change when
+the history should follow it: without it a name keeps the verdict it got
+when first offered. It refuses to run if a configured term list cannot be
+read (a missing dictionary would mark every name clean). Safe on the live
+file while the server runs: it writes in short transactions of 20 000 rows.
+About 3 minutes of one core for 28 million names; `nice -n 19 ionice -c3`
+keeps it out of the server's way. `--namedb-file DB` works on a copy
+instead of `[name_db] path`. No need to start the database over.
 
 ### `[admission]`
 Server-wide ceilings on the work remote peers can cause, however the load is

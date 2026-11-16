@@ -1058,3 +1058,52 @@ async fn a_wide_search_tree_is_refused_before_the_search_lane() {
     assert_eq!(&reply.payload[..4], &[0, 0, 0, 0], "no results");
     assert_eq!(state.block_stats.get("search_tree_over_budget").map(|v| *v), Some(1));
 }
+
+/// Issue #58. A hash search with a type filter names one file and the filter
+/// applies to it; a search whose every word is unknown, sent with a type
+/// filter, returns nothing instead of the best-sourced files of that type.
+#[tokio::test]
+async fn type_filters_neither_hide_a_hash_nor_turn_into_a_whole_index_scan() {
+    use ed2k_server::filter::ContentFilter;
+    use ed2k_server::server::search::{handle_search, SearchRequest};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let cfg = Arc::new(test_config(4661));
+    let state = Arc::new(ServerState::new(Arc::new(ContentFilter::new()), Arc::clone(&cfg)));
+    for i in 0..20u8 {
+        state.add_file_with_source(
+            [0x80 + i; 16],
+            700_000_000,
+            format!("Some Film part{i}.avi"),
+            ([i; 16], IpAddr::V4(Ipv4Addr::new(10, 3, i, 1)), 4662, true),
+        );
+    }
+    state.add_file_with_source(
+        [0x58; 16],
+        5_000_000,
+        "Some Song.mp3".to_string(),
+        ([0x58; 16], IpAddr::V4(Ipv4Addr::new(10, 4, 0, 1)), 4662, true),
+    );
+    fn string(p: &mut Vec<u8>, s: &str) {
+        p.push(0x01);
+        p.extend_from_slice(&(s.len() as u16).to_le_bytes());
+        p.extend_from_slice(s.as_bytes());
+    }
+    // AND(<term>, type = <kind>), as eMule sends a search with a file type.
+    let with_type = |t: &str, kind: &str| -> Vec<[u8; 16]> {
+        let mut p = vec![0x00, 0x00];
+        string(&mut p, t);
+        p.push(0x02);
+        p.extend_from_slice(&(kind.len() as u16).to_le_bytes());
+        p.extend_from_slice(kind.as_bytes());
+        p.extend_from_slice(&[1, 0, 0x03]);
+        handle_search(&state, SearchRequest::parse(&p).unwrap()).iter().map(|r| r.hash).collect()
+    };
+    let h = "58585858585858585858585858585858";
+    assert_eq!(with_type(&format!("ed2k::{h}"), "Audio"), vec![[0x58; 16]]);
+    assert!(with_type(&format!("ed2k::{h}"), "Video").is_empty(), "the filter applies to the file");
+    // Every word unknown: nothing, not twenty films.
+    assert!(with_type("zzqnope qqznope", "Video").is_empty());
+    // A known word is still found with its filter.
+    assert_eq!(with_type("film zzqnope", "Video").len(), 20);
+}
