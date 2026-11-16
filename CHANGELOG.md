@@ -84,6 +84,15 @@ were only ever seen while they were listed.
   hash search, and the filters apply to the file it names. Another word
   next to the hash still makes it an ordinary search.
 
+- A phrase in double quotes returned nothing (issue #59). eMule keeps the
+  quotes in the term it sends (`alpha "word1 word2"`), and the post-filter
+  split the term on spaces and looked for `"word1` and `word2"` in the
+  names. Now a quoted phrase is one part: its words must stand together, in
+  that order, with any separators between them ("Word1.Word2", "word1 -
+  word2"); its first and last word may be part of a longer one, as a single
+  word may. Unquoted words still match in any order. An unknown word drops
+  its whole phrase. The same for artist, album and title.
+
 Reported by ModderMule.
 
 ### Bots: no more IP filter for throttled clients, scanner rule retuned

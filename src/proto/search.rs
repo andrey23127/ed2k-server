@@ -516,13 +516,19 @@ fn rewrite_conjunction(
                 dropped.push(s.trim().to_string());
                 return None;
             }
-            let mut kept: Vec<&str> = Vec::new();
+            // A quoted phrase goes as a unit (issue #59): with one word no
+            // file holds, no file holds the phrase either.
+            let mut kept: Vec<String> = Vec::new();
             let mut lost: Vec<String> = Vec::new();
-            for w in s.split_whitespace() {
-                if word_is_unknown(w, is_known) {
-                    lost.push(w.to_string());
+            for part in term_parts(s) {
+                let unknown = match &part {
+                    TermPart::Word(w) => word_is_unknown(w, is_known),
+                    TermPart::Phrase(p) => p.split_whitespace().any(|w| word_is_unknown(w, is_known)),
+                };
+                if unknown {
+                    lost.push(part.text());
                 } else {
-                    kept.push(w);
+                    kept.push(part.text());
                 }
             }
             if lost.is_empty() {
@@ -669,12 +675,17 @@ pub fn candidate_groups(node: &SearchNode) -> Vec<Vec<String>> {
 
 /// The term with its starred words removed; anchored and plain words kept.
 fn without_starred_words(t: &str) -> String {
-    t.split_whitespace()
-        .filter(|w| {
-            let (core, _, starred) = parse_markers(w);
-            !starred && !core.is_empty()
+    term_parts(t)
+        .iter()
+        .filter(|part| match part {
+            TermPart::Word(w) => {
+                let (core, _, starred) = parse_markers(w);
+                !starred && !core.is_empty()
+            }
+            TermPart::Phrase(_) => true,
         })
-        .collect::<Vec<&str>>()
+        .map(TermPart::text)
+        .collect::<Vec<String>>()
         .join(" ")
 }
 
@@ -857,6 +868,94 @@ fn file_type_matches(name_lower: &str, type_value: &str) -> bool {
 /// A plain word is matched with `contains`, NOT as a whole token. That keeps
 /// single-word behaviour exactly as it was: "linux" goes on matching
 /// "linuxmint", and a query that worked before cannot start returning less.
+/// One piece of a search term: a word, or a phrase the user put in double
+/// quotes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TermPart<'a> {
+    Word(&'a str),
+    Phrase(&'a str),
+}
+
+impl TermPart<'_> {
+    /// As it is written in a term.
+    fn text(&self) -> String {
+        match self {
+            TermPart::Word(w) => (*w).to_string(),
+            TermPart::Phrase(p) => format!("\"{p}\""),
+        }
+    }
+}
+
+/// Split a term into words and quoted phrases (issue #59).
+///
+/// eMule keeps the quotes of a quoted string when it builds a server search
+/// (`LexInit(expr, bKeepQuotedStrings = true)`), so `alpha "word1 word2"`
+/// arrives as one term with the quotes in it. Split on spaces, the phrase
+/// became the words `"word1` and `word2"`, which no file name contains.
+/// A quote without a partner is not a phrase: it is dropped and the rest is
+/// read as words.
+pub fn term_parts(t: &str) -> Vec<TermPart<'_>> {
+    let mut out = Vec::new();
+    let mut rest = t;
+    loop {
+        let Some(open) = rest.find('"') else {
+            out.extend(words_of(rest));
+            break;
+        };
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else {
+            out.extend(words_of(&rest[..open]));
+            out.extend(words_of(after));
+            break;
+        };
+        out.extend(words_of(&rest[..open]));
+        let phrase = after[..close].trim();
+        if !phrase.is_empty() {
+            out.push(TermPart::Phrase(phrase));
+        }
+        rest = &after[close + 1..];
+    }
+    out
+}
+
+fn words_of(s: &str) -> impl Iterator<Item = TermPart<'_>> {
+    s.split_whitespace().map(TermPart::Word)
+}
+
+/// The words of `s` (runs of letters and digits), lowercase input assumed.
+fn alnum_words(s: &str) -> impl Iterator<Item = &str> {
+    s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty())
+}
+
+/// Does the name contain the phrase: its words, in this order, next to each
+/// other? Separators do not count, so "word1 word2" is found in
+/// "Word1.Word2.avi", "word1_word2" and "word1 - word2". Like a single word,
+/// the first and the last word may be part of a longer one ("linux" matches
+/// "linuxmint").
+fn phrase_matches(phrase: &str, name_lower: &str) -> bool {
+    let p: Vec<&str> = alnum_words(phrase).collect();
+    match p.len() {
+        0 => true,
+        1 => name_lower.contains(p[0]),
+        n => {
+            let words: Vec<&str> = alnum_words(name_lower).collect();
+            words.windows(n).any(|w| {
+                w[0].ends_with(p[0])
+                    && w[n - 1].starts_with(p[n - 1])
+                    && w[1..n - 1] == p[1..n - 1]
+            })
+        }
+    }
+}
+
+/// Every word and phrase of a term against a (folded) name.
+fn term_matches(t: &str, name_lower: &str) -> bool {
+    term_parts(t).iter().all(|part| match part {
+        TermPart::Word(w) => word_matches(w, name_lower),
+        TermPart::Phrase(p) => phrase_matches(p, name_lower),
+    })
+}
+
 fn word_matches(w: &str, name_lower: &str) -> bool {
     // "*" or "**" alone: eMule sends this for a "list everything" search.
     if w == "*" || w == "**" {
@@ -1052,7 +1151,10 @@ fn eval_node(node: &SearchNode, name_lower: &str, facts: &FileFacts, fold: bool)
             //   tested for the literal substring `^dvdrip`, and `mark dvdr*` as
             //   the phrase `mark dvdr`, because `*` and `^` were only recognised
             //   at the ends of the whole string. See `candidate_groups`.
-            Some(tl.split_whitespace().all(|w| word_matches(w, name_lower)))
+            //
+            // ⚠ AND A PHRASE IN DOUBLE QUOTES IS ONE PART (issue #59): its
+            //   words must stand together, in that order. See `term_parts`.
+            Some(term_matches(&tl, name_lower))
         }
         SearchNode::Meta { tag_name, value } => {
             // tag_name is usually a 1-char string holding a byte ID (eMule sends
@@ -1082,7 +1184,7 @@ fn eval_node(node: &SearchNode, name_lower: &str, facts: &FileFacts, fold: bool)
                 Some(m.length() == crate::state::media::parse_length_text(val_lower))
             } else if matches!(tag_name.id(), Some(0xD0..=0xD2)) {
                 // Artist, album, title: words of the file name, as Lugdunum.
-                Some(val_lower.split_whitespace().all(|w| word_matches(w, name_lower)))
+                Some(term_matches(val_lower, name_lower))
             } else {
                 // Unknown tags: not judged.
                 None
@@ -2066,5 +2168,70 @@ mod budget_tests {
     fn malformed_is_not_over_budget() {
         let e = parse(&[NODE_BOOL, 0x09]).unwrap_err();
         assert!(!is_over_budget(&e));
+    }
+}
+
+#[cfg(test)]
+mod phrase_tests {
+    use super::*;
+
+    fn m(term: &str, name: &str) -> bool {
+        term_matches(&crate::state::keyword_index::fold_for_match(term), &crate::state::keyword_index::fold_for_match(name))
+    }
+
+    #[test]
+    fn quoted_words_are_one_part() {
+        assert_eq!(
+            term_parts(r#"alpha "word1 word2" beta"#),
+            vec![
+                TermPart::Word("alpha"),
+                TermPart::Phrase("word1 word2"),
+                TermPart::Word("beta")
+            ]
+        );
+        // A quote without a partner is dropped; the rest are words.
+        assert_eq!(term_parts(r#"alpha "beta"#), vec![TermPart::Word("alpha"), TermPart::Word("beta")]);
+        assert_eq!(term_parts(r#""""#), vec![]);
+    }
+
+    #[test]
+    fn a_quoted_phrase_matches_its_words_together_in_order() {
+        // Issue #59: this returned nothing.
+        assert!(m(r#""word1 word2 wordN""#, "Word1 Word2 WordN.avi"));
+        assert!(m(r#""word1 word2""#, "Word1.Word2.2019.mkv"));
+        assert!(m(r#""word1 word2""#, "word1_-_word2.mp3"));
+        assert!(m(r#"extra "word1 word2""#, "Extra - Word1 Word2.avi"));
+        // Not together, not in order, or a word missing: no.
+        assert!(!m(r#""word1 word2""#, "Word2 Word1.avi"));
+        assert!(!m(r#""word1 word2""#, "Word1 other Word2.avi"));
+        assert!(!m(r#"extra "word1 word2""#, "Word1 Word2.avi"));
+        // The ends may be part of longer words, as a single word may.
+        assert!(m(r#""linux mint""#, "OpenLinux Mintcinnamon.iso"));
+        assert!(!m(r#""linux mint""#, "Linux Xmint.iso"));
+        // One quoted word is a word.
+        assert!(m(r#""linux""#, "linuxmint.iso"));
+        // Unquoted words keep any order, as before.
+        assert!(m("word2 word1", "Word1 Word2.avi"));
+    }
+
+    #[test]
+    fn an_unknown_word_takes_its_whole_phrase_with_it() {
+        let known = |t: &str| t == "alpha" || t == "word1" || t == "word2";
+        let q = SearchNode::Term(r#"alpha "word1 zzznope""#.into());
+        let (t, dropped) = drop_unknown_words(&q, &known);
+        assert_eq!(t, SearchNode::Term("alpha".into()));
+        assert_eq!(dropped, vec![r#""word1 zzznope""#.to_string()]);
+        // A phrase of known words stays as it was sent, quotes and all.
+        let q = SearchNode::Term(r#"zzznope "word1 word2""#.into());
+        let (t, _) = drop_unknown_words(&q, &known);
+        assert_eq!(t, SearchNode::Term(r#""word1 word2""#.into()));
+    }
+
+    #[test]
+    fn the_phrase_words_are_candidates() {
+        assert_eq!(
+            candidate_groups(&SearchNode::Term(r#"alpha "word1 word2""#.into())),
+            vec![vec!["alpha".to_string()], vec!["word1".to_string()], vec!["word2".to_string()]]
+        );
     }
 }

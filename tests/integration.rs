@@ -1107,3 +1107,46 @@ async fn type_filters_neither_hide_a_hash_nor_turn_into_a_whole_index_scan() {
     // A known word is still found with its filter.
     assert_eq!(with_type("film zzqnope", "Video").len(), 20);
 }
+
+/// Issue #59: a phrase in double quotes, as eMule sends it (quotes kept in
+/// the term), finds the files whose names hold its words together and in
+/// order, and only those.
+#[tokio::test]
+async fn a_quoted_phrase_finds_its_files() {
+    use ed2k_server::filter::ContentFilter;
+    use ed2k_server::server::search::{handle_search, SearchRequest};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let cfg = Arc::new(test_config(4661));
+    let state = Arc::new(ServerState::new(Arc::new(ContentFilter::new()), Arc::clone(&cfg)));
+    for (i, name) in [
+        "Quiet River Song.mp3",
+        "Quiet.River.Live.2019.mp3",
+        "River Quiet Song.mp3",
+        "Quiet Big River.mp3",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let i = i as u8;
+        state.add_file_with_source(
+            [0x90 + i; 16],
+            5_000_000,
+            name.to_string(),
+            ([i; 16], IpAddr::V4(Ipv4Addr::new(10, 5, i, 1)), 4662, true),
+        );
+    }
+    let run = |term: &str| -> Vec<[u8; 16]> {
+        let mut p = vec![0x01u8];
+        p.extend_from_slice(&(term.len() as u16).to_le_bytes());
+        p.extend_from_slice(term.as_bytes());
+        let mut v: Vec<[u8; 16]> =
+            handle_search(&state, SearchRequest::parse(&p).unwrap()).iter().map(|r| r.hash).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(run(r#""quiet river""#), vec![[0x90; 16], [0x91; 16]]);
+    assert_eq!(run(r#"song "quiet river""#), vec![[0x90; 16]]);
+    // Without quotes: every file with both words.
+    assert_eq!(run("quiet river").len(), 4);
+}
