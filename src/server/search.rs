@@ -173,26 +173,16 @@ pub fn search_by_hash(
     state: &ServerState,
     tree: &SearchNode,
 ) -> Option<Vec<crate::state::file_id::FileRecord>> {
-    let (hash, size, filters) = crate::proto::search::ed2k_file_search(tree)?;
+    let (hash, size) = crate::proto::search::ed2k_file_search(tree)?;
     state.note_hash_search();
-    // The type, size and tag filters sent with the hash (issue #58) apply to
-    // the file it names, exactly as to any search result.
-    let passes = |r: &crate::state::file_id::FileRecord| -> bool {
-        let Some(f) = &filters else { return true };
-        let prepared = prepared_tree(state, f);
-        let want_media = crate::proto::search::uses_media(&prepared);
-        let media = want_media.then(|| state.file_slab.media_of_hash(&r.hash).unwrap_or_default());
-        let facts = file_facts(r, crate::proto::search::uses_complete_sources(&prepared), media);
-        let name = crate::state::keyword_index::fold_for_match(r.name());
-        crate::proto::search::evaluate_prepared(&prepared, &name, &facts)
-    };
+    // Nothing else in the query applies (issue #61): not the other words,
+    // not the type or size filters. Only what the content filter withholds.
     let rec = state.file_slab.get_by_hash(&hash).filter(|r| {
         !r.sources.is_empty()
             && (size == 0 || r.size == size)
-            && passes(r)
             && !state.filter.is_withheld(&r.hash, r.name())
     });
-    debug!(hash = %hex::encode(hash), size, filtered = filters.is_some(), found = rec.is_some(), "search by file hash");
+    debug!(hash = %hex::encode(hash), size, found = rec.is_some(), "search by file hash");
     Some(rec.into_iter().collect())
 }
 

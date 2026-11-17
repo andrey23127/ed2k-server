@@ -90,19 +90,27 @@ pub fn status_bits(state: &ServerState, user_hash: &UserHash, addr: Option<Ipv6A
 /// Hold `addr` back until its probe has run: not published, status `HAVE`.
 /// Called before the welcome batch at login, so its `OP_SERVERIDENT` cannot
 /// claim more than that. Returns whether a probe should start: not when this
-/// address already has its verdict (re-applied) or a probe running.
+/// address passed (re-applied) or has a probe running.
+///
+/// The same address after a FAILED probe is dialled again (issue #60), within
+/// the session's `MAX_DIALS`. A client sends it again when something changed
+/// on its side, typically an inbound pinhole its router opened after the
+/// login (UPnP IGD2); before, the failure stood until the next login.
 pub fn mark_pending(state: &ServerState, user_hash: UserHash, addr: Ipv6Addr) -> bool {
     let prev = state.ipv6_probe.get(&user_hash).map(|p| *p);
     if let Some(p) = prev.filter(|p| p.addr == addr) {
         match p.verdict {
             Some(true) => {
                 state.client_ipv6.insert(user_hash, addr);
+                return false;
             }
-            _ => {
+            None => {
                 state.client_ipv6.remove(&user_hash);
+                return false;
             }
+            // Failed: falls through to a new pending entry, same count.
+            Some(false) => {}
         }
-        return false;
     }
     state.client_ipv6.remove(&user_hash);
     state.ipv6_probe.insert(
@@ -303,9 +311,16 @@ mod tests {
         conclude(&s, h, a, false);
         assert_eq!(status_bits(&s, &h, Some(a)), 0x05);
         assert!(s.client_ipv6.get(&h).is_none(), "withdrawn");
-        // The same address again keeps its verdict, no new dial.
+        // The same address again after a failure is dialled again (#60).
+        assert!(mark_pending(&s, h, a));
+        assert_eq!(status_bits(&s, &h, Some(a)), 0x01, "running again");
+        assert!(!mark_pending(&s, h, a), "already running");
+        // ... and after a success it keeps its verdict, no new dial.
+        conclude(&s, h, a, true);
         assert!(!mark_pending(&s, h, a));
-        assert_eq!(status_bits(&s, &h, Some(a)), 0x05);
+        assert_eq!(status_bits(&s, &h, Some(a)), 0x07);
+        assert_eq!(s.client_ipv6.get(&h).map(|e| *e), Some(a));
+        conclude(&s, h, a, false);
         // A verdict about another address does not count.
         let b: Ipv6Addr = "2001:db8::8".parse().unwrap();
         assert_eq!(status_bits(&s, &h, Some(b)), 0x01);
@@ -338,5 +353,31 @@ mod tests {
         assert_eq!(s.block_stats.get("ipv6_probe_skipped_limit").map(|v| *v), Some(2));
         // The withdrawn entry is settled: the sweep does not dial it.
         assert_eq!(s.ipv6_probe.get(&h).map(|p| (p.addr, p.verdict)), Some((Ipv6Addr::UNSPECIFIED, Some(false))));
+    }
+
+    /// Issue #60: the login address fails, the client sends it again once
+    /// its pinhole is open: a second dial. Repeated, the 5th is skipped.
+    #[tokio::test]
+    async fn a_repeated_failed_address_is_dialled_again_within_the_limit() {
+        let s = Arc::new(ServerState::for_test());
+        on(&s);
+        let h = [10u8; 16];
+        let _rx = s.register_test_client_at(h, 5, false, 0, "10.0.0.10".parse().unwrap());
+        let mut cfg = (**s.live_cfg.load()).clone();
+        cfg.network.login_timeout_ms = 1;
+        s.live_cfg.store(Arc::new(cfg));
+        let a: Ipv6Addr = "2001:db8::60".parse().unwrap();
+        s.clients.get_mut(&h).unwrap().ipv6 = Some(a);
+        for _ in 1..=6 {
+            if mark_pending(&s, h, a) {
+                start(&s, h, a, 1, 0);
+            }
+            // The dial's own verdict, as it would come back: no answer.
+            if s.ipv6_probe.get(&h).is_some_and(|p| p.verdict.is_none()) {
+                conclude(&s, h, a, false);
+            }
+        }
+        assert_eq!(s.ipv6_probe.get(&h).map(|p| p.dials), Some(MAX_DIALS));
+        assert_eq!(s.block_stats.get("ipv6_probe_skipped_limit").map(|v| *v), Some(2));
     }
 }

@@ -2,6 +2,34 @@
 
 Earlier releases are described in their release commit messages.
 
+## 0.9.90
+
+### Search by hash ignores the rest of the query (issue #61)
+
+A search whose first term names a file by its hash (`ed2k::HASH`,
+`ed2k:SIZE:HASH`, an `ed2k://|file|` link, a magnet) is now answered with
+that file alone, whatever else the query holds: other words, size and
+availability filters, and the file type too. Someone who searches by hash
+knows which file they want; 0.9.89 applied the filters to it (issue #58),
+so a file type left selected in the search window hid the very file the
+hash named. This is Lugdunum's rule (eserver 17.15 ignores the extra terms
+and filters but keeps the type). "First" is the whole query or the leftmost
+term of its AND chain, where eMule puts the typed text ahead of the
+filters; a hash further on, or under an OR or a NOT, is an ordinary word.
+The size written inside a link is part of the reference and still has to
+match. The content filter applies as before. Suggested by irwir.
+
+### IPv6 dial-back: a failed address is dialled again when the client repeats it (issue #60)
+
+A failed dial-back stood for the whole session: `OP_IPV6_UPDATE` with the
+same address found the verdict and started nothing, so an address that
+became reachable after the login (an inbound pinhole the router opened
+late through UPnP IGD2, an address that came up after start, a router
+reboot) stayed unpublished until the next login. Now the same address
+after a failure is dialled again, within the session's 4 dials (the 5th is
+skipped, `ipv6_probe_skipped_limit`). An address that passed, or whose dial
+is still running, keeps its state, as before. Reported by got3nks.
+
 ## 0.9.89
 
 Four findings from an audit of 0.9.88 by itlezy, two search fixes, the bot

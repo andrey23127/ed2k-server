@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "ed2k-server"
-version = "0.9.89"
+version = "0.9.90"
 dependencies = [
  "aho-corasick",
  "anyhow",

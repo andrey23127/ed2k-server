@@ -1059,8 +1059,8 @@ async fn a_wide_search_tree_is_refused_before_the_search_lane() {
     assert_eq!(state.block_stats.get("search_tree_over_budget").map(|v| *v), Some(1));
 }
 
-/// Issue #58. A hash search with a type filter names one file and the filter
-/// applies to it; a search whose every word is unknown, sent with a type
+/// Issues #58 and #61. A hash search with a type filter names one file, and
+/// the filter does not hide it; a search whose every word is unknown, sent with a type
 /// filter, returns nothing instead of the best-sourced files of that type.
 #[tokio::test]
 async fn type_filters_neither_hide_a_hash_nor_turn_into_a_whole_index_scan() {
@@ -1101,7 +1101,8 @@ async fn type_filters_neither_hide_a_hash_nor_turn_into_a_whole_index_scan() {
     };
     let h = "58585858585858585858585858585858";
     assert_eq!(with_type(&format!("ed2k::{h}"), "Audio"), vec![[0x58; 16]]);
-    assert!(with_type(&format!("ed2k::{h}"), "Video").is_empty(), "the filter applies to the file");
+    // Issue #61: a hash search ignores the type, as every other filter.
+    assert_eq!(with_type(&format!("ed2k::{h}"), "Video"), vec![[0x58; 16]]);
     // Every word unknown: nothing, not twenty films.
     assert!(with_type("zzqnope qqznope", "Video").is_empty());
     // A known word is still found with its filter.

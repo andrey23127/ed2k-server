@@ -210,38 +210,27 @@ pub fn ed2k_file_ref(s: &str) -> Option<([u8; 16], u64)> {
     Some((h, size))
 }
 
-/// The file a search names by its hash, and the filters to apply to it.
+/// The file a search names by its hash.
 ///
-/// Either the whole tree is one such string, or it is an AND of exactly one
-/// such string and type, size or other tag filters, which is what a client
-/// sends for `ed2k::HASH` with a file type or a size chosen in its search
-/// window (issue #58). The filters come back as their own tree. Any other
-/// word next to the hash makes it an ordinary search.
-pub fn ed2k_file_search(tree: &SearchNode) -> Option<([u8; 16], u64, Option<SearchNode>)> {
-    if let SearchNode::Term(s) = tree {
-        return ed2k_file_ref(s).map(|(h, n)| (h, n, None));
-    }
+/// A hash search is one whose FIRST term is such a string: the whole tree,
+/// or the leftmost term of an AND chain, which is where eMule puts the typed
+/// text, ahead of the type, size and other filters of its search window.
+/// Everything else in the query is then ignored, the file type included
+/// (issue #61): someone who searches by hash knows which file they want,
+/// and if the server has it, it is the answer. That is Lugdunum's rule
+/// (eserver 17.15 also ignores the extra terms and filters, though it keeps
+/// the type). The size inside a link (`ed2k:SIZE:HASH`, `ed2k://|file|..|`)
+/// is part of the reference, not a filter, and still applies.
+///
+/// 0.9.89 applied the filters to the file (issue #58); a type chosen in the
+/// search window then hid the very file the hash named.
+pub fn ed2k_file_search(tree: &SearchNode) -> Option<([u8; 16], u64)> {
     let mut parts = Vec::new();
     flatten_and(tree, &mut parts);
-    if parts.len() < 2 {
-        return None;
+    match parts.first()? {
+        SearchNode::Term(s) => ed2k_file_ref(s),
+        _ => None,
     }
-    let mut found = None;
-    let mut filters: Option<SearchNode> = None;
-    for p in parts {
-        match p {
-            SearchNode::Term(s) if found.is_none() => found = Some(ed2k_file_ref(s)?),
-            SearchNode::Meta { .. } | SearchNode::Numeric { .. } => {
-                filters = Some(match filters {
-                    None => p.clone(),
-                    Some(f) => SearchNode::Bool(BoolOp::And, Box::new(f), Box::new(p.clone())),
-                });
-            }
-            _ => return None,
-        }
-    }
-    let (h, n) = found?;
-    Some((h, n, filters))
 }
 
 fn flatten_and<'a>(node: &'a SearchNode, out: &mut Vec<&'a SearchNode>) {
@@ -2030,27 +2019,27 @@ mod markers_are_per_word {
     }
 
     #[test]
-    fn a_hash_search_with_filters_is_still_a_hash_search() {
-        // Issue #58: "ed2k::HASH" AND type=Video AND size > 1 MB.
+    fn a_hash_first_is_a_hash_search_and_the_rest_is_ignored() {
+        // Issue #61: "ed2k::HASH" AND type=Video AND size > 1 MB.
         let h = "193C85BB48D1F49B859BA1D744BD4D46";
         let hash = term(&format!("ed2k::{h}"));
         let video = SearchNode::Meta { tag_name: SearchTag::Id(0x03), value: "Video".into() };
         let big = SearchNode::Numeric { tag_name: SearchTag::Id(0x02), op: CmpOp::Gt, value: 1 << 20 };
-        let q = and(and(hash.clone(), video.clone()), big.clone());
-        let (_, size, filters) = ed2k_file_search(&q).unwrap();
-        assert_eq!(size, 0);
-        assert_eq!(filters, Some(and(video.clone(), big)));
-        // The filter first, the hash second: the same.
-        assert!(ed2k_file_search(&and(video.clone(), hash.clone())).is_some());
-        // Alone: no filters.
-        assert_eq!(ed2k_file_search(&hash).unwrap().2, None);
-        // Another word next to it, an OR, a NOT or a second hash: an ordinary search.
-        assert!(ed2k_file_search(&and(hash.clone(), term("alpha"))).is_none());
+        let want = ed2k_file_ref(&format!("ed2k::{h}")).unwrap();
+        assert_eq!(ed2k_file_search(&and(and(hash.clone(), video.clone()), big.clone())), Some(want));
+        assert_eq!(ed2k_file_search(&and(hash.clone(), and(video.clone(), big))), Some(want));
+        // Other words after the hash are ignored as well.
+        assert_eq!(ed2k_file_search(&and(hash.clone(), term("alpha"))), Some(want));
+        assert_eq!(ed2k_file_search(&hash), Some(want));
+        // Not first: an ordinary search.
+        assert!(ed2k_file_search(&and(term("alpha"), hash.clone())).is_none());
+        assert!(ed2k_file_search(&and(video.clone(), hash.clone())).is_none());
+        // Under an OR or a NOT: an ordinary search.
         assert!(ed2k_file_search(&SearchNode::Bool(BoolOp::Or, Box::new(hash.clone()), Box::new(video.clone()))).is_none());
-        assert!(ed2k_file_search(&SearchNode::Bool(BoolOp::Not, Box::new(hash.clone()), Box::new(video.clone()))).is_none());
-        assert!(ed2k_file_search(&and(hash.clone(), hash)).is_none());
-        // Filters alone are no hash search.
+        assert!(ed2k_file_search(&SearchNode::Bool(BoolOp::Not, Box::new(hash), Box::new(video.clone()))).is_none());
         assert!(ed2k_file_search(&video).is_none());
+        // The size of a link still applies: it is part of the reference.
+        assert_eq!(ed2k_file_search(&term(&format!("ed2k:1234:{h}"))).map(|r| r.1), Some(1234));
     }
 
     #[test]

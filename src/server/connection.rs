@@ -1373,7 +1373,9 @@ async fn dispatch(
                     // A new address is dialled back like the login one (#43).
                     (Some(a), Some(_)) => {
                         if !crate::server::ipv6_probe::mark_pending(state, c.user_hash, a) {
-                            // Same address: its verdict stands, no new dial.
+                            // Same address, passed or still being dialled:
+                            // no new dial. After a failure it is dialled
+                            // again, within the session's dials (#60).
                             probe = None;
                         }
                     }
