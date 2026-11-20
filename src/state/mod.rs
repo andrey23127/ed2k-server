@@ -1470,6 +1470,23 @@ impl ServerState {
 
     /// Have we completed (or started) an obfuscated handshake with any
     /// server at `ip`?
+    /// Has this address shown it runs an eD2k server? It answered our 0x96
+    /// with a 0x97 (an mldonkey client never answers a 0x96: it has no case
+    /// for it, see donkeyUdp.ml) or our obfuscated handshake gave its key.
+    /// Such an address stays a server when it ALSO logs in as a client, as
+    /// JEmuleServer does to search its peers.
+    pub fn is_proven_server_ip(&self, ip: std::net::Ipv4Addr) -> bool {
+        self.verified_servers.contains_key(&ip) || self.seed_server_keys.iter().any(|e| *e.key().ip() == ip)
+    }
+
+    /// Is this address in our peer list (any port)? Without waiting: `None`
+    /// while the list is being written.
+    pub fn is_listed_peer(&self, ip: std::net::IpAddr) -> Option<bool> {
+        let std::net::IpAddr::V4(v4) = ip else { return Some(false) };
+        let list = self.server_list.try_read().ok()?;
+        Some(list.iter().any(|s| *s.ip() == v4))
+    }
+
     pub fn is_gossiped_ip(&self, ip: std::net::Ipv4Addr) -> bool {
         self.seed_server_keys.iter().any(|e| *e.key().ip() == ip)
             || self.our_sent_random_parts.iter().any(|e| *e.key().ip() == ip)

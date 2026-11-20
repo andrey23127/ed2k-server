@@ -757,6 +757,10 @@ async fn merge_server_list(state: &Arc<ServerState>, new_list: Vec<SocketAddrV4>
         set
     };
 
+    // A proven server is no client leak, even when it also logs in as one
+    // (JEmuleServer does): it answered our 0x96, an mldonkey client never does.
+    let blocked_ips: std::collections::HashSet<std::net::Ipv4Addr> =
+        blocked_ips.into_iter().filter(|ip| !state.is_proven_server_ip(*ip)).collect();
     let mut list = state.server_list.write().await;
     // Purge stale client IPs that leaked into server_list previously.
     let before_purge = list.len();

@@ -541,6 +541,14 @@ sends 2 000 different files in the first minute. Neither is a scan: a list
 scanner asks thousands of different files an hour, each about once, which is
 what `scan_min_minutes` and `scan_max_repeats` test.
 
+A server in our peer list (any port of its address) is not judged by the
+scanner or hammer rule (0.9.91): a peer asks for sources and searches on
+behalf of its own clients, and JEmuleServer's source searcher asks for
+thousands of files once each, exactly a scanner's pattern. A match is
+counted as `bot_rule_peer_exempt` and written to the ledger
+(`peer_exempt`), nothing more. The flood and uniform-timing rules still
+apply to it.
+
 Retuned in 0.9.89 from the bot report of 15-16.11: the rule then judged at
 10 minutes and allowed 3 asks per file, and of the three sources it banned
 as scanners two were clients with large download lists (an eMule 0.50a and

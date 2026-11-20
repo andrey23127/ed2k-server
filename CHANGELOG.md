@@ -4,6 +4,43 @@ Earlier releases are described in their release commit messages.
 
 ## 0.9.90
 
+### Gossip: a server that is also a client can register
+
+JEmuleServer did not get into our peer list. It now registers the way
+Lugdunum and we do (a plain `0xA0 <ip><tcp port><challenge>` to TCP+4,
+then the obfuscated handshake), and answers our `0x96` from its TCP+4 with
+the challenge. But it also logs in to its peers as an eMule client, from the
+same address, to search them for its index, and every path of ours took an
+address seen as a client for an mldonkey client leaking into the list: the
+registration was refused (`gossip_registration_refused`), an `0xA1` it sent
+was dropped, and a login from the address took it out of the list again.
+
+What tells a server from an mldonkey client is the challenge: an mldonkey
+client has no case for an incoming `0x96` (`donkeyUdp.ml`,
+`udp_client_handler`) and never answers one. So:
+
+- `0xA0` from an address that is also a client is probed like any other,
+  and listed only when a `0x97` echoing the challenge comes back from its
+  TCP+4. The answer must now be a server status (challenge, users, files at
+  least), not a bare echo.
+- An address that has answered our `0x96` (or given its key in the
+  obfuscated handshake) is a proven server: a client login from it no
+  longer takes it out of the list, its `0xA1` lists are read, and it is not
+  filtered out of other servers' lists for being a client.
+- Addresses that are clients and have never answered a `0x96` are filtered
+  exactly as before.
+
+### Bots: peer servers are not judged as scanners or hammers
+
+A server in our peer list asks for sources and searches on behalf of its
+own clients; JEmuleServer's source searcher asks for thousands of different
+files once each, exactly what the scanner rule bans (seen: 2 007 files,
+1 827 different, in 57 minutes, banned 24 h). The scanner and hammer rules
+no longer apply to an address in the peer list: the match is counted
+(`bot_rule_peer_exempt`) and written to the ledger (`peer_exempt`). The
+flood and uniform-timing rules still apply.
+
+
 ### Search by hash ignores the rest of the query (issue #61)
 
 A search whose first term names a file by its hash (`ed2k::HASH`,

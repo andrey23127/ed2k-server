@@ -2204,12 +2204,17 @@ impl UdpServer {
     /// registrant is NOT listed on its word: it is sent a 0x96 with a fresh
     /// challenge and listed only when a 0x97 echoing that challenge comes
     /// back from its TCP+4 (see `handle_pingreply`). An mldonkey client
-    /// sends 0xA0 with its own address to the servers it knows, and does not
-    /// answer 0x96; nor can anyone list itself with a forged 0x97, which
-    /// must carry the challenge. Refused outright: an address that is not
-    /// the sender's, not public, ours, or that of a client (connected or
-    /// seen in the last 30 minutes). One probe per address per 10 minutes,
-    /// at most 4096 pending.
+    /// sends 0xA0 with its own address to the servers it knows, and never
+    /// answers a 0x96: its UDP handler has no case for one (`donkeyUdp.ml`,
+    /// `udp_client_handler`), so it cannot get in. Nor can anyone list
+    /// itself with a forged 0x97, which must carry the challenge. Refused
+    /// outright: an address that is not the sender's, not public, or ours.
+    /// One probe per address per 10 minutes, at most 4096 pending.
+    ///
+    /// An address that is also a client is probed like any other (0.9.91).
+    /// Refusing it kept JEmuleServer out for good: it logs in to its peers
+    /// as an eMule client to search them, from the same address. The
+    /// challenge, not the absence of a login, is what tells a server.
     async fn note_server_registration(&self, payload: &[u8], from: SocketAddr) {
         let std::net::IpAddr::V4(src) = canon_ip(from.ip()) else { return };
         if payload.len() < 6 {
@@ -2224,8 +2229,6 @@ impl UdpServer {
             || port > 65531
             || !crate::state::ServerState::is_publishable_source_ip(std::net::IpAddr::V4(ip))
             || self_ip == Some(ip)
-            || self.state.recent_client_ips.contains_key(&ip)
-            || self.state.conn_per_ip.contains_key(&std::net::IpAddr::V4(ip))
         {
             crate::server::holepunch::count(&self.state, "gossip_registration_refused");
             return;
@@ -2261,19 +2264,13 @@ impl UdpServer {
         let std::net::IpAddr::V4(ip) = canon_ip(from.ip()) else { return };
         let Some(p) = self.state.pending_registrations.get(&ip).map(|e| *e) else { return };
         let (port, challenge, _) = p;
-        let echoed = payload.len() >= 4
+        // A server status at least: challenge, users, files.
+        let echoed = payload.len() >= 12
             && u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) == challenge;
         if !echoed || from.port() != port.wrapping_add(4) {
             return;
         }
         self.state.pending_registrations.remove(&ip);
-        // Became a client meanwhile: not a server.
-        if self.state.recent_client_ips.contains_key(&ip)
-            || self.state.conn_per_ip.contains_key(&std::net::IpAddr::V4(ip))
-        {
-            crate::server::holepunch::count(&self.state, "gossip_registration_refused");
-            return;
-        }
         let addr = std::net::SocketAddrV4::new(ip, port);
         let mut list = self.state.server_list.write().await;
         if list.contains(&addr) || list.len() >= 2048 {
@@ -2317,11 +2314,15 @@ impl UdpServer {
         // over `clients` stays as a fallback for the window before an entry
         // lands (or after its TTL expires while the client is still connected),
         // but it now runs only for known peers whose cheap check missed.
-        let sender_is_client = self.state.recent_client_ips.contains_key(&sender_v4)
-            || self.state.clients.iter().any(|e| match e.ip {
-                std::net::IpAddr::V4(v4) => v4 == sender_v4,
-                _ => false,
-            });
+        // ... unless it has proven to be a server (answered our 0x96), which
+        // an mldonkey client never does: JEmuleServer logs in to its peers
+        // as a client too.
+        let sender_is_client = !self.state.is_proven_server_ip(sender_v4)
+            && (self.state.recent_client_ips.contains_key(&sender_v4)
+                || self.state.clients.iter().any(|e| match e.ip {
+                    std::net::IpAddr::V4(v4) => v4 == sender_v4,
+                    _ => false,
+                }));
         if sender_is_client {
             debug!(ip = %from.ip(),
                    "rejecting 0xA1 from connected client (mldonkey-style packet)");
@@ -2387,8 +2388,9 @@ impl UdpServer {
             {
                 continue;
             }
-            // Reject IPs of our currently-connected clients (mldonkey leak).
-            if client_ips.contains(&ip) {
+            // Reject IPs of our currently-connected clients (mldonkey leak),
+            // unless the address has answered our 0x96 itself.
+            if client_ips.contains(&ip) && !self.state.is_proven_server_ip(ip) {
                 continue;
             }
             new_servers.push(std::net::SocketAddrV4::new(ip, port));
@@ -3374,12 +3376,25 @@ mod registration_tests {
         let other = SocketAddr::new("93.184.216.35".parse().unwrap(), 4665);
         srv.note_server_registration(&reg, other).await;
         assert!(srv.state.pending_registrations.get(&"93.184.216.35".parse().unwrap()).is_none());
+        // An address that is also a client (0.9.91): probed like any other.
+        // An mldonkey client never answers the 0x96, so it stays out; a
+        // server that logs in to us as a client too (JEmuleServer) gets in.
         let cl: std::net::Ipv4Addr = "93.184.216.36".parse().unwrap();
         srv.state.conn_per_ip.insert(std::net::IpAddr::V4(cl), 1);
+        srv.state.recent_client_ips.insert(cl, std::time::Instant::now());
         let mut reg2 = cl.octets().to_vec();
         reg2.extend_from_slice(&4662u16.to_le_bytes());
-        srv.note_server_registration(&reg2, SocketAddr::new(std::net::IpAddr::V4(cl), 4666)).await;
-        assert!(srv.state.pending_registrations.get(&cl).is_none(), "a client is no server");
+        let cl_from = SocketAddr::new(std::net::IpAddr::V4(cl), 4666);
+        srv.note_server_registration(&reg2, cl_from).await;
+        let (_, ch2, _) = *srv.state.pending_registrations.get(&cl).expect("probed");
+        assert_eq!(srv.state.server_list.read().await.len(), 1, "not on its word");
+        // A bare echo without a server status is no answer either.
+        srv.confirm_server_registration(&ch2.to_le_bytes(), cl_from).await;
+        assert_eq!(srv.state.server_list.read().await.len(), 1);
+        let mut status = ch2.to_le_bytes().to_vec();
+        status.extend_from_slice(&[0; 8]);
+        srv.confirm_server_registration(&status, cl_from).await;
+        assert!(srv.state.server_list.read().await.contains(&std::net::SocketAddrV4::new(cl, 4662)));
     }
 }
 

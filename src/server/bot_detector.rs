@@ -370,6 +370,20 @@ pub fn record_sources(state: &Arc<ServerState>, raw_ip: IpAddr, hashes: &[FileHa
         v.map(|(r, a)| (r, a, files as f64 / mins, files))
     };
     let Some((reason, action, per_min, files)) = verdict else { return };
+    // A server in our peer list asks for sources and searches on behalf of
+    // its own clients (JEmuleServer's source searcher walks thousands of
+    // files once each, exactly a scanner's pattern): neither rule applies to
+    // it (0.9.91). Only these two: the flood and uniform-timing rules still
+    // do. The window stays flagged, so this is decided once an hour.
+    if state.is_listed_peer(raw_ip) == Some(true) {
+        *state.block_stats.entry("bot_rule_peer_exempt".to_string()).or_insert(0) += 1;
+        tracing::info!(%ip, tcp, %reason, "bot rule matched a listed peer server: not applied");
+        ledger(state, serde_json::json!({
+            "time": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "event": "peer_exempt", "ip": ip.to_string(), "reason": reason, "tcp": tcp,
+        }));
+        return;
+    }
     let action = action.trim().to_ascii_lowercase();
     if action == "log" || action == "off" {
         tracing::warn!(%ip, tcp, %reason, "bot rule matched (action = log, nothing done)");
@@ -910,6 +924,30 @@ mod scan_rule_tests {
         let d = s.bot_detections.get(&ip).unwrap();
         assert!(d.reason.starts_with("hammer"), "{}", d.reason);
         assert!(d.throttled);
+    }
+
+    #[test]
+    fn a_listed_peer_server_is_not_judged_a_scanner_or_a_hammer() {
+        // JEmuleServer's source searcher: 2 000 different files, each once.
+        let s = st();
+        let ip: IpAddr = "198.51.100.43".parse().unwrap();
+        if let IpAddr::V4(v4) = ip {
+            s.server_list.try_write().unwrap().push(std::net::SocketAddrV4::new(v4, 4661));
+        }
+        s.scan_windows.insert(ip, ScanWindow::started_ago(Duration::from_secs(31 * 60)));
+        for i in 0..2000u32 {
+            record_sources(&s, ip, &[h(50_000 + i)], false);
+        }
+        assert!(!s.is_bot_banned(ip));
+        assert!(s.bot_throttle_admit(ip).is_none());
+        assert_eq!(s.block_stats.get("bot_rule_peer_exempt").map(|v| *v), Some(1));
+        // The same from an address not in the list: banned.
+        let other: IpAddr = "198.51.100.44".parse().unwrap();
+        s.scan_windows.insert(other, ScanWindow::started_ago(Duration::from_secs(31 * 60)));
+        for i in 0..2000u32 {
+            record_sources(&s, other, &[h(60_000 + i)], false);
+        }
+        assert!(s.is_bot_banned(other));
     }
 
     #[test]

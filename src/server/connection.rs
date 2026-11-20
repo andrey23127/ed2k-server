@@ -1051,9 +1051,13 @@ async fn dispatch(
             // a previous gossip cycle (mldonkey clients advertise themselves
             // to seeds, which propagate them to us as "servers"). This keeps
             // the Clients and Peer servers admin tabs disjoint.
+            // A proven server is kept (0.9.91): JEmuleServer logs in to its
+            // peers as an eMule client from the address it serves on.
             if let std::net::IpAddr::V4(client_v4) = new_client.ip {
-                let mut sl = state.server_list.write().await;
-                sl.retain(|s| s.ip() != &client_v4);
+                if !state.is_proven_server_ip(client_v4) {
+                    let mut sl = state.server_list.write().await;
+                    sl.retain(|s| s.ip() != &client_v4);
+                }
             }
             *client = Some(new_client.clone());
             let ident = wants_v1 || crate::server::login::ident_at_login(&new_client);
